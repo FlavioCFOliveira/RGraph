@@ -8,6 +8,13 @@ O projeto suporta de raiz os dois modelos de dados de grafos mais relevantes:
 - **LPG** (Label Property Graph)
 - **RDF** (Resource Description Framework)
 
+## Requisitos Não Negociáveis
+
+Os seguintes requisitos são **NÃO negociáveis** e devem ser respeitados em todo o ciclo de desenvolvimento:
+
+- **100% openCypher compliant** — conformidade total com o openCypher (Cypher TCK).
+- **100% ACID compliant** — garantia total das propriedades ACID (Atomicidade, Consistência, Isolamento, Durabilidade) em todas as operações.
+
 ## 1. Tomada de Decisão
 
 NÃO ESTÁS AUTORIZADO a tomar decisões sozinho.
