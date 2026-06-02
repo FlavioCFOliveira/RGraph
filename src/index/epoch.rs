@@ -6,7 +6,7 @@
 
 use crate::index::page::BTreePage;
 use crate::storage::page::PageId;
-use crossbeam_epoch::{Atomic, Owned, Shared};
+use crossbeam_epoch::Atomic;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
@@ -104,7 +104,7 @@ mod tests {
         let loaded = table.load(1, guard).unwrap();
         assert!(loaded.is_leaf());
         // Force epoch advancement to ensure retirement runs.
-        drop(guard);
+        let _ = guard;
     }
 
     #[test]

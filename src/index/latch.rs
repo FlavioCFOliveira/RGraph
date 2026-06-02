@@ -62,7 +62,7 @@ impl LatchCoupling {
     /// Blocks until the latch is available.  The caller **must** request
     /// page ids in monotonically ascending order; otherwise a panic is raised
     /// in debug builds.
-    pub fn latch(&self, page_id: PageId, mode: LatchMode) -> LatchGuard {
+    pub fn latch(&self, page_id: PageId, mode: LatchMode) -> LatchGuard<'_> {
         let mut table = self.table.lock().unwrap();
         let mut entry = table.entry(page_id).or_insert_with(LatchEntry::new);
 

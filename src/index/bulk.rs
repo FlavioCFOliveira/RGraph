@@ -29,6 +29,7 @@ impl Default for BulkLoaderConfig {
 
 /// In-memory builder for a B+ tree from sorted input.
 pub struct BulkLoader {
+    #[allow(dead_code)]
     config: BulkLoaderConfig,
     current_leaf: BTreePage,
     leaf_entries: Vec<(Vec<u8>, Vec<u8>)>,
@@ -55,6 +56,7 @@ impl BulkLoader {
         id
     }
 
+    #[allow(dead_code)]
     fn peek_next_page_id(&self) -> PageId {
         self.next_page_id
     }

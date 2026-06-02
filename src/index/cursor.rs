@@ -13,7 +13,9 @@ use crate::storage::page::PageId;
 /// The cursor holds a shared latch on the current leaf page while it is
 /// alive, preventing concurrent splits from freeing the page underneath it.
 pub struct BTreeCursor<'a> {
+    #[allow(dead_code)]
     latch_mgr: &'a LatchCoupling,
+    #[allow(dead_code)]
     current_page_id: PageId,
     current_slot: u16,
     // In a real implementation we would hold a PageGuard from the buffer pool.

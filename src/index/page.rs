@@ -8,10 +8,6 @@ use crate::storage::page::{PageHeader, PageId, PageType, SlottedPage};
 /// Size of the B+ tree specific header extension (after the 64-byte page header).
 pub const BTREE_HEADER_SIZE: usize = 32;
 
-/// Total header for B+ tree pages: 64 (base) + 32 (btree) = 96 bytes.
-/// Leaves 8096 bytes for keys/values/slot directory.
-const BTREE_TOTAL_HEADER: usize = 64 + BTREE_HEADER_SIZE;
-
 /// B+ tree page type discriminant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

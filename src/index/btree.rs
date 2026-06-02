@@ -85,11 +85,6 @@ impl BPlusTree {
         pages.get(&page_id).cloned()
     }
 
-    fn put_page(&self, page_id: PageId, page: BTreePage) {
-        let mut pages = self.pages.lock().unwrap();
-        pages.insert(page_id, page);
-    }
-
     fn put_page_with_lsn(&self, page_id: PageId, mut page: BTreePage) {
         page.set_page_lsn(self.bump_lsn());
         let mut pages = self.pages.lock().unwrap();
@@ -136,7 +131,7 @@ impl BPlusTree {
                 Some(r) => r,
                 None => return self.search(key),
             };
-            let leaf_lsn = path.last().map(|p| p.1).unwrap_or(0);
+            let _leaf_lsn = path.last().map(|p| p.1).unwrap_or(0);
 
             // Validation: re-read every page in the path and check LSN.
             let mut valid = true;
@@ -554,25 +549,6 @@ impl BPlusTree {
         None
     }
 
-    fn decode_kv(page: &BTreePage, slot: u16) -> Option<(Vec<u8>, Vec<u8>)> {
-        let kv = page.key(slot)?;
-        if kv.len() < 2 {
-            return None;
-        }
-        let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
-        if 2 + key_len > kv.len() {
-            return None;
-        }
-        let key = kv[2..2 + key_len].to_vec();
-        let value = kv[2 + key_len..].to_vec();
-        Some((key, value))
-    }
-
-    fn decode_branch(page: &BTreePage, slot: u16) -> Option<(Vec<u8>, PageId)> {
-        let sep = page.separator_key(slot)?;
-        let child = page.child_pointer(slot)?;
-        Some((sep.to_vec(), child))
-    }
 }
 
 /// Errors that can occur during B+ tree operations.
