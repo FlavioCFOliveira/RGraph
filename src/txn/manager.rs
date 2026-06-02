@@ -34,6 +34,7 @@
 //! [`TxError`] enumerates every failure mode so callers can handle each case.
 
 use crate::io::FileSystem;
+use crate::index::manager::{IndexManager, IndexMutation};
 use crate::txn::{
     lock_table::{LockMode, LockResult, LockTable},
     snapshot::Snapshot,
@@ -65,6 +66,10 @@ pub enum TxError {
     /// An attempt was made to operate on an already-finalised transaction.
     #[error("transaction {0} has already been finalised")]
     AlreadyFinalised(TxId),
+
+    /// A secondary index mutation failed during commit.
+    #[error("secondary index mutation failed: {0}")]
+    IndexMutation(String),
 }
 
 /// The lifecycle state of a [`Transaction`].
@@ -97,6 +102,9 @@ pub struct Transaction {
     /// How many times this transaction has been wounded by the wound-wait
     /// protocol.  Mirrors the count in [`WoundWait`] for quick access.
     wound_count: u8,
+    /// Staged secondary-index mutations that will be applied atomically at
+    /// commit time.
+    pub index_mutations: Vec<IndexMutation>,
 }
 
 impl Transaction {
@@ -166,6 +174,7 @@ impl TransactionManager {
             status: TxStatus::Active,
             held_locks: Vec::new(),
             wound_count: 0,
+            index_mutations: Vec::new(),
         }
     }
 
@@ -219,6 +228,57 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Commit `tx` with secondary-index mutations applied atomically.
+    ///
+    /// Steps:
+    /// 1. Verify the transaction is still active.
+    /// 2. Apply all staged [`IndexMutation`]s through `index_mgr`.
+    /// 3. If any index mutation fails, abort the transaction.
+    /// 4. Append a [`RecordType::Commit`] WAL record and flush.
+    /// 5. Release locks, update global state, clean up wound-wait metadata.
+    ///
+    /// This ensures that either **both** the primary records and the secondary
+    /// indexes are durable, or neither is, preserving atomicity.
+    pub fn commit_with_indexes(
+        &self,
+        tx: &mut Transaction,
+        index_mgr: &mut IndexManager,
+        wal: &mut WalWriter,
+        fs: &dyn FileSystem,
+    ) -> Result<(), TxError> {
+        if !tx.is_active() {
+            return Err(TxError::NotActive(tx.txid, tx.status));
+        }
+
+        // Apply staged index mutations.  If this fails we must abort.
+        if let Err(e) = index_mgr.apply_batch(&tx.index_mutations) {
+            let _ = self.rollback(tx, wal, fs);
+            return Err(TxError::IndexMutation(e.to_string()));
+        }
+
+        // Clear the staged mutations so they are not replayed on retry.
+        tx.index_mutations.clear();
+
+        // Proceed with normal WAL commit.
+        self.commit(tx, wal, fs)
+    }
+
+    /// Stage an index mutation in the transaction-local write set.
+    ///
+    /// The mutation is not applied until [`commit_with_indexes`] is called.
+    /// If the transaction rolls back, staged mutations are simply discarded.
+    pub fn stage_index_mutation(
+        &self,
+        tx: &mut Transaction,
+        mutation: IndexMutation,
+    ) -> Result<(), TxError> {
+        if !tx.is_active() {
+            return Err(TxError::NotActive(tx.txid, tx.status));
+        }
+        tx.index_mutations.push(mutation);
+        Ok(())
+    }
+
     /// Roll back `tx`.
     ///
     /// Steps:
@@ -249,6 +309,9 @@ impl TransactionManager {
         // Ignore WAL write errors on rollback — we will still release locks
         // and update state.
         let _ = wal.append(fs, abort_rec);
+
+        // Discard staged index mutations — rollback means nothing is applied.
+        tx.index_mutations.clear();
 
         // Release all locks.
         self.lock_table.release_all(tx.txid, &tx.held_locks);
@@ -630,5 +693,114 @@ mod tests {
         let snap = mgr.global_state().active_snapshot();
         assert!(!snap.is_active(t1.txid));
         assert!(!snap.is_active(t2.txid));
+    }
+
+    // ------------------------------------------------------------------
+    // Secondary index group-commit integration
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stage_index_mutation_accumulates_in_tx() {
+        use crate::graph::record::SlotRef;
+        use crate::index::manager::IndexMutation;
+
+        let mgr = TransactionManager::new();
+        let mut tx = mgr.begin();
+
+        mgr.stage_index_mutation(
+            &mut tx,
+            IndexMutation::InsertNode {
+                node_id: 1,
+                slot: SlotRef::new(10, 5),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tx.index_mutations.len(), 1);
+    }
+
+    #[test]
+    fn stage_on_non_active_tx_fails() {
+        use crate::graph::record::SlotRef;
+        use crate::index::manager::IndexMutation;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let mut wal = make_wal(tmp.path());
+
+        let mgr = TransactionManager::new();
+        let mut tx = mgr.begin();
+        mgr.commit(&mut tx, &mut wal, &fs).unwrap();
+
+        let res = mgr.stage_index_mutation(
+            &mut tx,
+            IndexMutation::InsertNode {
+                node_id: 1,
+                slot: SlotRef::new(10, 5),
+            },
+        );
+        assert!(matches!(res, Err(TxError::NotActive(_, TxStatus::Committed))));
+    }
+
+    #[test]
+    fn commit_with_indexes_applies_mutations() {
+        use crate::graph::record::SlotRef;
+        use crate::index::manager::{IndexManager, IndexMutation};
+        use crate::index::key::node_id_key;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let mut wal = make_wal(tmp.path());
+
+        let mgr = TransactionManager::new();
+        let mut tx = mgr.begin();
+        let mut index_mgr = IndexManager::new();
+
+        mgr.stage_index_mutation(
+            &mut tx,
+            IndexMutation::InsertNode {
+                node_id: 42,
+                slot: SlotRef::new(7, 3),
+            },
+        )
+        .unwrap();
+
+        mgr.commit_with_indexes(&mut tx, &mut index_mgr, &mut wal, &fs
+        )
+        .unwrap();
+
+        assert_eq!(tx.status, TxStatus::Committed);
+        assert!(tx.index_mutations.is_empty());
+        assert!(index_mgr.node_index.search(&node_id_key(42)).is_some());
+    }
+
+    #[test]
+    fn rollback_discards_staged_mutations() {
+        use crate::graph::record::SlotRef;
+        use crate::index::manager::{IndexManager, IndexMutation};
+        use crate::index::key::node_id_key;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let mut wal = make_wal(tmp.path());
+
+        let mgr = TransactionManager::new();
+        let mut tx = mgr.begin();
+        let index_mgr = IndexManager::new();
+
+        mgr.stage_index_mutation(
+            &mut tx,
+            IndexMutation::InsertNode {
+                node_id: 99,
+                slot: SlotRef::new(7, 3),
+            },
+        )
+        .unwrap();
+
+        mgr.rollback(&mut tx, &mut wal, &fs).unwrap();
+
+        assert_eq!(tx.status, TxStatus::Aborted);
+        assert!(tx.index_mutations.is_empty());
+        assert!(index_mgr.node_index.search(&node_id_key(99)).is_none());
     }
 }
