@@ -92,6 +92,12 @@ impl PageManager {
     pub fn write_page(&self, fs: &dyn FileSystem, page_id: PageId, buf: &AlignedBuffer) -> io::Result<()> {
         let offset = page_id * PAGE_SIZE as u64;
         let handle = fs.open(&self.data_path, false)?;
+        // Ensure the file is large enough for this page.
+        let required_len = offset + PAGE_SIZE as u64;
+        let current_len = handle.len()?;
+        if current_len < required_len {
+            handle.set_len(required_len)?;
+        }
         handle.write_at(buf, offset)?;
         handle.sync_data()
     }
@@ -129,6 +135,11 @@ impl PageManager {
                 self.free_cache.pages.push(pid);
             }
         }
+    }
+
+    /// Return every allocated page id (including metadata pages).
+    pub fn allocated_pages(&self) -> Vec<PageId> {
+        self.bitmap.allocated_pages()
     }
 }
 

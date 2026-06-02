@@ -235,7 +235,7 @@ impl GraphStorageEngine {
         let wal_writer = WalWriter::open(wal_dir, fs)?;
 
         let config = BPlusTreeConfig::default();
-        Ok(Self {
+        let mut engine = Self {
             page_manager: pm,
             wal_writer,
             node_index: BPlusTree::new(config.clone()),
@@ -245,12 +245,79 @@ impl GraphStorageEngine {
             node_pages: Vec::new(),
             edge_pages: Vec::new(),
             property_pages: Vec::new(),
-        })
+        };
+
+        // Rebuild secondary indexes from primary data pages.
+        let _ = engine.rebuild_indexes(fs);
+
+        Ok(engine)
     }
 
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
+
+    /// Rebuild secondary indexes by scanning all allocated data pages.
+    ///
+    /// Called automatically during `open` after WAL recovery so that indexes
+    /// are consistent even if the in-memory B+ trees were lost.
+    pub fn rebuild_indexes(&mut self,
+        fs: &dyn FileSystem,
+    ) -> Result<(), StorageError> {
+        use crate::index::key::{label_index_key, type_index_key};
+
+        let allocated = self.page_manager.allocated_pages();
+        for page_id in allocated {
+            // Skip metadata pages.
+            if page_id < 2 {
+                continue;
+            }
+
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            if self.page_manager.read_page(fs, page_id, &mut buf).is_err() {
+                continue; // skip unreadable pages
+            }
+            let page = SlottedPage::new(buf);
+            let count = page.header().slot_count;
+
+            for slot_idx in 0..count {
+                let Some(bytes) = page.read(slot_idx) else {
+                    continue;
+                };
+
+                // Try to decode as NodeRecord (32 bytes).
+                if bytes.len() == NodeRecord::SIZE {
+                    if let Some(node) = NodeRecord::decode(bytes) {
+                        if node.node_id != 0 && (node.flags & node_flags::DELETED) == 0 {
+                            let slot_ref = SlotRef::new(page_id as u32, slot_idx as u8);
+                            let value = slot_ref.raw.to_be_bytes().to_vec();
+                            let _ = self.node_index.insert(&node_id_key(node.node_id as u128), &value);
+                            let _ = self.label_index.insert(
+                                &label_index_key(node.label_id as u64, node.node_id as u128),
+                                &value,
+                            );
+                        }
+                    }
+                }
+
+                // Try to decode as EdgeRecord (48 bytes).
+                if bytes.len() == EdgeRecord::SIZE {
+                    if let Some(edge) = EdgeRecord::decode(bytes) {
+                        if edge.edge_id != 0 && (edge.flags & edge_flags::DELETED) == 0 {
+                            let slot_ref = SlotRef::new(page_id as u32, slot_idx as u8);
+                            let value = slot_ref.raw.to_be_bytes().to_vec();
+                            let _ = self.edge_index.insert(&edge_id_key(edge.edge_id as u128), &value);
+                            let _ = self.type_index.insert(
+                                &type_index_key(edge.type_id as u64, edge.edge_id as u128),
+                                &value,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Write a raw record into the most recently used page in `page_list`,
     /// allocating a fresh page if necessary.
@@ -342,13 +409,16 @@ impl GraphStorageEngine {
         Ok(lsn)
     }
 
-    /// Sync the WAL and superblock to durable storage.
+    /// Sync the WAL, superblock, and bitmap to durable storage.
     pub fn sync(
         &mut self,
         fs: &dyn FileSystem,
     ) -> Result<(), StorageError> {
         self.wal_writer.sync(fs)?;
+        // Write superblock first (both copies), then overwrite the mirror
+        // copy (page 1) with the bitmap page.
         self.page_manager.sync_superblock(fs)?;
+        self.page_manager.sync_bitmap(fs)?;
         Ok(())
     }
 }
@@ -871,5 +941,64 @@ mod tests {
             let retrieved = engine.get_node(i, &fs).unwrap();
             assert!(retrieved.is_some(), "node {} should exist", i);
         }
+    }
+
+    #[test]
+    fn indexes_rebuilt_after_crash_recovery() {
+        use crate::index::key::{label_index_key, type_index_key};
+
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path.clone(), &fs).unwrap();
+
+        // Insert nodes with different labels.
+        let node1 = NodeRecord::new(1, 10);
+        let node2 = NodeRecord::new(2, 20);
+        engine.put_node(&node1, &fs).unwrap();
+        engine.put_node(&node2, &fs).unwrap();
+
+        // Insert edges with different types.
+        let edge1 = EdgeRecord::new(100, 1, SlotRef::new(1, 0), SlotRef::new(2, 0));
+        let edge2 = EdgeRecord::new(101, 2, SlotRef::new(1, 0), SlotRef::new(2, 0));
+        engine.put_edge(&edge1, &fs).unwrap();
+        engine.put_edge(&edge2, &fs).unwrap();
+
+        // Sync to disk.
+        engine.sync(&fs).unwrap();
+
+        // Verify data exists before crash.
+        assert!(engine.get_node(1, &fs).unwrap().is_some(), "node 1 should exist before crash");
+
+        // Simulate crash: drop the engine and reopen from disk.
+        drop(engine);
+        let recovered = GraphStorageEngine::open(path, &fs).unwrap();
+
+        // Verify primary indexes are restored.
+        let n1 = recovered.get_node(1, &fs).unwrap();
+        assert!(n1.is_some(), "node 1 should be recoverable");
+        assert_eq!(n1.unwrap().label_id, 10);
+
+        let n2 = recovered.get_node(2, &fs).unwrap();
+        assert!(n2.is_some(), "node 2 should be recoverable");
+        assert_eq!(n2.unwrap().label_id, 20);
+
+        let e1 = recovered.get_edge(100, &fs).unwrap();
+        assert!(e1.is_some(), "edge 100 should be recoverable");
+        assert_eq!(e1.unwrap().type_id, 1);
+
+        let e2 = recovered.get_edge(101, &fs).unwrap();
+        assert!(e2.is_some(), "edge 101 should be recoverable");
+        assert_eq!(e2.unwrap().type_id, 2);
+
+        // Verify secondary label index is rebuilt.
+        let label_key1 = label_index_key(10, 1);
+        let label_key2 = label_index_key(20, 2);
+        assert!(recovered.label_index.search(&label_key1).is_some(), "label index for node 1 should be rebuilt");
+        assert!(recovered.label_index.search(&label_key2).is_some(), "label index for node 2 should be rebuilt");
+
+        // Verify secondary type index is rebuilt.
+        let type_key1 = type_index_key(1, 100);
+        let type_key2 = type_index_key(2, 101);
+        assert!(recovered.type_index.search(&type_key1).is_some(), "type index for edge 100 should be rebuilt");
+        assert!(recovered.type_index.search(&type_key2).is_some(), "type index for edge 101 should be rebuilt");
     }
 }

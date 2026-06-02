@@ -74,6 +74,21 @@ impl BitmapPage {
         0
     }
 
+    /// Return every allocated page id tracked by this bitmap.
+    pub fn allocated_pages(&self) -> Vec<PageId> {
+        let mut ids = Vec::new();
+        let base = self.base_page_id();
+        let data = &self.page.buf[SlottedPage::HEADER_SIZE..];
+        for i in 0..PAGES_PER_BITMAP {
+            let byte = i / 8;
+            let bit = i % 8;
+            if (data[byte] & (1 << bit)) != 0 {
+                ids.push(base + i as PageId);
+            }
+        }
+        ids
+    }
+
     fn local_index(&self, global_id: PageId) -> usize {
         (global_id - self.base_page_id()) as usize
     }
