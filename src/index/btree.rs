@@ -4,13 +4,15 @@
 //! concurrency.  Structural changes are logged to WAL as physical
 //! redo/undo records.
 
+use crate::buffer::pool::BufferPool;
 use crate::index::key::CompositeKey;
 use crate::index::latch::{LatchCoupling, LatchMode};
 use crate::index::page::BTreePage;
+use crate::io::FileSystem;
 use crate::storage::page::PageId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Configuration knobs for a B+ tree.
 #[derive(Debug, Clone)]
@@ -39,19 +41,36 @@ impl Default for BPlusTreeConfig {
 
 /// In-memory B+ tree using page-level storage.
 ///
-/// This is a simplified implementation intended for unit testing the
-/// B+ tree algorithms before integrating with the full buffer pool and
-/// WAL.  Pages are held in a private `HashMap` keyed by `PageId`.
-#[derive(Debug)]
+/// When a [`BufferPool`] is attached via [`BPlusTree::with_pool`], pages
+/// are fixed in the pool and written back through the normal flush path,
+/// making the index persistent.  Without a pool the tree operates purely
+/// in-memory using a private `HashMap`.
 pub struct BPlusTree {
     pub config: BPlusTreeConfig,
     pub root_page_id: AtomicU64,
     pub latch_mgr: LatchCoupling,
-    /// In-memory page store (page_id -> BTreePage).
+    /// In-memory fallback page store (page_id -> BTreePage).
     pages: Mutex<HashMap<PageId, BTreePage>>,
     next_page_id: Mutex<PageId>,
     /// Monotonic LSN generator for optimistic read validation.
     next_lsn: AtomicU64,
+    /// Optional buffer pool for persistence.
+    pool: Option<Arc<BufferPool>>,
+    /// File-system handle required when `pool` is present.
+    fs: Option<Arc<dyn FileSystem>>,
+}
+
+impl std::fmt::Debug for BPlusTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BPlusTree")
+            .field("config", &self.config)
+            .field("root_page_id", &self.root_page_id)
+            .field("latch_mgr", &self.latch_mgr)
+            .field("next_page_id", &self.next_page_id)
+            .field("next_lsn", &self.next_lsn)
+            .field("pool", &self.pool)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BPlusTree {
@@ -66,6 +85,45 @@ impl BPlusTree {
             pages: Mutex::new(pages),
             next_page_id: Mutex::new(2),
             next_lsn: AtomicU64::new(1),
+            pool: None,
+            fs: None,
+        }
+    }
+
+    /// Attach a buffer pool and file system, enabling persistence.
+    ///
+    /// Any pages already resident in the in-memory fallback store are
+    /// copied into the pool so that subsequent reads are consistent.
+    pub fn with_pool(mut self, pool: Arc<BufferPool>, fs: Arc<dyn FileSystem>) -> Self {
+        self.pool = Some(pool.clone());
+        self.fs = Some(fs.clone());
+        // Sync existing in-memory pages into the pool.
+        let pages = self.pages.lock().unwrap();
+        for (&page_id, page) in pages.iter() {
+            if let Ok(mut guard) = pool.fix_page(fs.as_ref(), page_id) {
+                let buf = guard.buf_mut();
+                buf.copy_from_slice(&page.inner.buf[..]);
+                guard.set_dirty(page.page_lsn());
+            }
+        }
+        drop(pages);
+        self
+    }
+
+    /// Copy every page currently held in the in-memory fallback store into
+    /// the attached buffer pool.  This is useful when migrating an existing
+    /// in-memory tree to persistent storage.
+    pub fn sync_to_pool(&self) {
+        let (Some(pool), Some(fs)) = (&self.pool, self.fs.as_deref()) else {
+            return;
+        };
+        let pages = self.pages.lock().unwrap();
+        for (&page_id, page) in pages.iter() {
+            if let Ok(mut guard) = pool.fix_page(fs, page_id) {
+                let buf = guard.buf_mut();
+                buf.copy_from_slice(&page.inner.buf[..]);
+                guard.set_dirty(page.page_lsn());
+            }
         }
     }
 
@@ -77,18 +135,57 @@ impl BPlusTree {
         let mut next = self.next_page_id.lock().unwrap();
         let id = *next;
         *next += 1;
+        // If a pool is attached, ensure the data file is large enough.
+        if let (Some(pool), Some(fs)) = (&self.pool,
+            self.fs.as_deref()
+        ) {
+            let required_len = id * crate::storage::page::PAGE_SIZE as u64;
+            if let Ok(handle) = fs.open(&pool.data_path, false) {
+                if let Ok(current_len) = handle.len() {
+                    if current_len < required_len {
+                        let _ = handle.set_len(required_len);
+                    }
+                }
+            }
+        }
         id
     }
 
     pub fn get_page(&self, page_id: PageId) -> Option<BTreePage> {
-        let pages = self.pages.lock().unwrap();
-        pages.get(&page_id).cloned()
+        if let (Some(pool), Some(fs)) = (&self.pool, self.fs.as_deref()) {
+            match pool.fix_page(fs, page_id) {
+                Ok(guard) => {
+                    // Copy the page out of the buffer pool.
+                    let buf = guard.buf().clone();
+                    Some(BTreePage::from_buf(buf))
+                }
+                Err(_) => None,
+            }
+        } else {
+            let pages = self.pages.lock().unwrap();
+            pages.get(&page_id).cloned()
+        }
     }
 
     fn put_page_with_lsn(&self, page_id: PageId, mut page: BTreePage) {
-        page.set_page_lsn(self.bump_lsn());
-        let mut pages = self.pages.lock().unwrap();
-        pages.insert(page_id, page);
+        let lsn = self.bump_lsn();
+        page.set_page_lsn(lsn);
+        if let (Some(pool), Some(fs)) = (&self.pool, self.fs.as_deref()) {
+            match pool.fix_page(fs, page_id) {
+                Ok(mut guard) => {
+                    let buf = guard.buf_mut();
+                    buf.copy_from_slice(&page.inner.buf[..]);
+                    guard.set_dirty(lsn);
+                }
+                Err(_) => {
+                    let mut pages = self.pages.lock().unwrap();
+                    pages.insert(page_id, page);
+                }
+            }
+        } else {
+            let mut pages = self.pages.lock().unwrap();
+            pages.insert(page_id, page);
+        }
     }
 
     /// Search for `key` and return `(page_id, slot)` of the leaf entry.
@@ -728,5 +825,79 @@ mod tests {
         let tree = BPlusTree::new(BPlusTreeConfig::default());
         tree.insert(&node_id_key(1), b"one").unwrap();
         assert!(tree.optimistic_search(&node_id_key(2)).is_none());
+    }
+
+    #[test]
+    fn prefix_compression_reduces_leaf_size() {
+        use crate::index::page::BTreePage;
+        let mut page = BTreePage::new_leaf(1);
+        let shared = b"http://example.org/node/";
+        for i in 1u128..=50 {
+            let mut key = shared.to_vec();
+            key.extend_from_slice(&i.to_be_bytes());
+            let value = i.to_be_bytes().to_vec();
+            page.insert_raw(&encode_kv(&key, &value)).unwrap();
+        }
+        // Before recompute: no common prefix.
+        assert_eq!(page.btree_header().common_prefix_len, 0);
+
+        page.recompute_prefix();
+
+        // After recompute: common prefix should exist and match the shared part.
+        assert!(
+            page.btree_header().common_prefix_len > 0,
+            "common prefix should be computed"
+        );
+        let prefix = page.common_prefix();
+        assert!(
+            prefix.starts_with(shared),
+            "common prefix should start with the shared part"
+        );
+
+        // Verify that key_full still reconstructs the original keys correctly.
+        for i in 1u128..=50 {
+            let mut expected_key = shared.to_vec();
+            expected_key.extend_from_slice(&i.to_be_bytes());
+            let full_record = page.key_full(i as u16 - 1).unwrap();
+            let key_len = u16::from_be_bytes([full_record[0], full_record[1]]) as usize;
+            let key = &full_record[2..2 + key_len];
+            assert_eq!(key, expected_key, "key {} should reconstruct correctly", i);
+        }
+    }
+
+    #[test]
+    fn btree_persists_through_buffer_pool() {
+        use crate::buffer::pool::BufferPool;
+        use crate::io::posix::PosixFileSystem;
+        use crate::storage::page::PAGE_SIZE;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rgraph.db");
+        let fs = Arc::new(PosixFileSystem::new(false)) as Arc<dyn FileSystem>;
+        // Pre-allocate file.
+        let handle = fs.open(&path, true).unwrap();
+        handle.set_len(64 * PAGE_SIZE as u64).unwrap();
+        drop(handle);
+
+        let pool = Arc::new(BufferPool::new(8, path.clone()));
+
+        // Build tree with pool attached.
+        let tree = BPlusTree::new(BPlusTreeConfig::default())
+            .with_pool(pool.clone(), fs.clone());
+        for i in 1u128..=50 {
+            let k = node_id_key(i);
+            tree.insert(&k, &i.to_be_bytes()).unwrap();
+        }
+        // Flush dirty pages to disk.
+        pool.flush_all(fs.as_ref()).unwrap();
+
+        // Verify persistence by fixing the root page directly from the pool.
+        let root_id = tree.root_page_id.load(Ordering::Relaxed);
+        let guard = pool.fix_page(fs.as_ref(), root_id).unwrap();
+        let persisted = BTreePage::from_buf(guard.buf().clone());
+        // The page should be a leaf (all 50 small keys fit in one page).
+        assert!(persisted.is_leaf(), "persisted root should still be a leaf");
+        assert_eq!(persisted.key_count(), 50, "all 50 keys should be present");
     }
 }

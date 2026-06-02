@@ -160,12 +160,19 @@ pub fn type_index_key(type_id: u64, edge_id: u128) -> CompositeKey {
 }
 
 /// Build a property index key.
-pub fn property_index_key(property_id: u64, value_hash: u64, node_id: u128) -> CompositeKey {
+///
+/// Layout: `property_id (8 BE) | serialized_value (up to 16 BE) | entity_id (16 BE)`.
+/// The serialized value is truncated to fit within [`MAX_KEY_LEN`] (40 bytes).
+/// This preserves enough ordering for practical range scans while keeping
+/// the key size fixed.
+pub fn property_index_key(property_id: u64, serialized_value: &[u8], entity_id: u128) -> CompositeKey {
     let mut bytes = [0; MAX_KEY_LEN];
     let mut off = 0;
     off += encode_u64_be(property_id, &mut bytes[off..]);
-    off += encode_u64_be(value_hash, &mut bytes[off..]);
-    off += encode_u128_be(node_id, &mut bytes[off..]);
+    let value_len = serialized_value.len().min(MAX_KEY_LEN - off - 16);
+    bytes[off..off + value_len].copy_from_slice(&serialized_value[..value_len]);
+    off += value_len;
+    off += encode_u128_be(entity_id, &mut bytes[off..]);
     CompositeKey { bytes, len: off as u8 }
 }
 
@@ -248,10 +255,10 @@ mod tests {
 
     #[test]
     fn property_index_key_order() {
-        let a = property_index_key(1, 10, 100);
-        let b = property_index_key(1, 10, 101);
-        let c = property_index_key(1, 11, 0);
-        let d = property_index_key(2, 0, 0);
+        let a = property_index_key(1, &[10u8], 100);
+        let b = property_index_key(1, &[10u8], 101);
+        let c = property_index_key(1, &[11u8], 0);
+        let d = property_index_key(2, &[], 0);
         assert!(a.as_slice() < b.as_slice());
         assert!(b.as_slice() < c.as_slice());
         assert!(c.as_slice() < d.as_slice());
@@ -295,9 +302,9 @@ mod tests {
     #[test]
     fn prefix_order() {
         // All keys sharing the same prefix should sort by the next field.
-        let k1 = property_index_key(5, 100, 1);
-        let k2 = property_index_key(5, 100, 2);
-        let k3 = property_index_key(5, 101, 0);
+        let k1 = property_index_key(5, &[100u8], 1);
+        let k2 = property_index_key(5, &[100u8], 2);
+        let k3 = property_index_key(5, &[101u8], 0);
         assert!(k1.as_slice() < k2.as_slice());
         assert!(k2.as_slice() < k3.as_slice());
     }

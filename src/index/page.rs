@@ -3,7 +3,8 @@
 //! Extends the slotted page format with B+ tree specific headers.
 
 use crate::io::AlignedBuffer;
-use crate::storage::page::{PageHeader, PageId, PageType, SlottedPage};
+use crate::storage::page::{PageHeader, PageId, PageType, SlottedPage, PAGE_SIZE};
+use crate::index::prefix::{common_prefix, compress_record, decompress_record, extract_key};
 
 /// Size of the B+ tree specific header extension (after the 64-byte page header).
 pub const BTREE_HEADER_SIZE: usize = 32;
@@ -19,32 +20,38 @@ pub enum BTreePageType {
 }
 
 /// B+ tree specific header fields (stored at offset 64 in the page).
+///
+/// Fields are ordered by size (largest first) to minimise padding and
+/// keep the total struct size at exactly 32 bytes.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct BTreeHeader {
-    /// Tree level (0 = leaf, 1 = first branch, etc.).
-    pub level: u8,
-    /// Number of keys currently stored in this page.
-    pub key_count: u16,
     /// Previous sibling page id (for leaf chaining), or 0.
     pub sibling_prev: PageId,
     /// Next sibling page id (for leaf chaining), or 0.
     pub sibling_next: PageId,
     /// Rightmost child pointer (for branch nodes), or 0.
     pub rightmost_child: PageId,
+    /// Number of keys currently stored in this page.
+    pub key_count: u16,
+    /// Length of the common prefix shared by all keys in this page.
+    pub common_prefix_len: u16,
+    /// Tree level (0 = leaf, 1 = first branch, etc.).
+    pub level: u8,
     /// Reserved padding to keep `BTreeHeader` at 32 bytes.
-    pub _reserved: [u8; 14],
+    pub _reserved: [u8; 3],
 }
 
 impl BTreeHeader {
     pub fn new(level: u8) -> Self {
         Self {
-            level,
-            key_count: 0,
             sibling_prev: 0,
             sibling_next: 0,
             rightmost_child: 0,
-            _reserved: [0; 14],
+            key_count: 0,
+            common_prefix_len: 0,
+            level,
+            _reserved: [0; 3],
         }
     }
 }
@@ -206,6 +213,150 @@ impl BTreePage {
         } else {
             false
         }
+    }
+
+    /// Read the common prefix stored in this page.
+    ///
+    /// The prefix is located immediately after the B+ tree header at offset 96
+    /// and is stored as `[len: u16 BE][bytes…]`.
+    pub fn common_prefix(&self) -> Vec<u8> {
+        let bh = self.btree_header();
+        let len = bh.common_prefix_len as usize;
+        if len == 0 {
+            return Vec::new();
+        }
+        let offset = size_of::<PageHeader>() + size_of::<BTreeHeader>() + 2;
+        if offset + len > self.inner.buf.len() {
+            return Vec::new();
+        }
+        self.inner.buf[offset..offset + len].to_vec()
+    }
+
+    /// Write a new common prefix into the page and update the header.
+    ///
+    /// Existing slot data is **not** rewritten; callers must call
+    /// [`recompute_prefix`] when they want to compress existing records.
+    pub fn set_common_prefix(&mut self,
+        prefix: &[u8],
+    ) {
+        let max_prefix = 512usize; // generous upper bound
+        let prefix = &prefix[..prefix.len().min(max_prefix)];
+        let len = prefix.len();
+        let header_end = size_of::<PageHeader>() + size_of::<BTreeHeader>();
+        let storage_start = header_end + 2;
+        let storage_end = storage_start + len;
+
+        // Ensure we do not overwrite existing slot data.
+        let slot_size = size_of::<crate::storage::page::Slot>();
+        let first_slot_offset = PAGE_SIZE - self.inner.header().slot_count as usize * slot_size;
+        if storage_end > first_slot_offset {
+            // Prefix is too large to fit; silently truncate.
+            return;
+        }
+
+        // Write [len: u16 BE][prefix bytes].
+        self.inner.buf[header_end..header_end + 2]
+            .copy_from_slice(&(len as u16).to_be_bytes());
+        self.inner.buf[storage_start..storage_end].copy_from_slice(prefix);
+
+        // Update header.
+        let mut bh = self.btree_header();
+        bh.common_prefix_len = len as u16;
+        self.write_btree_header(&bh);
+
+        // Adjust free_space_offset so future inserts do not clobber the prefix.
+        let new_free = storage_end as u16;
+        let current_free = self.inner.header().free_space_offset;
+        if new_free > current_free {
+            self.inner.header_mut().free_space_offset = new_free;
+        }
+    }
+
+    /// Recompute the common prefix from all current keys and rewrite every
+    /// slot so that each stores only the suffix.
+    ///
+    /// This is typically called immediately after a page split, when the
+    /// remaining keys are highly homogeneous.
+    pub fn recompute_prefix(&mut self,
+    ) {
+        // Gather full keys (ignoring values) from every live slot.
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        for i in 0..self.slot_count() {
+            if let Some(data) = self.inner.read(i) {
+                records.push(data.to_vec());
+                if let Some(key) = extract_key(data) {
+                    keys.push(key.to_vec());
+                }
+            }
+        }
+        if keys.is_empty() {
+            self.set_common_prefix(&[]);
+            return;
+        }
+
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let prefix = common_prefix(&key_refs);
+        if prefix.is_empty() {
+            self.set_common_prefix(&[]);
+            return;
+        }
+
+        // Rewrite each record with the compressed key.
+        let mut compressed: Vec<Vec<u8>> = Vec::new();
+        for rec in &records {
+            if let Some(c) = compress_record(rec, &prefix) {
+                compressed.push(c);
+            } else {
+                // Fallback: keep original if compression fails.
+                compressed.push(rec.clone());
+            }
+        }
+
+        // Rebuild the page with the new prefix and compressed records.
+        let bh = self.btree_header();
+        let page_id = self.page_id();
+        let page_type = if self.is_leaf() {
+            PageType::BTreeLeaf
+        } else {
+            PageType::BTreeInterior
+        };
+        let page_lsn = self.page_lsn();
+
+        let mut new_inner = SlottedPage::init(page_id, page_type);
+        new_inner.header_mut().page_lsn = page_lsn;
+        self.inner = new_inner;
+        self.write_btree_header(&bh);
+        self.set_common_prefix(&prefix);
+
+        for rec in &compressed {
+            let _ = self.inner.insert(rec);
+        }
+    }
+
+    /// Read the full key at slot `idx`, reconstructing the prefix if present.
+    pub fn key_full(&self, idx: u16) -> Option<Vec<u8>> {
+        let data = self.inner.read(idx)?;
+        let prefix = self.common_prefix();
+        if prefix.is_empty() {
+            return Some(data.to_vec());
+        }
+        decompress_record(data, &prefix)
+    }
+
+    /// Read the full separator key at slot `idx` (branch nodes).
+    pub fn separator_key_full(&self, idx: u16) -> Option<Vec<u8>> {
+        let data = self.inner.read(idx)?;
+        let key_len = data.len().saturating_sub(8);
+        let suffix = &data[..key_len];
+        let prefix = self.common_prefix();
+        if prefix.is_empty() {
+            return Some(suffix.to_vec());
+        }
+        let mut full = Vec::with_capacity(prefix.len() + suffix.len());
+        full.extend_from_slice(&prefix);
+        full.extend_from_slice(suffix);
+        Some(full)
     }
 
     /// Free space available in the page (accounting for both headers).

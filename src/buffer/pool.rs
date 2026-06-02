@@ -65,6 +65,7 @@ impl<'a> Drop for PageGuard<'a> {
 ///
 /// The pool owns a dense array of frames, a sharded page table,
 /// and a ghost queue for scan resistance.
+#[derive(Debug)]
 pub struct BufferPool {
     /// Total number of frames (derived from RAM budget).
     pub frame_count: u32,
