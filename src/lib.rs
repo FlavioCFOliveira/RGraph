@@ -8,3 +8,4 @@ pub mod index;
 pub mod graph;
 pub mod txn;
 pub mod error;
+pub mod cypher;
