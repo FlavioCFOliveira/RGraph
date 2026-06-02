@@ -85,17 +85,16 @@ impl Flusher {
                             continue; // another thread already flushing
                         }
 
-                        let offset = page_id as u64 * crate::storage::page::PAGE_SIZE as u64;
-                        if let Ok(handle) = fs.open(&pool.data_path, false) {
-                            if handle.write_at(&frame.buf, offset).is_ok()
-                                && handle.sync_data().is_ok()
-                            {
-                                frame.desc.dirty.store(false, Ordering::Release);
-                                frame.desc.state.store(FrameState::Clean as u8, Ordering::Release);
-                                let last = frame.desc.last_lsn.load(Ordering::Relaxed);
-                                flushed_lsn_clone.fetch_max(last, Ordering::Release);
-                                frame.desc.rec_lsn.store(u64::MAX, Ordering::Relaxed);
-                            }
+                        let offset = page_id * crate::storage::page::PAGE_SIZE as u64;
+                        if let Ok(handle) = fs.open(&pool.data_path, false)
+                            && handle.write_at(&frame.buf, offset).is_ok()
+                            && handle.sync_data().is_ok()
+                        {
+                            frame.desc.dirty.store(false, Ordering::Release);
+                            frame.desc.state.store(FrameState::Clean as u8, Ordering::Release);
+                            let last = frame.desc.last_lsn.load(Ordering::Relaxed);
+                            flushed_lsn_clone.fetch_max(last, Ordering::Release);
+                            frame.desc.rec_lsn.store(u64::MAX, Ordering::Relaxed);
                         }
                         frame.desc.io_inflight.store(false, Ordering::Release);
                     }

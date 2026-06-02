@@ -49,6 +49,11 @@ pub trait FileHandle: Send + Sync {
     /// Current file size in bytes.
     fn len(&self) -> io::Result<u64>;
 
+    /// Returns `true` if the file is empty (zero bytes).
+    fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
     /// Set the file length (may extend or truncate).
     fn set_len(&self, len: u64) -> io::Result<()>;
 }

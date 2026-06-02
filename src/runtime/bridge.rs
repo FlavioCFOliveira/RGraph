@@ -142,7 +142,7 @@ impl IoBridge {
                     match rx.recv_timeout(std::time::Duration::from_millis(10)) {
                         Ok(IoCommand::ReadPage { page_id, respond }) => {
                             let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
-                            let offset = page_id as u64 * PAGE_SIZE as u64;
+                            let offset = page_id * PAGE_SIZE as u64;
                             let res = match fs.open(&pool.data_path, false) {
                                 Ok(handle) => match handle.read_at(&mut buf, offset) {
                                     Ok(()) => IoResponse::Ok(buf.to_vec()),
@@ -153,7 +153,7 @@ impl IoBridge {
                             let _ = respond.send(res);
                         }
                         Ok(IoCommand::WritePage { page_id, buf, respond }) => {
-                            let offset = page_id as u64 * PAGE_SIZE as u64;
+                            let offset = page_id * PAGE_SIZE as u64;
                             let res = match fs.open(&pool.data_path, false) {
                                 Ok(handle) => match handle.write_at(&buf, offset) {
                                     Ok(()) => match handle.sync_data() {
@@ -269,7 +269,7 @@ mod tests {
             println!("After set_dirty: dirty={}",
                 guard.desc().dirty.load(std::sync::atomic::Ordering::Relaxed));
         }
-        let _flushed = pool.flush_all(&PosixFileSystem::new(false)).unwrap();
+        pool.flush_all(&PosixFileSystem::new(false)).unwrap();
         println!("After flush_all");
         for (i, frame) in pool.iter_frames().enumerate() {
             println!("Frame {}: page_id={}, dirty={}, buf[0]={}",

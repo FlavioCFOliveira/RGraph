@@ -78,6 +78,7 @@ impl<'a> BTreeCursor<'a> {
     }
 
     /// Advance to the next key.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> bool {
         let count = self.current_page.key_count();
         if (self.current_slot as usize) + 1 < count as usize {
@@ -148,6 +149,7 @@ impl<'a> BTreeRangeScan<'a> {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         if self.done {
             return None;
@@ -155,11 +157,11 @@ impl<'a> BTreeRangeScan<'a> {
         let (key, val) = self.cursor.current()?;
         let key = key.to_vec();
         let val = val.to_vec();
-        if let Some(ref end) = self.end_key {
-            if key.as_slice() >= end.as_slice() {
-                self.done = true;
-                return None;
-            }
+        if let Some(ref end) = self.end_key
+            && key.as_slice() >= end.as_slice()
+        {
+            self.done = true;
+            return None;
         }
         let has_next = self.cursor.next();
         if !has_next {

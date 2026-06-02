@@ -102,10 +102,10 @@ impl BulkLoader {
         // Seal final leaf.
         let final_id = current.page_id();
         current.set_siblings(prev_leaf_id, 0);
-        if prev_leaf_id > 0 {
-            if let Some(prev) = leaves.last_mut() {
-                prev.set_siblings(prev.btree_header().sibling_prev, final_id);
-            }
+        if prev_leaf_id > 0
+            && let Some(prev) = leaves.last_mut()
+        {
+            prev.set_siblings(prev.btree_header().sibling_prev, final_id);
         }
         leaves.push(current);
 
@@ -146,11 +146,11 @@ impl BulkLoader {
 
     fn find_first_key(&self, page_id: PageId) -> Vec<u8> {
         for page in &self.pages {
-            if page.page_id() == page_id {
-                if let Some(kv) = page.key(0) {
-                    let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
-                    return kv[2..2 + key_len].to_vec();
-                }
+            if page.page_id() == page_id
+                && let Some(kv) = page.key(0)
+            {
+                let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
+                return kv[2..2 + key_len].to_vec();
             }
         }
         Vec::new()

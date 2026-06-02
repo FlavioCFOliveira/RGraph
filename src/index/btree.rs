@@ -100,10 +100,10 @@ impl BPlusTree {
         let (leaf_id, _) = self.find_leaf(root, key)?;
         let leaf = self.get_page(leaf_id)?;
         let slot = Self::leaf_lower_bound(&leaf, key);
-        if let Some(k) = Self::leaf_key(&leaf, slot) {
-            if k.as_slice() == key.as_slice() {
-                return Some((leaf_id, slot));
-            }
+        if let Some(k) = Self::leaf_key(&leaf, slot)
+            && k.as_slice() == key.as_slice()
+        {
+            return Some((leaf_id, slot));
         }
         None
     }
@@ -155,10 +155,10 @@ impl BPlusTree {
                 None => return self.search(key),
             };
             let slot = Self::leaf_lower_bound(&leaf, key);
-            if let Some(k) = Self::leaf_key(&leaf, slot) {
-                if k.as_slice() == key.as_slice() {
-                    return Some((leaf_id, slot));
-                }
+            if let Some(k) = Self::leaf_key(&leaf, slot)
+                && k.as_slice() == key.as_slice()
+            {
+                return Some((leaf_id, slot));
             }
             return None;
         }
@@ -195,18 +195,18 @@ impl BPlusTree {
 
         // Check if key already exists.
         let slot = Self::leaf_lower_bound(&leaf, key);
-        if let Some(existing) = Self::leaf_key(&leaf, slot) {
-            if existing.as_slice() == key.as_slice() {
-                // Overwrite value in place.
-                let mut new_leaf = leaf.clone();
-                new_leaf.delete(slot);
-                if new_leaf.insert_raw_at(slot, &record).is_some() {
-                    self.put_page_with_lsn(leaf_id, new_leaf);
-                    drop(guard);
-                    return Ok(());
-                }
-                // Leaf full after delete; fall through to split.
+        if let Some(existing) = Self::leaf_key(&leaf, slot)
+            && existing.as_slice() == key.as_slice()
+        {
+            // Overwrite value in place.
+            let mut new_leaf = leaf.clone();
+            new_leaf.delete(slot);
+            if new_leaf.insert_raw_at(slot, &record).is_some() {
+                self.put_page_with_lsn(leaf_id, new_leaf);
+                drop(guard);
+                return Ok(());
             }
+            // Leaf full after delete; fall through to split.
         }
 
         if leaf.insert_raw_at(slot, &record).is_some() {
@@ -351,15 +351,15 @@ impl BPlusTree {
         let new_key_slice = new_key.as_slice();
         let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for i in 0..leaf.slot_count() {
-            if let Some(kv) = leaf.key(i) {
-                if kv.len() >= 2 {
-                    let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
-                    if 2 + key_len <= kv.len() {
-                        let k = &kv[2..2 + key_len];
-                        if k != new_key_slice {
-                            let v = kv[2 + key_len..].to_vec();
-                            entries.push((k.to_vec(), v));
-                        }
+            if let Some(kv) = leaf.key(i)
+                && kv.len() >= 2
+            {
+                let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
+                if 2 + key_len <= kv.len() {
+                    let k = &kv[2..2 + key_len];
+                    if k != new_key_slice {
+                        let v = kv[2 + key_len..].to_vec();
+                        entries.push((k.to_vec(), v));
                     }
                 }
             }

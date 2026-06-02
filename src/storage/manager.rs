@@ -83,14 +83,14 @@ impl PageManager {
 
     /// Read a page from disk into `buf`.
     pub fn read_page(&self, fs: &dyn FileSystem, page_id: PageId, buf: &mut AlignedBuffer) -> io::Result<()> {
-        let offset = page_id as u64 * PAGE_SIZE as u64;
+        let offset = page_id * PAGE_SIZE as u64;
         let handle = fs.open(&self.data_path, false)?;
         handle.read_at(buf, offset)
     }
 
     /// Write `buf` to disk at `page_id`.
     pub fn write_page(&self, fs: &dyn FileSystem, page_id: PageId, buf: &AlignedBuffer) -> io::Result<()> {
-        let offset = page_id as u64 * PAGE_SIZE as u64;
+        let offset = page_id * PAGE_SIZE as u64;
         let handle = fs.open(&self.data_path, false)?;
         handle.write_at(buf, offset)?;
         handle.sync_data()

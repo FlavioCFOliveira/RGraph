@@ -15,6 +15,12 @@ pub struct LabelIndex {
     tree: BPlusTree,
 }
 
+impl Default for LabelIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LabelIndex {
     /// Create a new empty label index.
     pub fn new() -> Self {
@@ -67,10 +73,10 @@ impl LabelIndex {
         let start_key = label_index_key(label_id, 0);
 
         // Find the leaf that would contain the first key for this label.
-        let root = match self.tree.get_page(self.tree.root_page_id.load(std::sync::atomic::Ordering::Relaxed)) {
-            Some(p) => p,
-            None => return results,
-        };
+        // (We probe the root to verify the tree is populated before descending.)
+        if self.tree.get_page(self.tree.root_page_id.load(std::sync::atomic::Ordering::Relaxed)).is_none() {
+            return results;
+        }
 
         let leaf_id = find_leaf(&self.tree,
             self.tree.root_page_id.load(std::sync::atomic::Ordering::Relaxed),

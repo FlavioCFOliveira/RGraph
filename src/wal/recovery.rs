@@ -40,16 +40,16 @@ where
                     RecordType::PageInsert
                     | RecordType::PageUpdate
                     | RecordType::PageFree
-                    | RecordType::BitmapUpdate => {
-                        // Payload: first 8 bytes = page_id, rest = after-image (optional).
-                        if rec.payload.len() >= 8 {
-                            let page_id = u64::from_be_bytes([
-                                rec.payload[0], rec.payload[1], rec.payload[2], rec.payload[3],
-                                rec.payload[4], rec.payload[5], rec.payload[6], rec.payload[7],
-                            ]);
-                            let after_image = &rec.payload[8..];
-                            replay(page_id, after_image, lsn)?;
-                        }
+                    | RecordType::BitmapUpdate
+                        if rec.payload.len() >= 8 =>
+                    {
+                        // Payload: first 8 bytes = page_id, rest = after-image.
+                        let page_id = u64::from_be_bytes([
+                            rec.payload[0], rec.payload[1], rec.payload[2], rec.payload[3],
+                            rec.payload[4], rec.payload[5], rec.payload[6], rec.payload[7],
+                        ]);
+                        let after_image = &rec.payload[8..];
+                        replay(page_id, after_image, lsn)?;
                     }
                     _ => {
                         // Transactional / checkpoint records: nothing to replay at
@@ -87,7 +87,7 @@ pub fn simple_page_replay(
     after_image: &[u8],
     record_lsn: u64,
 ) -> io::Result<()> {
-    let offset = page_id as u64 * PAGE_SIZE as u64;
+    let offset = page_id * PAGE_SIZE as u64;
     let handle = fs.open(data_path, false)?;
 
     // Read existing header to check page_lsn.

@@ -54,7 +54,7 @@ impl FileSystem for PosixFileSystem {
                     if create {
                         opts2.create(true);
                     }
-                    opts2.open(path).map_err(|e2| e2)?
+                    opts2.open(path)?
                 } else {
                     return Err(e);
                 }

@@ -214,7 +214,7 @@ impl GraphStorageEngine {
 
         // Read bitmap page.
         let mut bitmap_buf = AlignedBuffer::zeroed(PAGE_SIZE);
-        handle.read_at(&mut bitmap_buf, (1 * PAGE_SIZE) as u64)?;
+        handle.read_at(&mut bitmap_buf, PAGE_SIZE as u64)?;
 
         let mut pm = PageManager::open(data_path.clone(), sb, bitmap_buf)?;
 
@@ -269,7 +269,7 @@ impl GraphStorageEngine {
             if let Some(slot) = page.insert(record) {
                 page.update_checksum();
                 page_manager.write_page(fs, page_id, &page.buf)?;
-                return Ok(slot_ref(page_id, slot)?);
+                return slot_ref(page_id, slot);
             }
         }
 
@@ -280,7 +280,7 @@ impl GraphStorageEngine {
         page.update_checksum();
         page_manager.write_page(fs, page_id, &page.buf)?;
         page_list.push(page_id);
-        Ok(slot_ref(page_id, slot)?)
+        slot_ref(page_id, slot)
     }
 
     /// Read a raw record from a [`SlotRef`].

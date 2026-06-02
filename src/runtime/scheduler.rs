@@ -100,8 +100,8 @@ impl IoScheduler {
 
                     // Strict priority: try P0 .. P3 in order.
                     let mut found = false;
-                    for lane in 0..4 {
-                        match rxs[lane].try_recv() {
+                    for (lane, rx) in rxs.iter().enumerate() {
+                        match rx.try_recv() {
                             Ok(req) => {
                                 // P3 yield logic.
                                 if lane == 3 {
@@ -153,7 +153,7 @@ impl IoScheduler {
                 use crate::io::AlignedBuffer;
                 use crate::storage::page::PAGE_SIZE;
                 let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
-                let offset = page_id as u64 * PAGE_SIZE as u64;
+                let offset = page_id * PAGE_SIZE as u64;
                 match fs.open(&pool.data_path, false) {
                     Ok(handle) => match handle.read_at(&mut buf, offset) {
                         Ok(()) => ScheduleResponse::Ok(buf.to_vec()),
@@ -164,7 +164,7 @@ impl IoScheduler {
             }
             ScheduleCommand::WritePage { page_id, buf } => {
                 use crate::storage::page::PAGE_SIZE;
-                let offset = page_id as u64 * PAGE_SIZE as u64;
+                let offset = page_id * PAGE_SIZE as u64;
                 match fs.open(&pool.data_path, false) {
                     Ok(handle) => match handle.write_at(&buf[..buf.len().min(PAGE_SIZE)], offset) {
                         Ok(()) => match handle.sync_data() {

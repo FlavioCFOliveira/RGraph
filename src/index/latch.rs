@@ -50,6 +50,12 @@ pub struct LatchCoupling {
     table: Mutex<HashMap<PageId, LatchEntry>>,
 }
 
+impl Default for LatchCoupling {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LatchCoupling {
     pub fn new() -> Self {
         Self {

@@ -49,7 +49,7 @@ pub trait EdgeRecordView {
 pub fn link_source_head<V: EdgeRecordView>(
     view: &mut V,
     new_edge: SlotRef,
-    mut head: SlotRef,
+    head: SlotRef,
 ) -> Result<SlotRef, AdjacencyError> {
     let mut rec = view.read(new_edge).ok_or(AdjacencyError::InvalidSlot)?;
     if rec.source_node.is_null() {
@@ -80,7 +80,7 @@ pub fn link_source_head<V: EdgeRecordView>(
 pub fn link_target_head<V: EdgeRecordView>(
     view: &mut V,
     new_edge: SlotRef,
-    mut head: SlotRef,
+    head: SlotRef,
 ) -> Result<SlotRef, AdjacencyError> {
     let mut rec = view.read(new_edge).ok_or(AdjacencyError::InvalidSlot)?;
     if rec.target_node.is_null() {
@@ -303,8 +303,8 @@ mod tests {
         store.insert(e3, EdgeRecord::new(300, 1, n1, SlotRef::NULL));
 
         let _ = link_source_head(&mut store, e1, SlotRef::NULL).unwrap();
-        let head = link_source_head(&mut store, e2, e1).unwrap();
-        let head = link_source_head(&mut store, e3, head).unwrap();
+        let _head = link_source_head(&mut store, e2, e1).unwrap();
+        let _head = link_source_head(&mut store, e3, _head).unwrap();
 
         // List is now e3 -> e2 -> e1
         let new_head = unlink_source(&mut store, e2).unwrap();
@@ -331,8 +331,8 @@ mod tests {
         store.insert(e1, EdgeRecord::new(100, 1, n1, SlotRef::NULL));
         store.insert(e2, EdgeRecord::new(200, 1, n1, SlotRef::NULL));
 
-        let head = link_source_head(&mut store, e1, SlotRef::NULL).unwrap();
-        let head = link_source_head(&mut store, e2, head).unwrap();
+        let _head = link_source_head(&mut store, e1, SlotRef::NULL).unwrap();
+        let _head = link_source_head(&mut store, e2, _head).unwrap();
 
         let new_head = unlink_source(&mut store, e2).unwrap();
         assert_eq!(new_head, Some(e1));
@@ -354,8 +354,8 @@ mod tests {
         store.insert(e3, EdgeRecord::new(300, 1, SlotRef::NULL, n1));
 
         let _ = link_target_head(&mut store, e1, SlotRef::NULL).unwrap();
-        let head = link_target_head(&mut store, e2, e1).unwrap();
-        let head = link_target_head(&mut store, e3, head).unwrap();
+        let _head = link_target_head(&mut store, e2, e1).unwrap();
+        let _head = link_target_head(&mut store, e3, _head).unwrap();
 
         let new_head = unlink_target(&mut store, e2).unwrap();
         assert!(new_head.is_none());

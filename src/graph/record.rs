@@ -27,8 +27,6 @@
 //! This gives a maximum of **16 777 216 pages** (~128 TiB with 8 KiB
 //! pages) and **255 slots per page**.
 
-use std::mem::size_of;
-
 /// Packed page-id + slot-index reference (4 bytes).
 ///
 /// Layout: upper 24 bits = page_id, lower 8 bits = slot_index.
@@ -49,7 +47,7 @@ impl SlotRef {
     /// `slot_index` does not fit in 8 bits.
     pub fn new(page_id: u32, slot_index: u8) -> Self {
         debug_assert!(page_id <= Self::MAX_PAGE_ID, "page_id exceeds 24 bits");
-        debug_assert!(slot_index <= Self::MAX_SLOT_INDEX, "slot_index exceeds 8 bits");
+        // slot_index is u8 and MAX_SLOT_INDEX = u8::MAX, so the range is always satisfied.
         Self {
             raw: (page_id << 8) | u32::from(slot_index),
         }
@@ -451,6 +449,7 @@ impl From<&str> for PropertyRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::size_of;
 
     // ------------------------------------------------------------------
     // SlotRef

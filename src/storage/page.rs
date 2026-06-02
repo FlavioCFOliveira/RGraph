@@ -100,10 +100,8 @@ impl PageHeader {
         // data area = PAGE_SIZE - header - slot directory
         let header_size = size_of::<PageHeader>();
         let slot_dir_size = self.slot_count as usize * size_of::<Slot>();
-        if header_size + self.free_space_offset as usize + slot_dir_size > PAGE_SIZE {
-            return 0;
-        }
-        PAGE_SIZE - header_size - self.free_space_offset as usize - slot_dir_size
+        let used = header_size + self.free_space_offset as usize + slot_dir_size;
+        PAGE_SIZE.saturating_sub(used)
     }
 }
 
@@ -257,7 +255,7 @@ impl SlottedPage {
         let slot_dir_size = slot_count * size_of::<Slot>();
         let needed = record.len() + size_of::<Slot>();
         let used = Self::HEADER_SIZE + free_offset + slot_dir_size;
-        let available = if used >= PAGE_SIZE { 0 } else { PAGE_SIZE - used };
+        let available = PAGE_SIZE.saturating_sub(used);
 
         if needed > available {
             // Try compacting deleted slots first.
@@ -267,7 +265,7 @@ impl SlottedPage {
             let free_offset = header.free_space_offset as usize;
             let slot_dir_size = slot_count * size_of::<Slot>();
             let used = Self::HEADER_SIZE + free_offset + slot_dir_size;
-            let available = if used >= PAGE_SIZE { 0 } else { PAGE_SIZE - used };
+            let available = PAGE_SIZE.saturating_sub(used);
             if needed > available {
                 return None;
             }
@@ -278,11 +276,13 @@ impl SlottedPage {
 
         // best-fit among deleted slots
         for i in 0..slot_count {
-            if let Some(slot) = self.slot(i as u16) {
-                if slot.is_deleted() && slot.length as usize >= record.len() && (slot.length as usize) < best_len {
-                    best_len = slot.length as usize;
-                    best_idx = Some(i as u16);
-                }
+            if let Some(slot) = self.slot(i as u16)
+                && slot.is_deleted()
+                && slot.length as usize >= record.len()
+                && (slot.length as usize) < best_len
+            {
+                best_len = slot.length as usize;
+                best_idx = Some(i as u16);
             }
         }
 
@@ -335,7 +335,7 @@ impl SlottedPage {
         let slot_dir_size = slot_count * size_of::<Slot>();
         let needed = record.len() + size_of::<Slot>();
         let used = Self::HEADER_SIZE + free_offset + slot_dir_size;
-        let available = if used >= PAGE_SIZE { 0 } else { PAGE_SIZE - used };
+        let available = PAGE_SIZE.saturating_sub(used);
 
         let mut free_offset = free_offset;
         if needed > available {
@@ -345,7 +345,7 @@ impl SlottedPage {
             free_offset = header.free_space_offset as usize;
             let slot_dir_size = slot_count * size_of::<Slot>();
             let used = Self::HEADER_SIZE + free_offset + slot_dir_size;
-            let available = if used >= PAGE_SIZE { 0 } else { PAGE_SIZE - used };
+            let available = PAGE_SIZE.saturating_sub(used);
             if needed > available {
                 return None;
             }
@@ -394,11 +394,11 @@ impl SlottedPage {
     /// data is not moved until compaction.  The original `length` is
     /// preserved so best-fit reuse can pick the smallest adequate slot.
     pub fn delete(&mut self, idx: u16) -> bool {
-        if let Some(slot) = self.slot_mut(idx) {
-            if !slot.is_deleted() {
-                slot.offset = u16::MAX;
-                return true;
-            }
+        if let Some(slot) = self.slot_mut(idx)
+            && !slot.is_deleted()
+        {
+            slot.offset = u16::MAX;
+            return true;
         }
         false
     }
@@ -424,28 +424,28 @@ impl SlottedPage {
         // First pass: collect live slots without mutating buf.
         let mut moves: Vec<(usize, usize, usize)> = Vec::new();
         for i in 0..old_count {
-            if let Some(slot) = self.slot(i) {
-                if !slot.is_deleted() {
-                    let old_start = Self::HEADER_SIZE + slot.offset as usize;
-                    let len = slot.length as usize;
-                    debug_assert!(
-                        old_start + len <= PAGE_SIZE,
-                        "corrupted slot {}: offset={}, length={}, page_id={}",
-                        i,
-                        slot.offset,
-                        slot.length,
-                        self.header().page_id
-                    );
-                    let new_start = Self::HEADER_SIZE + new_offset as usize;
-                    if old_start != new_start {
-                        moves.push((old_start, new_start, len));
-                    }
-                    new_slots.push(Slot {
-                        offset: new_offset,
-                        length: slot.length,
-                    });
-                    new_offset += len as u16;
+            if let Some(slot) = self.slot(i)
+                && !slot.is_deleted()
+            {
+                let old_start = Self::HEADER_SIZE + slot.offset as usize;
+                let len = slot.length as usize;
+                debug_assert!(
+                    old_start + len <= PAGE_SIZE,
+                    "corrupted slot {}: offset={}, length={}, page_id={}",
+                    i,
+                    slot.offset,
+                    slot.length,
+                    self.header().page_id
+                );
+                let new_start = Self::HEADER_SIZE + new_offset as usize;
+                if old_start != new_start {
+                    moves.push((old_start, new_start, len));
                 }
+                new_slots.push(Slot {
+                    offset: new_offset,
+                    length: slot.length,
+                });
+                new_offset += len as u16;
             }
         }
 

@@ -34,8 +34,7 @@ impl WalWriter {
         let segment_path = wal_dir.join("wal-000000000");
         let current_lsn = if fs.exists(&segment_path) {
             let handle = fs.open(&segment_path, false)?;
-            let len = handle.len()?;
-            len
+            handle.len()?
         } else {
             let handle = fs.open(&segment_path, true)?;
             handle.sync_data()?;

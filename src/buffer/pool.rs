@@ -146,6 +146,7 @@ impl BufferPool {
     }
 
     /// Mutable access to a frame (safe because the caller holds &mut PageGuard).
+    #[allow(clippy::mut_from_ref)]
     fn frame_mut(&self, fid: FrameId) -> &mut Frame {
         // SAFETY: The caller holds a &mut PageGuard, which means no other
         // reference to this specific frame exists through guards.
@@ -183,7 +184,7 @@ impl BufferPool {
         let frame = self.frame(fid);
 
         // Read page from disk.
-        let offset = page_id as u64 * PAGE_SIZE as u64;
+        let offset = page_id * PAGE_SIZE as u64;
         let handle = fs.open(&self.data_path, false)?;
         // SAFETY: We are loading into a free frame that no other thread
         // can access (it is not yet in the page table).
@@ -314,9 +315,7 @@ impl BufferPool {
                 }
                 // Not referenced and dirty: attempt to flush inline so we
                 // can evict it immediately.
-                if let Err(e) = self.flush_single_frame(fs, idx as FrameId) {
-                    return Err(e);
-                }
+                self.flush_single_frame(fs, idx as FrameId)?;
                 // After inline flush the frame is clean (or empty if we
                 // evict).  Re-try this index on the next loop iteration.
                 continue;
@@ -352,7 +351,7 @@ impl BufferPool {
             return Ok(()); // another thread is already flushing it
         }
 
-        let offset = page_id as u64 * PAGE_SIZE as u64;
+        let offset = page_id * PAGE_SIZE as u64;
         let handle = fs.open(&self.data_path, false)?;
         handle.write_at(&frame.buf, offset)?;
         handle.sync_data()?;
@@ -371,10 +370,10 @@ impl BufferPool {
         if set.contains_key(&page_id) {
             return;
         }
-        if queue.len() >= self.ghost_capacity {
-            if let Some(old) = queue.pop_front() {
-                set.remove(&old);
-            }
+        if queue.len() >= self.ghost_capacity
+            && let Some(old) = queue.pop_front()
+        {
+            set.remove(&old);
         }
         queue.push_back(page_id);
         set.insert(page_id, ());

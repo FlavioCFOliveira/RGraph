@@ -20,6 +20,12 @@ pub struct EpochPageTable {
     table: Mutex<HashMap<PageId, Atomic<BTreePage>>>,
 }
 
+impl Default for EpochPageTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EpochPageTable {
     pub fn new() -> Self {
         Self {

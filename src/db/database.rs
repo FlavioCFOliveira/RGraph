@@ -105,7 +105,7 @@ impl Database {
 
         // Read bitmap page.
         let mut bitmap_buf = AlignedBuffer::zeroed(PAGE_SIZE);
-        handle.read_at(&mut bitmap_buf, (1 * PAGE_SIZE) as u64)?;
+        handle.read_at(&mut bitmap_buf, PAGE_SIZE as u64)?;
 
         let mut pm = PageManager::open(data_path.clone(), sb, bitmap_buf)?;
 

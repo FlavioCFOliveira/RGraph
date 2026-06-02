@@ -48,6 +48,12 @@ pub struct FrameDescriptor {
     pub state: AtomicU8,
 }
 
+impl Default for FrameDescriptor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameDescriptor {
     pub fn new() -> Self {
         Self {
@@ -95,6 +101,12 @@ impl FrameDescriptor {
 pub struct Frame {
     pub desc: FrameDescriptor,
     pub buf: AlignedBuffer,
+}
+
+impl Default for Frame {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Frame {

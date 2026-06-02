@@ -15,6 +15,12 @@ pub struct TypeIndex {
     tree: BPlusTree,
 }
 
+impl Default for TypeIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypeIndex {
     /// Create a new empty type index.
     pub fn new() -> Self {
