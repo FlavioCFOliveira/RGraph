@@ -1,5 +1,9 @@
 # CLAUDE.md — Diretrizes de Interação para o Projeto RGraph
 
+## Propósito do Projeto
+
+RGraph é uma crate Rust que fornece toda a infraestrutura de suporte a grafos. Foi desenhada desde o início para operar em ambientes de altíssima carga e alta concorrência.
+
 ## 1. Tomada de Decisão
 
 NÃO ESTÁS AUTORIZADO a tomar decisões sozinho.
