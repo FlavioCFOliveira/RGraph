@@ -253,7 +253,12 @@ impl BTreePage {
         // Restore key_count from the header (it was already decremented by delete).
         // Re-insert records preserving order.
         for (idx, record) in records.iter().enumerate() {
-            self.inner.insert_at(idx as u16, record);
+            let result = self.inner.insert_at(idx as u16, record);
+            assert!(
+                result.is_some(),
+                "compact failed: record {} does not fit in rebuilt page",
+                idx
+            );
         }
     }
 

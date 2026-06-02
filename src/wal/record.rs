@@ -47,6 +47,16 @@ pub enum RecordType {
     CheckpointBegin = 0x20,
     /// End checkpoint marker (contains dirty page table and active tx table).
     CheckpointEnd = 0x21,
+    /// A new node record was inserted.
+    NodeInsert = 0x30,
+    /// A node record was deleted (tombstone).
+    NodeDelete = 0x31,
+    /// A new edge record was inserted.
+    EdgeInsert = 0x32,
+    /// An edge record was deleted (tombstone).
+    EdgeDelete = 0x33,
+    /// A new property record was inserted.
+    PropertyInsert = 0x34,
 }
 
 /// A single WAL record.
@@ -191,6 +201,11 @@ impl WalRecord {
             0x13 => RecordType::BitmapUpdate,
             0x20 => RecordType::CheckpointBegin,
             0x21 => RecordType::CheckpointEnd,
+            0x30 => RecordType::NodeInsert,
+            0x31 => RecordType::NodeDelete,
+            0x32 => RecordType::EdgeInsert,
+            0x33 => RecordType::EdgeDelete,
+            0x34 => RecordType::PropertyInsert,
             _ => return None,
         };
         cursor += 1;

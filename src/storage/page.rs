@@ -256,7 +256,8 @@ impl SlottedPage {
         let free_offset = header.free_space_offset as usize;
         let slot_dir_size = slot_count * size_of::<Slot>();
         let needed = record.len() + size_of::<Slot>();
-        let available = PAGE_SIZE - Self::HEADER_SIZE - free_offset - slot_dir_size;
+        let used = Self::HEADER_SIZE + free_offset + slot_dir_size;
+        let available = if used >= PAGE_SIZE { 0 } else { PAGE_SIZE - used };
 
         if needed > available {
             // Try compacting deleted slots first.
@@ -265,7 +266,8 @@ impl SlottedPage {
             let slot_count = header.slot_count as usize;
             let free_offset = header.free_space_offset as usize;
             let slot_dir_size = slot_count * size_of::<Slot>();
-            let available = PAGE_SIZE - Self::HEADER_SIZE - free_offset - slot_dir_size;
+            let used = Self::HEADER_SIZE + free_offset + slot_dir_size;
+            let available = if used >= PAGE_SIZE { 0 } else { PAGE_SIZE - used };
             if needed > available {
                 return None;
             }
@@ -332,15 +334,18 @@ impl SlottedPage {
         let free_offset = header.free_space_offset as usize;
         let slot_dir_size = slot_count * size_of::<Slot>();
         let needed = record.len() + size_of::<Slot>();
-        let available = PAGE_SIZE - Self::HEADER_SIZE - free_offset - slot_dir_size;
+        let used = Self::HEADER_SIZE + free_offset + slot_dir_size;
+        let available = if used >= PAGE_SIZE { 0 } else { PAGE_SIZE - used };
 
+        let mut free_offset = free_offset;
         if needed > available {
             self.compact();
             let header = self.header();
             let slot_count = header.slot_count as usize;
-            let free_offset = header.free_space_offset as usize;
+            free_offset = header.free_space_offset as usize;
             let slot_dir_size = slot_count * size_of::<Slot>();
-            let available = PAGE_SIZE - Self::HEADER_SIZE - free_offset - slot_dir_size;
+            let used = Self::HEADER_SIZE + free_offset + slot_dir_size;
+            let available = if used >= PAGE_SIZE { 0 } else { PAGE_SIZE - used };
             if needed > available {
                 return None;
             }
@@ -423,6 +428,14 @@ impl SlottedPage {
                 if !slot.is_deleted() {
                     let old_start = Self::HEADER_SIZE + slot.offset as usize;
                     let len = slot.length as usize;
+                    debug_assert!(
+                        old_start + len <= PAGE_SIZE,
+                        "corrupted slot {}: offset={}, length={}, page_id={}",
+                        i,
+                        slot.offset,
+                        slot.length,
+                        self.header().page_id
+                    );
                     let new_start = Self::HEADER_SIZE + new_offset as usize;
                     if old_start != new_start {
                         moves.push((old_start, new_start, len));

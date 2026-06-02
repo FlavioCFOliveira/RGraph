@@ -5,3 +5,4 @@ pub mod db;
 pub mod buffer;
 pub mod runtime;
 pub mod index;
+pub mod graph;

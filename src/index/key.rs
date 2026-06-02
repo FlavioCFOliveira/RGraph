@@ -124,6 +124,13 @@ pub fn node_id_key(node_id: u128) -> CompositeKey {
     CompositeKey { bytes, len: 16 }
 }
 
+/// Build an edge-id primary key.
+pub fn edge_id_key(edge_id: u128) -> CompositeKey {
+    let mut bytes = [0; MAX_KEY_LEN];
+    encode_u128_be(edge_id, &mut bytes);
+    CompositeKey { bytes, len: 16 }
+}
+
 /// Build an edge adjacency key.
 pub fn edge_adjacency_key(source_id: u128, type_id: u64, target_id: u128) -> CompositeKey {
     let mut bytes = [0; MAX_KEY_LEN];
@@ -140,6 +147,15 @@ pub fn label_index_key(label_hash: u64, node_id: u128) -> CompositeKey {
     let mut off = 0;
     off += encode_u64_be(label_hash, &mut bytes[off..]);
     off += encode_u128_be(node_id, &mut bytes[off..]);
+    CompositeKey { bytes, len: off as u8 }
+}
+
+/// Build a type index key for edge type lookups.
+pub fn type_index_key(type_id: u64, edge_id: u128) -> CompositeKey {
+    let mut bytes = [0; MAX_KEY_LEN];
+    let mut off = 0;
+    off += encode_u64_be(type_id, &mut bytes[off..]);
+    off += encode_u128_be(edge_id, &mut bytes[off..]);
     CompositeKey { bytes, len: off as u8 }
 }
 
@@ -210,6 +226,22 @@ mod tests {
         let a = label_index_key(1, 10);
         let b = label_index_key(1, 11);
         let c = label_index_key(2, 0);
+        assert!(a.as_slice() < b.as_slice());
+        assert!(b.as_slice() < c.as_slice());
+    }
+
+    #[test]
+    fn edge_id_key_order() {
+        let a = edge_id_key(1);
+        let b = edge_id_key(2);
+        assert!(a.as_slice() < b.as_slice());
+    }
+
+    #[test]
+    fn type_index_key_order() {
+        let a = type_index_key(1, 10);
+        let b = type_index_key(1, 11);
+        let c = type_index_key(2, 0);
         assert!(a.as_slice() < b.as_slice());
         assert!(b.as_slice() < c.as_slice());
     }
