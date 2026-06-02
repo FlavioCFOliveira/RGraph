@@ -4,6 +4,10 @@
 
 RGraph é uma crate Rust que fornece toda a infraestrutura de suporte a grafos. Foi desenhada desde o início para operar em ambientes de altíssima carga e alta concorrência.
 
+O projeto suporta de raiz os dois modelos de dados de grafos mais relevantes:
+- **LPG** (Label Property Graph)
+- **RDF** (Resource Description Framework)
+
 ## 1. Tomada de Decisão
 
 NÃO ESTÁS AUTORIZADO a tomar decisões sozinho.
