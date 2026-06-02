@@ -127,7 +127,13 @@ impl BPlusTree {
         }
     }
 
-    fn bump_lsn(&self) -> u64 {
+    /// Return a snapshot of every page id currently known to the tree.
+    pub fn all_page_ids(&self) -> Vec<PageId> {
+        let pages = self.pages.lock().unwrap();
+        pages.keys().copied().collect()
+    }
+
+    pub(crate) fn bump_lsn(&self) -> u64 {
         self.next_lsn.fetch_add(1, Ordering::Relaxed)
     }
 
@@ -167,7 +173,7 @@ impl BPlusTree {
         }
     }
 
-    fn put_page_with_lsn(&self, page_id: PageId, mut page: BTreePage) {
+    pub(crate) fn put_page_with_lsn(&self, page_id: PageId, mut page: BTreePage) {
         let lsn = self.bump_lsn();
         page.set_page_lsn(lsn);
         if let (Some(pool), Some(fs)) = (&self.pool, self.fs.as_deref()) {

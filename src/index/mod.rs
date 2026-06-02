@@ -17,6 +17,7 @@ pub mod label;
 pub mod adjacency_index;
 pub mod rdf_store;
 pub mod manager;
+pub mod defrag;
 
 pub use value_codec::{Value, encode, decode, encode_property_value, MAX_ENCODED_LEN};
 pub use prefix::{common_prefix, compress_record, decompress_record, extract_key};

@@ -7,7 +7,7 @@
 use crate::graph::record::SlotRef;
 use crate::index::adjacency_index::AdjacencyIndex;
 use crate::index::btree::{BPlusTree, BPlusTreeConfig, BTreeError};
-use crate::index::key::{edge_id_key, label_index_key, node_id_key, type_index_key};
+use crate::index::key::{edge_id_key, node_id_key};
 use crate::index::label::LabelIndex;
 use crate::graph::record::ValueType;
 use crate::index::property::PropertyIndex;
