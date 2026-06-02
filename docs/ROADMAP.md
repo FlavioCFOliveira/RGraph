@@ -100,47 +100,52 @@ The storage engine is organized into five layers:
 
 **Duration:** 4 weeks | **Themes:** I/O abstraction, Page format, Basic WAL, Runnable MVP
 
-| Title | Type | Priority |
-|-------|------|----------|
-| Define portable FileSystem trait | TASK | 9 |
-| Implement aligned buffer allocator | TASK | 9 |
-| Define 8KB slotted page format | TASK | 9 |
-| Build simple page manager | TASK | 9 |
-| Implement WAL record codec | TASK | 9 |
-| Build append-only WAL writer | TASK | 9 |
-| Implement basic redo-only crash recovery | TASK | 9 |
-| Create runnable CLI MVP | USER_STORY | 8 |
+| Title | Type | Priority | Depends On |
+|-------|------|----------|------------|
+| Define portable FileSystem trait | TASK | 9 | — |
+| Implement aligned buffer allocator | TASK | 9 | FileSystem trait |
+| Define 8KB slotted page format | TASK | 9 | Aligned buffer allocator |
+| Design database bootstrap and meta page format | TASK | 9 | FileSystem trait, Aligned buffer |
+| Implement page allocation bitmap and free-list structures | TASK | 9 | Slotted page format, Meta page |
+| Build simple page manager | TASK | 9 | FileSystem trait, Slotted page, Bitmap |
+| Implement WAL record codec | TASK | 9 | FileSystem trait |
+| Build append-only WAL writer | TASK | 9 | WAL record codec |
+| Implement basic redo-only crash recovery | TASK | 9 | WAL writer |
+| Implement database init and open routines | TASK | 9 | WAL writer, Crash recovery, Bitmap |
+| Create runnable CLI MVP | USER_STORY | 8 | Crash recovery |
 
 ### Sprint 2: Buffer Pool & I/O Runtime
 **Goal:** Replace the simple page manager with a production user-space buffer pool (CLOCK-Pro, background flush, fuzzy checkpoints) and establish the async/sync runtime bridge.
 
 **Duration:** 4 weeks | **Themes:** Buffer pool, Background flush, Async I/O bridge, Checkpointing
 
-| Title | Type | Priority |
-|-------|------|----------|
-| Implement frame table and sharded page table | TASK | 9 |
-| Implement CLOCK-Pro replacement policy | TASK | 9 |
-| Build background dirty-page flusher | TASK | 9 |
-| Implement fuzzy checkpoint protocol | TASK | 9 |
-| Build channel-based I/O runtime bridge | TASK | 9 |
-| Implement multi-queue I/O scheduler | TASK | 9 |
-| Add O_DIRECT support | TASK | 8 |
-| Integrate PageLSN tracking and WAL-before-flush ordering | TASK | 9 |
+| Title | Type | Priority | Depends On |
+|-------|------|----------|------------|
+| Build channel-based I/O runtime bridge | TASK | 9 | FileSystem trait |
+| Implement multi-queue I/O scheduler | TASK | 9 | I/O runtime bridge |
+| Add O_DIRECT support | TASK | 8 | FileSystem trait, Aligned buffer |
+| Implement frame table and sharded page table | TASK | 9 | Page manager |
+| Implement CLOCK-Pro replacement policy | TASK | 9 | Frame table |
+| Integrate PageLSN tracking and WAL-before-flush ordering | TASK | 9 | WAL writer, Frame table |
+| Build background dirty-page flusher | TASK | 9 | WAL writer, CLOCK-Pro |
+| Implement fuzzy checkpoint protocol | TASK | 9 | Background flusher |
 
 ### Sprint 3: B+ Tree Core
 **Goal:** Implement a persistent B+ tree with slotted pages, latch crabbing, split/merge, optimistic reads, and crossbeam-epoch reclamation.
 
 **Duration:** 4 weeks | **Themes:** B+ tree persistence, Latch crabbing, Split and merge, Lock-free reads
 
-| Title | Type | Priority |
-|-------|------|----------|
-| Implement B+ tree leaf and branch page formats | TASK | 9 |
-| Define composite key encoding | TASK | 9 |
-| Implement latch crabbing with deadlock-free ordering | TASK | 9 |
-| Implement split and merge with physical WAL records | TASK | 9 |
-| Integrate crossbeam-epoch for page pointer swizzling | TASK | 9 |
-| Build optimistic reader traversal | TASK | 8 |
-| Implement bottom-up bulk loader | TASK | 8 |
+| Title | Type | Priority | Depends On |
+|-------|------|----------|------------|
+| Define composite key encoding | TASK | 9 | — |
+| Implement B+ tree leaf and branch page formats | TASK | 9 | Composite key encoding |
+| Implement latch crabbing with deadlock-free ordering | TASK | 9 | B+ tree page formats |
+| Implement B+ tree search and point insert/delete | TASK | 9 | Latch crabbing |
+| Implement split and merge with physical WAL records | TASK | 9 | Search and insert/delete |
+| Implement B+ tree cursor and range scan iterator | TASK | 8 | Search and insert/delete |
+| Integrate crossbeam-epoch for page pointer swizzling | TASK | 9 | Split and merge |
+| Build optimistic reader traversal | TASK | 8 | Latch crabbing |
+| Implement bottom-up bulk loader | TASK | 8 | Split and merge |
 
 ### Sprint 4: Graph Native Storage
 **Goal:** Implement native graph record formats (nodes, edges, properties, adjacency lists) and basic secondary indexes on top of the B+ tree and page manager.
@@ -224,34 +229,44 @@ The critical path (tasks that must be completed in sequence and directly block d
 1. Define portable FileSystem trait
 2. Implement aligned buffer allocator
 3. Define 8KB slotted page format
-4. Implement WAL record codec
-5. Build append-only WAL writer
-6. Implement frame table and sharded page table
-7. Integrate PageLSN tracking and WAL-before-flush ordering
-8. Implement latch crabbing with deadlock-free ordering
-9. Implement split and merge with physical WAL records
-10. Implement fixed-size 32-byte node record format
-11. Implement fixed-size 48-byte edge record format
-12. Implement monotonic TxID allocator
-13. Build global transaction state manager
-14. Implement snapshot acquisition and visibility evaluator
-15. Implement sharded lock table with wait queues
-16. Implement group-commit queue with fsync coalescing
-17. Implement ANALYSIS phase
-18. Implement REDO phase
-19. Implement UNDO phase with CLR generation
-20. Build double-write buffer for torn page protection
-21. Implement property index B+ tree
-22. Implement RDF SPO/POS/OSP B+ tree indexes
-23. Implement io_uring backend
-24. Build FaultInjectFileSystem and DeterministicIoUring tests
-25. Implement ACID stress tests and benchmark suite
+4. Design database bootstrap and meta page format
+5. Implement page allocation bitmap and free-list structures
+6. Build simple page manager
+7. Implement WAL record codec
+8. Build append-only WAL writer
+9. Implement basic redo-only crash recovery
+10. Implement database init and open routines
+11. Implement frame table and sharded page table
+12. Integrate PageLSN tracking and WAL-before-flush ordering
+13. Define composite key encoding
+14. Implement B+ tree leaf and branch page formats
+15. Implement latch crabbing with deadlock-free ordering
+16. Implement B+ tree search and point insert/delete
+17. Implement split and merge with physical WAL records
+18. Implement B+ tree cursor and range scan iterator
+19. Implement fixed-size 32-byte node record format
+20. Implement fixed-size 48-byte edge record format
+21. Implement monotonic TxID allocator
+22. Build global transaction state manager
+23. Design slotted page tuple headers for MVCC
+24. Implement snapshot acquisition and visibility evaluator
+25. Implement sharded lock table with wait queues
+26. Implement group-commit queue with fsync coalescing
+27. Implement ANALYSIS phase
+28. Implement REDO phase
+29. Implement UNDO phase with CLR generation
+30. Build double-write buffer for torn page protection
+31. Implement property index B+ tree
+32. Implement RDF SPO/POS/OSP B+ tree indexes
+33. Implement io_uring backend
+34. Build FaultInjectFileSystem and DeterministicIoUring tests
+35. Implement ACID stress tests and benchmark suite
 
 ## Risks & Mitigations
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Achieving RocksDB-level crash recovery reliability without years of battle testing | High | Implement deterministic fault injection and ARIES recovery property tests from Sprint 1; run continuous crash-recovery CI with random kill points |
+| Achieving production-grade crash recovery reliability without years of battle testing | High | Implement deterministic fault injection and ARIES recovery property tests from Sprint 1; run continuous crash-recovery CI with random kill points |
 | Designing a deadlock-free or recoverable locking protocol for dense-graph edge updates under high concurrency | High | Use strict ascending page_id latch ordering and wound-wait victim selection; validate with loom/shuttle concurrency tests and synthetic deadlock generators |
 | Implementing io_uring correctly and safely in Rust with a custom runtime; fallback to async std I/O may reduce performance | Medium | Abstract I/O behind the FileSystem trait so io_uring is swappable; maintain a fully functional blocking pool backend from day one |
 | Balancing page size and record format for both small property-heavy LPG nodes and large RDF string literals | Medium | Use inline threshold of 256 bytes with overflow chains; benchmark both LPG and RDF workloads before finalizing prefix compression thresholds |
@@ -263,9 +278,9 @@ The critical path (tasks that must be completed in sequence and directly block d
 ## Immediate Next Steps
 
 1. Create the `FileSystem` trait and aligned buffer allocator as the first commit.
-2. Write a design document for the 8KB slotted page format and composite key encoding.
+2. Write a design document for the 8KB slotted page format, meta page format, and composite key encoding.
 3. Set up CI benchmarks for I/O latency before any storage code is written.
-4. Remove the `rocksdb` and `librocksdb-sys` crates from `Cargo.toml` and all module references.
+4. Initialize the Rust crate (`cargo init`) with the dependency manifest aligned to the technology choices table.
 5. Initialize the rmp Knowledge Graph with nodes for `PageManager`, `WALManager`, `BufferPool`, `BPlusTree`, `TransactionManager`, and relationships mapping dependencies.
 
 ## Knowledge Graph
