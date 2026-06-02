@@ -186,6 +186,41 @@ impl Graph {
         }
         Ok(rels)
     }
+
+    /// Insert an entry into the property secondary index.
+    ///
+    /// This is a low-level operation exposed for testing; in production the
+    /// property index is maintained automatically by `create_node` and
+    /// `create_relationship` once full property persistence is wired.
+    pub fn insert_property_index(
+        &mut self,
+        entity_id: u64,
+        property_id: u64,
+        value_type: crate::graph::record::ValueType,
+        payload: &[u8],
+        slot: SlotRef,
+    ) -> Result<(), StorageError> {
+        self.engine.insert_property_index(entity_id as u128, property_id, value_type, payload, slot)
+    }
+
+    /// Scan nodes that have a property with the given `property_id` and value.
+    pub fn scan_nodes_by_property(
+        &self,
+        property_id: u64,
+        value_type: crate::graph::record::ValueType,
+        payload: &[u8],
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<Node>, StorageError> {
+        let entries = self.engine.scan_property_index(property_id, value_type, payload);
+        let mut nodes = Vec::new();
+        for (entity_id, _prop_slot) in entries {
+            let node_id = entity_id as u64;
+            if let Some(node) = self.get_node(node_id, fs)? {
+                nodes.push(node);
+            }
+        }
+        Ok(nodes)
+    }
 }
 
 #[cfg(test)]
@@ -364,5 +399,42 @@ mod tests {
         let rels = graph.scan_by_type(5, &fs).unwrap();
         assert_eq!(rels.len(), 1);
         assert_eq!(rels[0].edge_id, 101);
+    }
+
+    #[test]
+    fn scan_nodes_by_property_returns_matching_nodes() {
+        let (_dir, fs, _path, mut graph) = temp_graph();
+        graph.create_node(NodeBuilder::new(1).label(10), &fs).unwrap();
+        graph.create_node(NodeBuilder::new(2).label(10), &fs).unwrap();
+        graph.create_node(NodeBuilder::new(3).label(10), &fs).unwrap();
+
+        // Manually insert property index entries.
+        let slot = SlotRef::new(1, 0);
+        graph.insert_property_index(1, 42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), slot).unwrap();
+        graph.insert_property_index(2, 42, crate::graph::record::ValueType::Int64, &20i64.to_be_bytes(), slot).unwrap();
+        graph.insert_property_index(3, 42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), slot).unwrap();
+
+        let nodes = graph.scan_nodes_by_property(42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), &fs).unwrap();
+        assert_eq!(nodes.len(), 2);
+        let ids: Vec<u64> = nodes.iter().map(|n| n.node_id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&3));
+    }
+
+    #[test]
+    fn scan_nodes_by_property_excludes_deleted() {
+        let (_dir, fs, _path, mut graph) = temp_graph();
+        graph.create_node(NodeBuilder::new(1).label(10), &fs).unwrap();
+        graph.create_node(NodeBuilder::new(2).label(10), &fs).unwrap();
+
+        let slot = SlotRef::new(1, 0);
+        graph.insert_property_index(1, 42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), slot).unwrap();
+        graph.insert_property_index(2, 42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), slot).unwrap();
+
+        graph.delete_node(1, &fs).unwrap();
+
+        let nodes = graph.scan_nodes_by_property(42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), &fs).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_id, 2);
     }
 }

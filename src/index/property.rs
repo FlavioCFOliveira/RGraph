@@ -33,6 +33,11 @@ impl PropertyIndex {
         }
     }
 
+    /// Return a reference to the underlying B+ tree.
+    pub fn tree(&self) -> &BPlusTree {
+        &self.tree
+    }
+
     /// Insert or update an entry.
     ///
     /// `entity_id` is the node or edge id that carries this property.

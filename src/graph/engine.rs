@@ -5,7 +5,7 @@
 
 use crate::graph::record::{EdgeRecord, NodeRecord, PropertyRecord, SlotRef, ValueType, node_flags, edge_flags};
 use crate::index::btree::{BPlusTree, BPlusTreeConfig, BTreeError};
-use crate::index::key::{edge_id_key, label_index_key, node_id_key, type_index_key};
+use crate::index::key::{edge_id_key, label_index_key, node_id_key, property_index_key, type_index_key};
 use crate::index::property::PropertyIndex;
 use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::manager::PageManager;
@@ -470,6 +470,46 @@ impl GraphStorageEngine {
             }
         }
         Ok(results)
+    }
+
+    pub fn insert_property_index(
+        &mut self,
+        entity_id: u128,
+        property_id: u64,
+        value_type: ValueType,
+        payload: &[u8],
+        slot: SlotRef,
+    ) -> Result<(), StorageError> {
+        self.property_index.insert(property_id, value_type, payload, entity_id, slot)
+            .map_err(|e| e.into())
+    }
+
+    pub fn scan_property_index(
+        &self,
+        property_id: u64,
+        value_type: ValueType,
+        payload: &[u8],
+    ) -> Vec<(u128, SlotRef)> {
+        let serialized = crate::index::value_codec::encode_property_value(value_type, payload)
+            .unwrap_or_else(|| vec![0x00]);
+        let start = property_index_key(property_id, &serialized, 0);
+        let end = property_index_key(property_id, &serialized, u128::MAX);
+        let entries = self.property_index.tree().range_search(&start, &end);
+        let mut results = Vec::new();
+        for (key, value) in entries {
+            let key_slice = key.as_slice();
+            if key_slice.len() < 16 {
+                continue;
+            }
+            let entity_bytes = &key_slice[key_slice.len() - 16..];
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(entity_bytes);
+            let entity_id = u128::from_be_bytes(arr);
+            if let Some(slot_ref) = decode_slot_ref(&value) {
+                results.push((entity_id, slot_ref));
+            }
+        }
+        results
     }
 }
 

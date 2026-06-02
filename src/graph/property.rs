@@ -121,6 +121,31 @@ impl Property {
             Property::Duration(_) => 9,
         }
     }
+
+    /// Convert this property into the `(ValueType, payload)` pair used by
+    /// the storage engine and secondary indexes.
+    ///
+    /// Returns `None` for composite types that are not yet supported by the
+    /// on-disk codec (`List`, `Map`, `Point`, `Date`, `Duration`).
+    pub fn to_value_type_payload(&self,
+    ) -> Option<(crate::graph::record::ValueType, Vec<u8>)> {
+        use crate::graph::record::ValueType;
+        match self {
+            Property::Null => Some((ValueType::Null, Vec::new())),
+            Property::Boolean(b) => Some((ValueType::Bool, vec![if *b { 0x01 } else { 0x00 }])),
+            Property::Integer(v) => Some((ValueType::Int64, v.to_be_bytes().to_vec())),
+            Property::Float(OrderedF64(v)) => {
+                let bits = if v.is_nan() {
+                    0x7FF8_0000_0000_0000u64
+                } else {
+                    v.to_bits()
+                };
+                Some((ValueType::Float64, bits.to_be_bytes().to_vec()))
+            }
+            Property::String(s) => Some((ValueType::String, s.as_bytes().to_vec())),
+            _ => None, // composites not yet supported for indexing
+        }
+    }
 }
 
 // ------------------------------------------------------------------
