@@ -269,7 +269,7 @@ mod tests {
             println!("After set_dirty: dirty={}",
                 guard.desc().dirty.load(std::sync::atomic::Ordering::Relaxed));
         }
-        let flushed = pool.flush_all(&PosixFileSystem::new(false)).unwrap();
+        let _flushed = pool.flush_all(&PosixFileSystem::new(false)).unwrap();
         println!("After flush_all");
         for (i, frame) in pool.iter_frames().enumerate() {
             println!("Frame {}: page_id={}, dirty={}, buf[0]={}",

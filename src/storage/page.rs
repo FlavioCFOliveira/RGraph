@@ -131,7 +131,7 @@ impl Slot {
 }
 
 /// In-memory view of a slotted page backed by an [`AlignedBuffer`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SlottedPage {
     pub buf: AlignedBuffer,
 }
@@ -320,6 +320,71 @@ impl SlottedPage {
         Some(new_slot_idx)
     }
 
+    /// Insert a record at a specific logical slot index, shifting existing
+    /// slots to the right.  Returns `Some(idx)` on success or `None` if the
+    /// record does not fit.
+    pub fn insert_at(&mut self, idx: u16, record: &[u8]) -> Option<u16> {
+        if record.len() > MAX_INLINE_RECORD_LEN {
+            return None;
+        }
+        let header = self.header();
+        let slot_count = header.slot_count as usize;
+        let free_offset = header.free_space_offset as usize;
+        let slot_dir_size = slot_count * size_of::<Slot>();
+        let needed = record.len() + size_of::<Slot>();
+        let available = PAGE_SIZE - Self::HEADER_SIZE - free_offset - slot_dir_size;
+
+        if needed > available {
+            self.compact();
+            let header = self.header();
+            let slot_count = header.slot_count as usize;
+            let free_offset = header.free_space_offset as usize;
+            let slot_dir_size = slot_count * size_of::<Slot>();
+            let available = PAGE_SIZE - Self::HEADER_SIZE - free_offset - slot_dir_size;
+            if needed > available {
+                return None;
+            }
+        }
+
+        // Write record at current free offset.
+        let data_start = Self::HEADER_SIZE + free_offset;
+        self.buf[data_start..data_start + record.len()].copy_from_slice(record);
+
+        let header_mut = self.header_mut();
+        header_mut.slot_count += 1;
+        header_mut.free_space_offset = (free_offset + record.len()) as u16;
+        let new_slot = Slot {
+            offset: free_offset as u16,
+            length: record.len() as u16,
+        };
+
+        // Collect existing slots in logical order (slot 0 .. slot N-1).
+        let count = self.header().slot_count as usize;
+        let mut slots: Vec<Slot> = Vec::with_capacity(count);
+        for i in 0..(count - 1) {
+            if let Some(s) = self.slot(i as u16) {
+                slots.push(*s);
+            }
+        }
+
+        // Insert new slot at the requested logical position.
+        let pos = (idx as usize).min(slots.len());
+        slots.insert(pos, new_slot);
+
+        // Rewrite slot directory in reverse order (logical 0 at the tail).
+        let start = PAGE_SIZE - count * size_of::<Slot>();
+        for (i, slot) in slots.iter().enumerate() {
+            let phys_pos = count - 1 - i;
+            let offset = start + phys_pos * size_of::<Slot>();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(slot as *const _ as *const u8, size_of::<Slot>())
+            };
+            self.buf[offset..offset + size_of::<Slot>()].copy_from_slice(bytes);
+        }
+
+        Some(pos as u16)
+    }
+
     /// Delete the record at `idx`.  The slot is marked deleted but the
     /// data is not moved until compaction.  The original `length` is
     /// preserved so best-fit reuse can pick the smallest adequate slot.
@@ -455,5 +520,27 @@ mod tests {
         page.update_checksum();
         page.buf[100] ^= 0xFF;
         assert!(!page.verify_checksum());
+    }
+
+    #[test]
+    fn insert_at_maintains_order() {
+        let mut page = SlottedPage::init(1, PageType::SlottedData);
+        page.insert_at(0, b"bbb").unwrap();
+        page.insert_at(0, b"aaa").unwrap();
+        page.insert_at(2, b"ccc").unwrap();
+        assert_eq!(page.read(0).unwrap(), b"aaa");
+        assert_eq!(page.read(1).unwrap(), b"bbb");
+        assert_eq!(page.read(2).unwrap(), b"ccc");
+    }
+
+    #[test]
+    fn insert_at_after_delete_and_compact() {
+        let mut page = SlottedPage::init(1, PageType::SlottedData);
+        page.insert(b"aaa").unwrap();
+        page.delete(0);
+        page.compact();
+        page.insert_at(0, b"bbb").unwrap();
+        assert_eq!(page.read(0).unwrap(), b"bbb");
+        assert_eq!(page.header().slot_count, 1);
     }
 }

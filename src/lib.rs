@@ -4,3 +4,4 @@ pub mod wal;
 pub mod db;
 pub mod buffer;
 pub mod runtime;
+pub mod index;

@@ -69,6 +69,14 @@ impl AlignedBuffer {
     }
 }
 
+impl Clone for AlignedBuffer {
+    fn clone(&self) -> Self {
+        let mut new = Self::zeroed(self.len);
+        new.copy_from_slice(&self[..]);
+        new
+    }
+}
+
 // SAFETY: `AlignedBuffer` owns its memory and there is no aliasing.
 unsafe impl Send for AlignedBuffer {}
 unsafe impl Sync for AlignedBuffer {}
