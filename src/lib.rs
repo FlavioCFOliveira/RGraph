@@ -7,3 +7,4 @@ pub mod runtime;
 pub mod index;
 pub mod graph;
 pub mod txn;
+pub mod error;

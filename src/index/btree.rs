@@ -439,6 +439,64 @@ impl BPlusTree {
             &kv[2..2 + key_len]))
     }
 
+    fn leaf_value(page: &BTreePage, slot: u16) -> Option<Vec<u8>> {
+        let kv = page.key(slot)?;
+        if kv.len() < 2 {
+            return None;
+        }
+        let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
+        if 2 + key_len > kv.len() {
+            return None;
+        }
+        Some(kv[2 + key_len..].to_vec())
+    }
+
+    /// Range search: return all `(key, value)` pairs where key is in `[start, end)`.
+    pub fn range_search(
+        &self,
+        start: &CompositeKey,
+        end: &CompositeKey,
+    ) -> Vec<(CompositeKey, Vec<u8>)> {
+        let mut results = Vec::new();
+        let root = match self.get_page(self.root_page_id.load(Ordering::Relaxed)) {
+            Some(p) => p,
+            None => return results,
+        };
+        let (mut leaf_id, _) = match self.find_leaf(root, start) {
+            Some(r) => r,
+            None => return results,
+        };
+
+        loop {
+            let leaf = match self.get_page(leaf_id) {
+                Some(p) => p,
+                None => break,
+            };
+            let count = leaf.key_count();
+            for slot in 0..count {
+                if let Some(key) = Self::leaf_key(&leaf, slot) {
+                    let key_slice = key.as_slice();
+                    if key_slice < start.as_slice() {
+                        continue;
+                    }
+                    if key_slice >= end.as_slice() {
+                        return results;
+                    }
+                    if let Some(value) = Self::leaf_value(&leaf, slot) {
+                        results.push((key, value));
+                    }
+                }
+            }
+            let next = leaf.btree_header().sibling_next;
+            if next == 0 {
+                break;
+            }
+            leaf_id = next;
+        }
+
+        results
+    }
+
     fn split_leaf(
         &self,
         leaf_id: PageId,

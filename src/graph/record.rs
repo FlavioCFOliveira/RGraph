@@ -165,7 +165,7 @@ pub mod node_flags {
 /// 0x2A  generation           u16
 /// 0x2C  _pad                 u32
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct EdgeRecord {
     pub edge_id: u64,

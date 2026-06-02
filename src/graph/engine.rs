@@ -3,9 +3,10 @@
 //! The [`GraphStorageEngine`] provides CRUD operations for nodes, edges,
 //! and properties on top of the page manager, B+ tree indexes, and WAL.
 
-use crate::graph::record::{EdgeRecord, NodeRecord, PropertyRecord, SlotRef, node_flags, edge_flags};
+use crate::graph::record::{EdgeRecord, NodeRecord, PropertyRecord, SlotRef, ValueType, node_flags, edge_flags};
 use crate::index::btree::{BPlusTree, BPlusTreeConfig, BTreeError};
 use crate::index::key::{edge_id_key, label_index_key, node_id_key, type_index_key};
+use crate::index::property::PropertyIndex;
 use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::manager::PageManager;
 use crate::storage::page::{PageId, PageType, SlottedPage, PAGE_SIZE};
@@ -149,6 +150,7 @@ pub struct GraphStorageEngine {
     pub edge_index: BPlusTree,
     pub label_index: BPlusTree,
     pub type_index: BPlusTree,
+    pub property_index: PropertyIndex,
     pub node_pages: Vec<PageId>,
     pub edge_pages: Vec<PageId>,
     pub property_pages: Vec<PageId>,
@@ -180,7 +182,8 @@ impl GraphStorageEngine {
             node_index: BPlusTree::new(config.clone()),
             edge_index: BPlusTree::new(config.clone()),
             label_index: BPlusTree::new(config.clone()),
-            type_index: BPlusTree::new(config),
+            type_index: BPlusTree::new(config.clone()),
+            property_index: PropertyIndex::new(),
             node_pages: Vec::new(),
             edge_pages: Vec::new(),
             property_pages: Vec::new(),
@@ -241,7 +244,8 @@ impl GraphStorageEngine {
             node_index: BPlusTree::new(config.clone()),
             edge_index: BPlusTree::new(config.clone()),
             label_index: BPlusTree::new(config.clone()),
-            type_index: BPlusTree::new(config),
+            type_index: BPlusTree::new(config.clone()),
+            property_index: PropertyIndex::new(),
             node_pages: Vec::new(),
             edge_pages: Vec::new(),
             property_pages: Vec::new(),
@@ -420,6 +424,52 @@ impl GraphStorageEngine {
         self.page_manager.sync_superblock(fs)?;
         self.page_manager.sync_bitmap(fs)?;
         Ok(())
+    }
+
+    pub fn scan_nodes_by_label(
+        &self,
+        label_id: u64,
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<NodeRecord>, StorageError> {
+        let start = label_index_key(label_id, 0);
+        let end = label_index_key(label_id, u128::MAX);
+        let entries = self.label_index.range_search(&start, &end);
+        let mut results = Vec::new();
+        for (_key, value) in entries {
+            let slot_ref = decode_slot_ref(&value).ok_or(StorageError::IndexError)?;
+            let record = Self::read_record(&self.page_manager, slot_ref, fs)?;
+            if let Some(bytes) = record {
+                if let Some(node) = NodeRecord::decode(&bytes) {
+                    if node.flags & node_flags::DELETED == 0 {
+                        results.push(node);
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    pub fn scan_edges_by_type(
+        &self,
+        type_id: u64,
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<EdgeRecord>, StorageError> {
+        let start = type_index_key(type_id, 0);
+        let end = type_index_key(type_id, u128::MAX);
+        let entries = self.type_index.range_search(&start, &end);
+        let mut results = Vec::new();
+        for (_key, value) in entries {
+            let slot_ref = decode_slot_ref(&value).ok_or(StorageError::IndexError)?;
+            let record = Self::read_record(&self.page_manager, slot_ref, fs)?;
+            if let Some(bytes) = record {
+                if let Some(edge) = EdgeRecord::decode(&bytes) {
+                    if edge.flags & edge_flags::DELETED == 0 {
+                        results.push(edge);
+                    }
+                }
+            }
+        }
+        Ok(results)
     }
 }
 
