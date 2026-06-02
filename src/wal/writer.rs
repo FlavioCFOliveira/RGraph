@@ -1,9 +1,13 @@
-use crate::io::FileSystem;
+use crate::io::{AlignedBuffer, FileSystem};
 use crate::wal::record::WalRecord;
 use std::io;
 use std::path::PathBuf;
 
 /// Append-only WAL writer that maintains a monotonic LSN.
+///
+/// The writer keeps a pinned **1 MiB aligned buffer** to avoid extra
+/// copies when `O_DIRECT` is enabled.  All buffered records are flushed
+/// to the segment file in a single `write_at` call.
 #[derive(Debug)]
 pub struct WalWriter {
     /// Directory that holds WAL segment files.
@@ -12,15 +16,17 @@ pub struct WalWriter {
     pub current_lsn: u64,
     /// Path of the current segment file.
     pub segment_path: PathBuf,
-    /// In-memory buffer for records not yet synced.
-    buffer: Vec<u8>,
+    /// In-memory aligned buffer (1 MiB) for records not yet synced.
+    buffer: AlignedBuffer,
+    /// Number of valid bytes in `buffer`.
+    buffered: usize,
     /// Number of bytes since last sync.
     unsynced: usize,
 }
 
 impl WalWriter {
     pub const SEGMENT_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
-    pub const BUFFER_SIZE: usize = 256 * 1024;       // 256 KB
+    pub const BUFFER_SIZE: usize = 1024 * 1024;      // 1 MiB aligned pool
 
     /// Open (or create) the WAL in `wal_dir`.
     pub fn open(wal_dir: PathBuf, fs: &dyn FileSystem) -> io::Result<Self> {
@@ -39,7 +45,8 @@ impl WalWriter {
             wal_dir,
             current_lsn,
             segment_path,
-            buffer: Vec::with_capacity(Self::BUFFER_SIZE),
+            buffer: AlignedBuffer::zeroed(Self::BUFFER_SIZE),
+            buffered: 0,
             unsynced: 0,
         })
     }
@@ -48,26 +55,32 @@ impl WalWriter {
     pub fn append(&mut self, fs: &dyn FileSystem, mut record: WalRecord) -> io::Result<u64> {
         record.set_lsn(self.current_lsn);
         let bytes = record.encode();
-        self.buffer.extend_from_slice(&bytes);
+        if self.buffered + bytes.len() > Self::BUFFER_SIZE {
+            self.flush(fs)?;
+            if bytes.len() > Self::BUFFER_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL record larger than buffer pool",
+                ));
+            }
+        }
+        self.buffer[self.buffered..self.buffered + bytes.len()].copy_from_slice(&bytes);
+        self.buffered += bytes.len();
         self.unsynced += bytes.len();
         self.current_lsn += bytes.len() as u64;
-
-        if self.buffer.len() >= Self::BUFFER_SIZE {
-            self.flush(fs)?;
-        }
         Ok(record.lsn)
     }
 
     /// Flush buffered data to disk and sync.
     pub fn flush(&mut self, fs: &dyn FileSystem) -> io::Result<()> {
-        if self.buffer.is_empty() {
+        if self.buffered == 0 {
             return Ok(());
         }
         let handle = fs.open(&self.segment_path, true)?;
         let offset = handle.len()?;
-        handle.write_at(&self.buffer, offset)?;
+        handle.write_at(&self.buffer[..self.buffered], offset)?;
         handle.sync_data()?;
-        self.buffer.clear();
+        self.buffered = 0;
         self.unsynced = 0;
         Ok(())
     }
@@ -127,5 +140,14 @@ mod tests {
         assert_eq!(decoded.lsn, lsn);
         assert_eq!(decoded.record_type, RecordType::Begin);
         assert_eq!(size, len);
+    }
+
+    #[test]
+    fn buffer_is_aligned() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
+        assert_eq!(writer.buffer.len(), WalWriter::BUFFER_SIZE);
+        assert_eq!(writer.buffer.as_ptr() as usize % AlignedBuffer::ALIGNMENT, 0);
     }
 }

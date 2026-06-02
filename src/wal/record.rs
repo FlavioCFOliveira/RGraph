@@ -43,8 +43,10 @@ pub enum RecordType {
     PageFree = 0x12,
     /// The allocation bitmap changed.
     BitmapUpdate = 0x13,
-    /// Checkpoint marker.
-    Checkpoint = 0x20,
+    /// Begin checkpoint marker.
+    CheckpointBegin = 0x20,
+    /// End checkpoint marker (contains dirty page table and active tx table).
+    CheckpointEnd = 0x21,
 }
 
 /// A single WAL record.
@@ -187,7 +189,8 @@ impl WalRecord {
             0x11 => RecordType::PageUpdate,
             0x12 => RecordType::PageFree,
             0x13 => RecordType::BitmapUpdate,
-            0x20 => RecordType::Checkpoint,
+            0x20 => RecordType::CheckpointBegin,
+            0x21 => RecordType::CheckpointEnd,
             _ => return None,
         };
         cursor += 1;
