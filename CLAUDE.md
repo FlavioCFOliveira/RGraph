@@ -15,6 +15,15 @@ Os seguintes requisitos são **NÃO negociáveis** e devem ser respeitados em to
 - **100% openCypher compliant** — conformidade total com o openCypher (Cypher TCK).
 - **100% ACID compliant** — garantia total das propriedades ACID (Atomicidade, Consistência, Isolamento, Durabilidade) em todas as operações.
 
+## Modos de Operação
+
+A crate deve estar preparada para operar em dois cenários distintos, garantindo sempre **100% de sucesso** tanto na persistência como na capacidade de resposta (desempenho / performance):
+
+1. **One-shot** — Chamadas diretas de uma aplicação CLI ou scripts pontuais.
+2. **Servidor** — Ambientes de altíssima concorrência e carga, onde a crate atua como backend de um serviço contínuo.
+
+Em ambos os cenários, a crate deve garantir total fiabilidade de dados e performance previsível.
+
 ## 1. Tomada de Decisão
 
 NÃO ESTÁS AUTORIZADO a tomar decisões sozinho.
