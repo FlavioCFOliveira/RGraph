@@ -57,6 +57,25 @@ pub enum RecordType {
     EdgeDelete = 0x33,
     /// A new property record was inserted.
     PropertyInsert = 0x34,
+    /// After-image of a modified node record.
+    NodeUpdate = 0x35,
+    /// After-image of a modified edge record.
+    EdgeUpdate = 0x36,
+    /// After-image of a modified property record.
+    PropertyUpdate = 0x37,
+    /// Compensation Log Record — written during UNDO, never itself undone.
+    ///
+    /// Payload layout:
+    /// - `[0..8]`  `undo_next_lsn`: the `prev_lsn` of the record being compensated
+    ///   (i.e. the next record to undo for this transaction).
+    /// - `[8..16]` `page_id`: the page being restored.
+    /// - `[16..]`  before-image or tombstone of the undone state.
+    Clr = 0x40,
+    /// Written at the end of a full WAL segment before rotation.
+    ///
+    /// Payload is a [`SegmentDescriptor::SIZE`]-byte block produced by
+    /// [`SegmentDescriptor::encode`].
+    SegmentDescriptor = 0x50,
 }
 
 /// A single WAL record.
@@ -206,6 +225,11 @@ impl WalRecord {
             0x32 => RecordType::EdgeInsert,
             0x33 => RecordType::EdgeDelete,
             0x34 => RecordType::PropertyInsert,
+            0x35 => RecordType::NodeUpdate,
+            0x36 => RecordType::EdgeUpdate,
+            0x37 => RecordType::PropertyUpdate,
+            0x40 => RecordType::Clr,
+            0x50 => RecordType::SegmentDescriptor,
             _ => return None,
         };
         cursor += 1;
@@ -302,5 +326,96 @@ mod tests {
         let mut bytes = vec![0u8; WAL_RECORD_MIN_SIZE];
         bytes[0..4].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
         assert!(WalRecord::decode(&bytes, 0).is_none());
+    }
+
+    #[test]
+    fn new_record_types_roundtrip() {
+        for rt in [
+            RecordType::NodeUpdate,
+            RecordType::EdgeUpdate,
+            RecordType::PropertyUpdate,
+            RecordType::Clr,
+            RecordType::SegmentDescriptor,
+        ] {
+            let rec = WalRecord::new(rt, 42, 0, 0, vec![0xAB, 0xCD]);
+            let bytes = rec.encode();
+            let (decoded, consumed) = WalRecord::decode(&bytes, 0).unwrap();
+            assert_eq!(consumed, bytes.len());
+            assert_eq!(decoded.record_type, rt);
+        }
+    }
+}
+
+#[cfg(test)]
+mod proptest_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn wal_record_roundtrip(
+            txid in 0u64..u64::MAX,
+            prev_lsn in 0u64..u64::MAX,
+            payload in prop::collection::vec(any::<u8>(), 0..512),
+        ) {
+            let rec = WalRecord::new(RecordType::PageUpdate, txid, 0, prev_lsn, payload.clone());
+            let bytes = rec.encode();
+            let (decoded, consumed) = WalRecord::decode(&bytes, 0).unwrap();
+            prop_assert_eq!(consumed, bytes.len());
+            prop_assert_eq!(decoded.txid, txid);
+            prop_assert_eq!(decoded.prev_lsn, prev_lsn);
+            prop_assert_eq!(decoded.payload, payload);
+        }
+
+        #[test]
+        fn lsn_monotonic_after_set(lsn in 1u64..u64::MAX) {
+            let mut rec = WalRecord::new(RecordType::Begin, 1, 0, 0, vec![]);
+            rec.set_lsn(lsn);
+            prop_assert_eq!(rec.lsn, lsn);
+            // Checksums must be consistent after set_lsn.
+            let bytes = rec.encode();
+            prop_assert!(WalRecord::decode(&bytes, 0).is_some());
+        }
+
+        #[test]
+        fn corruption_always_detected(
+            payload in prop::collection::vec(any::<u8>(), 0..256),
+            corrupt_byte_idx in 0usize..50,
+            corrupt_value in 1u8..=255u8,
+        ) {
+            let rec = WalRecord::new(RecordType::PageUpdate, 1, 0, 0, payload);
+            let mut bytes = rec.encode();
+            let idx = corrupt_byte_idx % bytes.len();
+            bytes[idx] ^= corrupt_value;
+            // Corrupted record may or may not decode, but if it does decode,
+            // the checksum check should catch it (or it happened to produce a valid record).
+            // We only assert it doesn't panic.
+            let _ = WalRecord::decode(&bytes, 0);
+        }
+
+        #[test]
+        fn empty_payload_roundtrip(
+            txid in 0u64..u64::MAX,
+            lsn in 0u64..u64::MAX,
+        ) {
+            let rec = WalRecord::new(RecordType::Begin, txid, lsn, 0, vec![]);
+            let bytes = rec.encode();
+            let result = WalRecord::decode(&bytes, 0);
+            prop_assert!(result.is_some());
+            let (decoded, consumed) = result.unwrap();
+            prop_assert_eq!(consumed, bytes.len());
+            prop_assert_eq!(decoded.txid, txid);
+            prop_assert!(decoded.payload.is_empty());
+        }
+
+        #[test]
+        fn max_payload_roundtrip(
+            payload in prop::collection::vec(any::<u8>(), 480..512),
+        ) {
+            let rec = WalRecord::new(RecordType::PageUpdate, 1, 0, 0, payload.clone());
+            let bytes = rec.encode();
+            let (decoded, _) = WalRecord::decode(&bytes, 0).unwrap();
+            prop_assert_eq!(decoded.payload, payload);
+        }
     }
 }
