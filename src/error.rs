@@ -6,6 +6,7 @@
 //! at runtime.
 
 use std::fmt;
+use std::io;
 use thiserror::Error;
 
 /// The top-level error type for every public operation in the crate.
@@ -62,6 +63,49 @@ pub enum RGraphError {
     /// An invariant was violated (bug in the engine).
     #[error("internal invariant violated: {0}")]
     Internal(String),
+}
+
+/// Crate-wide result alias used by every public API.
+pub type Result<T> = std::result::Result<T, RGraphError>;
+
+impl From<io::Error> for RGraphError {
+    fn from(err: io::Error) -> Self {
+        RGraphError::Io(err.to_string())
+    }
+}
+
+impl From<std::num::ParseIntError> for RGraphError {
+    fn from(err: std::num::ParseIntError) -> Self {
+        RGraphError::Argument(err.to_string())
+    }
+}
+
+impl From<std::num::ParseFloatError> for RGraphError {
+    fn from(err: std::num::ParseFloatError) -> Self {
+        RGraphError::Argument(err.to_string())
+    }
+}
+
+impl From<std::str::Utf8Error> for RGraphError {
+    fn from(err: std::str::Utf8Error) -> Self {
+        RGraphError::Corruption(err.to_string())
+    }
+}
+
+impl From<std::string::FromUtf8Error> for RGraphError {
+    fn from(err: std::string::FromUtf8Error) -> Self {
+        RGraphError::Corruption(err.to_string())
+    }
+}
+
+impl From<crate::cypher::executor::ExecError> for RGraphError {
+    fn from(err: crate::cypher::executor::ExecError) -> Self {
+        match err {
+            crate::cypher::executor::ExecError::Semantic(msg) => RGraphError::Semantic(msg),
+            crate::cypher::executor::ExecError::Eval(msg) => RGraphError::Type(msg),
+            crate::cypher::executor::ExecError::Unsupported(msg) => RGraphError::Argument(msg),
+        }
+    }
 }
 
 /// TCK error class as defined by the openCypher TCK.
@@ -242,5 +286,27 @@ mod tests {
             let _class = ErrorRegistry::class(&err);
             let _phase = ErrorRegistry::phase(&err);
         }
+    }
+
+    #[test]
+    fn io_error_converts_to_rgraph_error() {
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "file missing");
+        let err: RGraphError = io_err.into();
+        assert!(matches!(err, RGraphError::Io(_)));
+    }
+
+    #[test]
+    fn parse_int_error_converts_to_rgraph_error() {
+        let parse_err = "not_a_number".parse::<i32>().unwrap_err();
+        let err: RGraphError = parse_err.into();
+        assert!(matches!(err, RGraphError::Argument(_)));
+    }
+
+    #[test]
+    fn result_alias_compiles() {
+        fn returns_result() -> Result<i32> {
+            Ok(42)
+        }
+        assert_eq!(returns_result().unwrap(), 42);
     }
 }

@@ -120,6 +120,26 @@ enum Command {
     },
 }
 
+/// Map an [`RGraphError`] to a distinct CLI exit code.
+fn exit_code_for(err: &rgraph::error::RGraphError) -> i32 {
+    use rgraph::error::RGraphError;
+    match err {
+        RGraphError::Syntax(_) => 2,
+        RGraphError::Semantic(_) => 3,
+        RGraphError::Type(_) => 4,
+        RGraphError::Argument(_) => 5,
+        RGraphError::NotFound(_) => 6,
+        RGraphError::AlreadyExists(_) => 7,
+        RGraphError::Io(_) => 8,
+        RGraphError::Corruption(_) => 9,
+        RGraphError::Index(_) => 10,
+        RGraphError::Storage(_) => 11,
+        RGraphError::Transaction(_) => 12,
+        RGraphError::ResourceExhausted(_) => 13,
+        RGraphError::Internal(_) => 101,
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -149,6 +169,8 @@ fn main() {
                 Err(e) => {
                     tracing::error!("Database init failed: {}", e);
                     eprintln!("Error: {}", e);
+                    let rerr: rgraph::error::RGraphError = e.into();
+                    std::process::exit(exit_code_for(&rerr));
                 }
             }
         }
@@ -174,6 +196,8 @@ fn main() {
                 Err(e) => {
                     tracing::error!("Database open failed: {}", e);
                     eprintln!("Error: {}", e);
+                    let rerr: rgraph::error::RGraphError = e.into();
+                    std::process::exit(exit_code_for(&rerr));
                 }
             }
         }
@@ -212,6 +236,8 @@ fn main() {
                 Err(e) => {
                     tracing::error!("Database insert failed: {}", e);
                     eprintln!("Error: {}", e);
+                    let rerr: rgraph::error::RGraphError = e.into();
+                    std::process::exit(exit_code_for(&rerr));
                 }
             }
         }
@@ -229,7 +255,8 @@ fn main() {
                     if let Err(e) = db.page_manager.read_page(&fs, page_id, &mut buf) {
                         tracing::error!("Error reading page: {}", e);
                         eprintln!("Error reading page: {}", e);
-                        return;
+                        let rerr: rgraph::error::RGraphError = e.into();
+                        std::process::exit(exit_code_for(&rerr));
                     }
                     let page = SlottedPage::new(buf);
                     match page.read(slot) {
@@ -247,6 +274,8 @@ fn main() {
                 Err(e) => {
                     tracing::error!("Database read failed: {}", e);
                     eprintln!("Error: {}", e);
+                    let rerr: rgraph::error::RGraphError = e.into();
+                    std::process::exit(exit_code_for(&rerr));
                 }
             }
         }
@@ -346,6 +375,8 @@ fn main() {
                 Err(e) => {
                     tracing::error!("Query execution failed: {}", e);
                     eprintln!("Error: {}", e);
+                    let rerr: rgraph::error::RGraphError = e.into();
+                    std::process::exit(exit_code_for(&rerr));
                 }
             }
         }
@@ -372,5 +403,47 @@ fn main() {
             println!("  concurrency: {}", concurrency);
             println!("Benchmark is a stub — full implementation depends on the query execution engine (Sprint 21).");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rgraph::error::RGraphError;
+
+    #[test]
+    fn exit_codes_are_distinct() {
+        let variants = vec![
+            RGraphError::Syntax("x".into()),
+            RGraphError::Semantic("x".into()),
+            RGraphError::Type("x".into()),
+            RGraphError::Argument("x".into()),
+            RGraphError::NotFound("x".into()),
+            RGraphError::AlreadyExists("x".into()),
+            RGraphError::Io("x".into()),
+            RGraphError::Corruption("x".into()),
+            RGraphError::Index("x".into()),
+            RGraphError::Storage("x".into()),
+            RGraphError::Transaction("x".into()),
+            RGraphError::ResourceExhausted("x".into()),
+            RGraphError::Internal("x".into()),
+        ];
+        let mut codes = std::collections::HashSet::new();
+        for err in &variants {
+            let code = exit_code_for(err);
+            assert!(
+                codes.insert(code),
+                "duplicate exit code {} for {:?}",
+                code,
+                err
+            );
+        }
+        assert_eq!(codes.len(), variants.len());
+    }
+
+    #[test]
+    fn internal_error_uses_bug_exit_code() {
+        let err = RGraphError::Internal("oops".into());
+        assert_eq!(exit_code_for(&err), 101);
     }
 }
