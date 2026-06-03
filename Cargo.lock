@@ -1022,6 +1022,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "is-terminal"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1669,6 +1680,7 @@ dependencies = [
  "gherkin 0.14.0",
  "hyper",
  "hyper-util",
+ "io-uring",
  "libc",
  "num_cpus",
  "prometheus",

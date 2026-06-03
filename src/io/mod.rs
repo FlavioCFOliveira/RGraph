@@ -4,6 +4,9 @@ use std::path::Path;
 pub mod aligned_buffer;
 pub mod posix;
 
+#[cfg(target_os = "linux")]
+pub mod uring;
+
 pub use aligned_buffer::AlignedBuffer;
 
 /// A portable abstraction over file-system operations.
