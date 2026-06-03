@@ -1,25 +1,170 @@
-use crate::io::{AlignedBuffer, FileSystem};
-use crate::storage::meta::decode_superblock;
-use crate::storage::page::PAGE_SIZE;
+use crate::config::GraphMode;
+use crate::graph::builder::{NodeBuilder, RelationshipBuilder};
+use crate::graph::engine::{GraphStorageEngine, StorageError};
+use crate::graph::graph::{Graph, Node, Relationship};
+use crate::graph::record::{SlotRef, ValueType};
+use crate::io::FileSystem;
 use crate::storage::manager::PageManager;
-use crate::wal::recovery::{recover, simple_page_replay};
 use crate::wal::writer::WalWriter;
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// Top-level database handle.
-#[derive(Debug)]
+///
+/// Owns a fully-initialised [`GraphStorageEngine`] so that CRUD operations
+/// are available directly on the handle.  The `page_manager` and `wal_writer`
+/// accessors delegate into the inner engine, preserving compatibility with
+/// existing tests.
 pub struct Database {
     pub path: PathBuf,
-    pub page_manager: PageManager,
-    pub wal_writer: WalWriter,
+    pub graph_mode: GraphMode,
+    graph: Graph,
+}
+
+impl std::fmt::Debug for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Database")
+            .field("path", &self.path)
+            .field("graph_mode", &self.graph_mode)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Database {
     pub const LOCK_FILE: &str = ".rgraph.lock";
 
-    /// Create a new empty database at `path`.
-    pub fn init(path: &Path, fs: &dyn FileSystem) -> io::Result<Self> {
+    // ------------------------------------------------------------------
+    // Delegating accessors for backward-compatibility
+    // ------------------------------------------------------------------
+
+    /// Borrow the underlying [`PageManager`].
+    pub fn page_manager(&self) -> &PageManager {
+        &self.graph.engine().page_manager
+    }
+
+    /// Mutably borrow the underlying [`PageManager`].
+    pub fn page_manager_mut(&mut self) -> &mut PageManager {
+        &mut self.graph.engine_mut().page_manager
+    }
+
+    /// Borrow the underlying [`WalWriter`].
+    pub fn wal_writer(&self) -> &WalWriter {
+        &self.graph.engine().wal_writer
+    }
+
+    /// Mutably borrow the underlying [`WalWriter`].
+    pub fn wal_writer_mut(&mut self) -> &mut WalWriter {
+        &mut self.graph.engine_mut().wal_writer
+    }
+
+    /// Borrow the inner [`Graph`].
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    /// Mutably borrow the inner [`Graph`].
+    pub fn graph_mut(&mut self) -> &mut Graph {
+        &mut self.graph
+    }
+
+    // ------------------------------------------------------------------
+    // High-level CRUD interface
+    // ------------------------------------------------------------------
+
+    /// Create a new node.  Returns the `(SlotRef, node_id)` pair.
+    pub fn create_node(
+        &mut self,
+        builder: NodeBuilder,
+        fs: &dyn FileSystem,
+    ) -> Result<(SlotRef, u64), StorageError> {
+        self.graph.create_node(builder, fs)
+    }
+
+    /// Retrieve a node by `node_id`.
+    pub fn get_node(
+        &self,
+        node_id: u64,
+        fs: &dyn FileSystem,
+    ) -> Result<Option<Node>, StorageError> {
+        self.graph.get_node(node_id, fs)
+    }
+
+    /// Delete a node (tombstone).
+    pub fn delete_node(
+        &mut self,
+        node_id: u64,
+        fs: &dyn FileSystem,
+    ) -> Result<(), StorageError> {
+        self.graph.delete_node(node_id, fs)
+    }
+
+    /// Create a new relationship.  Returns the `(SlotRef, edge_id)` pair.
+    pub fn create_relationship(
+        &mut self,
+        builder: RelationshipBuilder,
+        fs: &dyn FileSystem,
+    ) -> Result<(SlotRef, u64), StorageError> {
+        self.graph.create_relationship(builder, fs)
+    }
+
+    /// Retrieve a relationship by `edge_id`.
+    pub fn get_relationship(
+        &self,
+        edge_id: u64,
+        fs: &dyn FileSystem,
+    ) -> Result<Option<Relationship>, StorageError> {
+        self.graph.get_relationship(edge_id, fs)
+    }
+
+    /// Delete a relationship (tombstone).
+    pub fn delete_relationship(
+        &mut self,
+        edge_id: u64,
+        fs: &dyn FileSystem,
+    ) -> Result<(), StorageError> {
+        self.graph.delete_relationship(edge_id, fs)
+    }
+
+    /// Scan nodes by label.
+    pub fn scan_by_label(
+        &self,
+        label_id: u32,
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<Node>, StorageError> {
+        self.graph.scan_by_label(label_id, fs)
+    }
+
+    /// Scan relationships by type.
+    pub fn scan_by_type(
+        &self,
+        type_id: u32,
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        self.graph.scan_by_type(type_id, fs)
+    }
+
+    /// Scan nodes by property value.
+    pub fn scan_nodes_by_property(
+        &self,
+        property_id: u64,
+        value_type: ValueType,
+        payload: &[u8],
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<Node>, StorageError> {
+        self.graph.scan_nodes_by_property(property_id, value_type, payload, fs)
+    }
+
+    /// Flush WAL, superblock, and bitmap to durable storage.
+    pub fn sync(&mut self, fs: &dyn FileSystem) -> Result<(), StorageError> {
+        self.graph.sync(fs)
+    }
+
+    // ------------------------------------------------------------------
+    // Lifecycle
+    // ------------------------------------------------------------------
+
+    /// Create a new empty database at `path` with the specified `graph_mode`.
+    pub fn init(path: &Path, fs: &dyn FileSystem, graph_mode: GraphMode) -> io::Result<Self> {
         if path.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -36,28 +181,16 @@ impl Database {
         }
 
         let data_path = path.join(PageManager::DATA_FILE);
-        let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32, fs)?;
-
-        // Write superblock (both copies).
-        pm.sync_superblock(fs)?;
-
-        // Write bitmap page.
-        pm.sync_bitmap(fs)?;
-
-        // Initialise WAL with a buffered filesystem (WAL does not use O_DIRECT).
-        let wal_dir = path.join("wal");
-        let wal_fs = crate::io::posix::PosixFileSystem::new(false);
-        let wal_writer = WalWriter::open(wal_dir, &wal_fs)?;
-
+        let engine = GraphStorageEngine::init(data_path, fs)?;
         Ok(Self {
             path: path.to_path_buf(),
-            page_manager: pm,
-            wal_writer,
+            graph_mode,
+            graph: Graph::new(engine),
         })
     }
 
     /// Open an existing database, recovering WAL if necessary.
-    pub fn open(path: &Path, fs: &dyn FileSystem) -> io::Result<Self> {
+    pub fn open(path: &Path, fs: &dyn FileSystem, graph_mode: GraphMode) -> io::Result<Self> {
         if !path.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -82,61 +215,11 @@ impl Database {
             ));
         }
 
-        // Read both superblock copies.
-        let handle = fs.open(&data_path, false)?;
-        let mut primary = AlignedBuffer::zeroed(PAGE_SIZE);
-        let mut mirror = AlignedBuffer::zeroed(PAGE_SIZE);
-        handle.read_at(&mut primary, 0)?;
-        handle.read_at(&mut mirror, PAGE_SIZE as u64)?;
-
-        let sb_primary = decode_superblock(&primary);
-        let sb_mirror = decode_superblock(&mirror);
-
-        let sb = match (sb_primary, sb_mirror) {
-            (Some(p), Some(m)) => {
-                if m.generation > p.generation {
-                    m
-                } else {
-                    p
-                }
-            }
-            (Some(p), None) => p,
-            (None, Some(m)) => m,
-            (None, None) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "both superblock copies invalid",
-                ));
-            }
-        };
-
-        // Read bitmap page.
-        let mut bitmap_buf = AlignedBuffer::zeroed(PAGE_SIZE);
-        handle.read_at(&mut bitmap_buf, (2 * PAGE_SIZE) as u64)?;
-
-        let mut pm = PageManager::open(data_path.clone(), sb, bitmap_buf, fs)?;
-
-        // Recover WAL using a buffered filesystem (WAL does not use O_DIRECT).
-        let wal_dir = path.join("wal");
-        let wal_path = wal_dir.join("wal-000000000");
-        let wal_fs = crate::io::posix::PosixFileSystem::new(false);
-        let start_lsn = pm.superblock.last_checkpoint_lsn;
-        if let Some(last_lsn) = recover(
-            &wal_fs,
-            &wal_path,
-            start_lsn,
-            |pid, img, lsn| simple_page_replay(fs, &data_path, pid, img, lsn),
-        )? {
-            pm.superblock.current_wal_lsn = last_lsn;
-            pm.sync_superblock(fs)?;
-        }
-
-        let wal_writer = WalWriter::open(wal_dir, &wal_fs)?;
-
+        let engine = GraphStorageEngine::open(data_path, fs)?;
         Ok(Self {
             path: path.to_path_buf(),
-            page_manager: pm,
-            wal_writer,
+            graph_mode,
+            graph: Graph::new(engine),
         })
     }
 }
@@ -144,7 +227,10 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::posix::PosixFileSystem;
+    use crate::config::GraphMode;
+    use crate::io::{AlignedBuffer, posix::PosixFileSystem};
+    use crate::storage::meta::decode_superblock;
+    use crate::storage::page::PAGE_SIZE;
 
     #[test]
     fn init_and_open_roundtrip() {
@@ -153,13 +239,13 @@ mod tests {
         let db_path = dir.path().join("db");
 
         {
-            let db = Database::init(&db_path, &fs).unwrap();
-            assert_eq!(db.page_manager.superblock.total_page_count, 3);
+            let db = Database::init(&db_path, &fs, GraphMode::Lpg).unwrap();
+            assert_eq!(db.page_manager().superblock.total_page_count, 3);
         }
 
         {
-            let db = Database::open(&db_path, &fs).unwrap();
-            assert_eq!(db.page_manager.superblock.total_page_count, 3);
+            let db = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap();
+            assert_eq!(db.page_manager().superblock.total_page_count, 3);
         }
     }
 
@@ -172,7 +258,7 @@ mod tests {
         let data = db_path.join(PageManager::DATA_FILE);
         fs.open(&data, true).unwrap().sync_data().unwrap();
 
-        let err = Database::open(&db_path, &fs).unwrap_err();
+        let err = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -183,8 +269,8 @@ mod tests {
         let db_path = dir.path().join("db");
 
         {
-            let db = Database::init(&db_path, &fs).unwrap();
-            assert_eq!(db.page_manager.superblock.total_page_count, 3);
+            let db = Database::init(&db_path, &fs, GraphMode::Lpg).unwrap();
+            assert_eq!(db.page_manager().superblock.total_page_count, 3);
             drop(db);
         }
 
@@ -199,8 +285,8 @@ mod tests {
         drop(handle);
 
         // Open should recover from the mirror copy.
-        let db = Database::open(&db_path, &fs).unwrap();
-        assert_eq!(db.page_manager.superblock.total_page_count, 3);
+        let db = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap();
+        assert_eq!(db.page_manager().superblock.total_page_count, 3);
     }
 
     #[test]
@@ -210,7 +296,7 @@ mod tests {
         let db_path = dir.path().join("db");
 
         {
-            let db = Database::init(&db_path, &fs).unwrap();
+            let db = Database::init(&db_path, &fs, GraphMode::Lpg).unwrap();
             drop(db);
         }
 
@@ -225,8 +311,8 @@ mod tests {
         drop(handle);
 
         // Open should recover from the primary copy.
-        let db = Database::open(&db_path, &fs).unwrap();
-        assert_eq!(db.page_manager.superblock.total_page_count, 3);
+        let db = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap();
+        assert_eq!(db.page_manager().superblock.total_page_count, 3);
     }
 
     #[test]
@@ -236,7 +322,7 @@ mod tests {
         let db_path = dir.path().join("db");
 
         {
-            let db = Database::init(&db_path, &fs).unwrap();
+            let db = Database::init(&db_path, &fs, GraphMode::Lpg).unwrap();
             drop(db);
         }
 
@@ -266,7 +352,33 @@ mod tests {
         drop(handle);
 
         // Open should recover from the mirror with the last good generation.
-        let db = Database::open(&db_path, &fs).unwrap();
-        assert_eq!(db.page_manager.superblock.generation, old_generation);
+        let db = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap();
+        assert_eq!(db.page_manager().superblock.generation, old_generation);
+    }
+
+    #[test]
+    fn database_create_and_get_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let db_path = dir.path().join("db");
+
+        let mut db = Database::init(&db_path, &fs, GraphMode::Lpg).unwrap();
+        let (slot, node_id) = db.create_node(NodeBuilder::new().label(42), &fs).unwrap();
+        assert!(!slot.is_null());
+        assert!(node_id > 0);
+
+        let node = db.get_node(node_id, &fs).unwrap().unwrap();
+        assert_eq!(node.node_id, node_id);
+        assert_eq!(node.label_id, 42);
+    }
+
+    #[test]
+    fn database_graph_mode_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let db_path = dir.path().join("db");
+
+        let db = Database::init(&db_path, &fs, GraphMode::Rdf).unwrap();
+        assert_eq!(db.graph_mode, GraphMode::Rdf);
     }
 }

@@ -7,7 +7,6 @@
 use crate::error::RGraphError;
 use crate::graph::graph::Graph;
 use crate::graph::builder::NodeBuilder;
-use crate::graph::engine::GraphStorageEngine;
 use crate::io::FileSystem;
 use crate::server::storage::{AsyncStorageEngine, InMemoryStorageEngine};
 use std::collections::HashMap;
@@ -318,9 +317,8 @@ impl StressHarness {
         let engine = GraphStorageEngine::init(path.clone(), fs)
             .map_err(|e| RGraphError::Storage(e.to_string()))?;
         let mut graph = Graph::new(engine);
-        let n = NodeBuilder::new(9999).label(1);
-        graph
-            .create_node(n, fs)
+        let (_, node_id) = graph
+            .create_node(NodeBuilder::new().label(1), fs)
             .map_err(|e| RGraphError::Storage(e.to_string()))?;
         graph.sync(fs).map_err(|e| RGraphError::Storage(e.to_string()))?;
 
@@ -332,9 +330,9 @@ impl StressHarness {
             .map_err(|e| RGraphError::Storage(e.to_string()))?;
         let graph2 = Graph::new(engine2);
         let recovered = graph2
-            .get_node(9999, fs)
+            .get_node(node_id, fs)
             .map_err(|e| RGraphError::Storage(e.to_string()))?;
-        assert!(recovered.is_some(), "node 9999 must survive crash");
+        assert!(recovered.is_some(), "created node must survive crash");
         Ok(())
     }
 }

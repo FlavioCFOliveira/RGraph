@@ -154,7 +154,7 @@ fn main() {
     match cli.cmd {
         Command::Init { path } => {
             let _span = tracing::info_span!("cmd", command = "init").entered();
-            match Database::init(&path, &fs) {
+            match Database::init(&path, &fs, rgraph::config::GraphMode::Lpg) {
                 Ok(db) => {
                     info!("Database initialised at {:?}", path);
                     println!(
@@ -163,7 +163,7 @@ fn main() {
                     );
                     println!(
                         "  total pages: {}",
-                        db.page_manager.superblock.total_page_count
+                        db.page_manager().superblock.total_page_count
                     );
                 }
                 Err(e) => {
@@ -176,21 +176,21 @@ fn main() {
         }
         Command::Open { path } => {
             let _span = tracing::info_span!("cmd", command = "open").entered();
-            match Database::open(&path, &fs) {
+            match Database::open(&path, &fs, rgraph::config::GraphMode::Lpg) {
                 Ok(db) => {
                     info!("Database opened at {:?}", path);
                     println!("Database opened at {:?}", path);
                     println!(
                         "  total pages: {}",
-                        db.page_manager.superblock.total_page_count
+                        db.page_manager().superblock.total_page_count
                     );
                     println!(
                         "  free pages:  {}",
-                        db.page_manager.superblock.free_page_count
+                        db.page_manager().superblock.free_page_count
                     );
                     println!(
                         "  WAL LSN:     {}",
-                        db.page_manager.superblock.current_wal_lsn
+                        db.page_manager().superblock.current_wal_lsn
                     );
                 }
                 Err(e) => {
@@ -203,13 +203,13 @@ fn main() {
         }
         Command::Insert { path, data } => {
             let _span = tracing::info_span!("cmd", command = "insert").entered();
-            match Database::open(&path, &fs) {
+            match Database::open(&path, &fs, rgraph::config::GraphMode::Lpg) {
                 Ok(mut db) => {
-                    let pid = db.page_manager.allocate_page();
+                    let pid = db.page_manager_mut().allocate_page();
                     let mut page = SlottedPage::init(pid, PageType::SlottedData);
                     let idx = page.insert(data.as_bytes()).expect("record fits in page");
                     page.update_checksum();
-                    db.page_manager
+                    db.page_manager_mut()
                         .write_page(&fs, pid, &mut page.buf)
                         .expect("write page");
 
@@ -222,13 +222,13 @@ fn main() {
                         rgraph::wal::record::RecordType::PageUpdate,
                         1,
                         0,
-                        db.page_manager.superblock.current_wal_lsn,
+                        db.page_manager().superblock.current_wal_lsn,
                         payload,
                     );
-                    let lsn = db.wal_writer.append(&fs, rec).expect("append wal");
-                    db.wal_writer.sync(&fs).expect("sync wal");
-                    db.page_manager.superblock.current_wal_lsn = lsn;
-                    db.page_manager.sync_superblock(&fs).expect("sync meta");
+                    let lsn = db.wal_writer_mut().append(&fs, rec).expect("append wal");
+                    db.wal_writer_mut().sync(&fs).expect("sync wal");
+                    db.page_manager_mut().superblock.current_wal_lsn = lsn;
+                    db.page_manager_mut().sync_superblock(&fs).expect("sync meta");
 
                     info!("Inserted record into page {} slot {}", pid, idx);
                     println!("Inserted record into page {} slot {}", pid, idx);
@@ -247,12 +247,12 @@ fn main() {
             slot,
         } => {
             let _span = tracing::info_span!("cmd", command = "read").entered();
-            match Database::open(&path, &fs) {
+            match Database::open(&path, &fs, rgraph::config::GraphMode::Lpg) {
                 Ok(db) => {
                     let mut buf = rgraph::io::AlignedBuffer::zeroed(
                         rgraph::storage::page::PAGE_SIZE
                     );
-                    if let Err(e) = db.page_manager.read_page(&fs, page_id, &mut buf) {
+                    if let Err(e) = db.page_manager().read_page(&fs, page_id, &mut buf) {
                         tracing::error!("Error reading page: {}", e);
                         eprintln!("Error reading page: {}", e);
                         let rerr: rgraph::error::RGraphError = e.into();

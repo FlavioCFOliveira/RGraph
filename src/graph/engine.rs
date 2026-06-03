@@ -16,6 +16,70 @@ use crate::wal::writer::WalWriter;
 use crate::wal::recovery::{recover, simple_page_replay};
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonically-increasing graph-entity id allocator.
+///
+/// Ids start at 1; id 0 is reserved as a sentinel ("null").
+/// The allocator is persisted implicitly: on engine open the max seen id is
+/// recovered from `rebuild_indexes` and `next_id` is set accordingly.
+///
+/// # Thread safety
+///
+/// `IdAllocator` uses an [`AtomicU64`] so allocation is lock-free.  Each
+/// call to [`allocate`] returns a strictly unique, monotonically increasing
+/// value.
+#[derive(Debug)]
+pub struct IdAllocator {
+    next_id: AtomicU64,
+}
+
+impl IdAllocator {
+    /// Create a new allocator starting from `start`.
+    ///
+    /// `start` must be ≥ 1 (id 0 is the null sentinel).
+    pub fn new(start: u64) -> Self {
+        let start = start.max(1);
+        Self {
+            next_id: AtomicU64::new(start),
+        }
+    }
+
+    /// Allocate the next unique id.
+    ///
+    /// Always returns a value ≥ 1.  Wraps to 1 on u64 overflow (extremely
+    /// unlikely in practice — 2^64 allocations would be needed).
+    pub fn allocate(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Seed the allocator so that all future ids are greater than `observed`.
+    ///
+    /// This is used during recovery to ensure freshly allocated ids never
+    /// collide with ids already present on disk.
+    pub fn observe(&self, observed: u64) {
+        let mut current = self.next_id.load(Ordering::Relaxed);
+        loop {
+            if observed < current {
+                break;
+            }
+            match self.next_id.compare_exchange_weak(
+                current,
+                observed + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Return the next id that would be allocated without consuming it.
+    pub fn peek(&self) -> u64 {
+        self.next_id.load(Ordering::Relaxed)
+    }
+}
 
 /// Errors that can occur during storage engine operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +96,8 @@ pub enum StorageError {
     SlotOverflow,
     /// The entity already exists.
     AlreadyExists,
+    /// Id 0 is reserved and must not be used for graph entities.
+    InvalidId,
 }
 
 impl std::fmt::Display for StorageError {
@@ -43,6 +109,7 @@ impl std::fmt::Display for StorageError {
             StorageError::PageFull => write!(f, "page full"),
             StorageError::SlotOverflow => write!(f, "slot reference overflow"),
             StorageError::AlreadyExists => write!(f, "entity already exists"),
+            StorageError::InvalidId => write!(f, "id 0 is reserved and may not be used"),
         }
     }
 }
@@ -142,6 +209,10 @@ pub trait StorageEngine {
 /// Pages used for graph records are tracked in `node_pages`,
 /// `edge_pages`, and `property_pages` so that insertions prefer
 /// recently-used pages before allocating new ones.
+///
+/// `id_allocator` hands out globally unique, monotonically-increasing u64
+/// ids for nodes and edges.  On engine open the allocator is seeded from
+/// the highest id observed during `rebuild_indexes`.
 #[derive(Debug)]
 pub struct GraphStorageEngine {
     pub page_manager: PageManager,
@@ -154,6 +225,8 @@ pub struct GraphStorageEngine {
     pub node_pages: Vec<PageId>,
     pub edge_pages: Vec<PageId>,
     pub property_pages: Vec<PageId>,
+    /// Server-side id allocator.  Seeded from on-disk data during open.
+    pub id_allocator: IdAllocator,
 }
 
 impl GraphStorageEngine {
@@ -183,6 +256,7 @@ impl GraphStorageEngine {
             node_pages: Vec::new(),
             edge_pages: Vec::new(),
             property_pages: Vec::new(),
+            id_allocator: IdAllocator::new(1),
         })
     }
 
@@ -258,9 +332,11 @@ impl GraphStorageEngine {
             node_pages: Vec::new(),
             edge_pages: Vec::new(),
             property_pages: Vec::new(),
+            id_allocator: IdAllocator::new(1),
         };
 
-        // Rebuild secondary indexes from primary data pages.
+        // Rebuild secondary indexes from primary data pages.  This also
+        // seeds the id_allocator with the highest id seen on disk.
         let _ = engine.rebuild_indexes(fs);
 
         Ok(engine)
@@ -273,7 +349,9 @@ impl GraphStorageEngine {
     /// Rebuild secondary indexes by scanning all allocated data pages.
     ///
     /// Called automatically during `open` after WAL recovery so that indexes
-    /// are consistent even if the in-memory B+ trees were lost.
+    /// are consistent even if the in-memory B+ trees were lost.  Also seeds
+    /// the [`IdAllocator`] with the highest node/edge id observed on disk so
+    /// fresh allocations never collide with existing records.
     pub fn rebuild_indexes(&mut self,
         fs: &dyn FileSystem,
     ) -> Result<(), StorageError> {
@@ -281,8 +359,8 @@ impl GraphStorageEngine {
 
         let allocated = self.page_manager.allocated_pages();
         for page_id in allocated {
-            // Skip metadata pages.
-            if page_id < 2 {
+            // Skip metadata pages (superblock copies and bitmap).
+            if page_id < 3 {
                 continue;
             }
 
@@ -293,6 +371,9 @@ impl GraphStorageEngine {
             let page = SlottedPage::new(buf);
             let count = page.header().slot_count;
 
+            let mut page_has_nodes = false;
+            let mut page_has_edges = false;
+
             for slot_idx in 0..count {
                 let Some(bytes) = page.read(slot_idx) else {
                     continue;
@@ -300,8 +381,11 @@ impl GraphStorageEngine {
 
                 // Try to decode as NodeRecord (32 bytes).
                 if bytes.len() == NodeRecord::SIZE {
-                    if let Some(node) = NodeRecord::decode(bytes) {
-                        if node.node_id != 0 && (node.flags & node_flags::DELETED) == 0 {
+                    if let Some(node) = NodeRecord::decode(bytes).filter(|n| n.node_id != 0) {
+                        // Seed the id allocator regardless of deletion state.
+                        self.id_allocator.observe(node.node_id);
+                        page_has_nodes = true;
+                        if node.flags & node_flags::DELETED == 0 {
                             let slot_ref = SlotRef::new(page_id as u32, slot_idx as u8);
                             let value = slot_ref.raw.to_be_bytes().to_vec();
                             let _ = self.node_index.insert(&node_id_key(node.node_id as u128), &value);
@@ -313,10 +397,13 @@ impl GraphStorageEngine {
                     }
                 }
 
-                // Try to decode as EdgeRecord (48 bytes).
+                // Try to decode as EdgeRecord (64 bytes).
                 if bytes.len() == EdgeRecord::SIZE {
-                    if let Some(edge) = EdgeRecord::decode(bytes) {
-                        if edge.edge_id != 0 && (edge.flags & edge_flags::DELETED) == 0 {
+                    if let Some(edge) = EdgeRecord::decode(bytes).filter(|e| e.edge_id != 0) {
+                        // Seed the id allocator regardless of deletion state.
+                        self.id_allocator.observe(edge.edge_id);
+                        page_has_edges = true;
+                        if edge.flags & edge_flags::DELETED == 0 {
                             let slot_ref = SlotRef::new(page_id as u32, slot_idx as u8);
                             let value = slot_ref.raw.to_be_bytes().to_vec();
                             let _ = self.edge_index.insert(&edge_id_key(edge.edge_id as u128), &value);
@@ -328,8 +415,36 @@ impl GraphStorageEngine {
                     }
                 }
             }
+
+            // Track pages by type so future insertions reuse them.
+            if page_has_nodes && !self.node_pages.contains(&page_id) {
+                self.node_pages.push(page_id);
+            }
+            if page_has_edges && !self.edge_pages.contains(&page_id) {
+                self.edge_pages.push(page_id);
+            }
         }
         Ok(())
+    }
+
+    /// Look up the physical [`SlotRef`] for a node by its logical `node_id`.
+    ///
+    /// Returns `Ok(None)` if the node does not exist or has been deleted.
+    pub fn lookup_node_slot(
+        &self,
+        node_id: u64,
+    ) -> Result<Option<SlotRef>, StorageError> {
+        let key = node_id_key(node_id as u128);
+        let (_page_id, slot) = match self.node_index.search(&key) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let page = self.node_index.get_page(_page_id).ok_or(StorageError::IndexError)?;
+        let kv = page.key(slot).ok_or(StorageError::IndexError)?;
+        let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
+        let value = &kv[2 + key_len..];
+        let slot_ref = decode_slot_ref(value).ok_or(StorageError::IndexError)?;
+        Ok(Some(slot_ref))
     }
 
     /// Write a raw record into the most recently used page in `page_list`,
@@ -447,11 +562,9 @@ impl GraphStorageEngine {
         for (_key, value) in entries {
             let slot_ref = decode_slot_ref(&value).ok_or(StorageError::IndexError)?;
             let record = Self::read_record(&self.page_manager, slot_ref, fs)?;
-            if let Some(bytes) = record {
-                if let Some(node) = NodeRecord::decode(&bytes) {
-                    if node.flags & node_flags::DELETED == 0 {
-                        results.push(node);
-                    }
+            if let Some(node) = record.and_then(|b| NodeRecord::decode(&b)) {
+                if node.flags & node_flags::DELETED == 0 {
+                    results.push(node);
                 }
             }
         }
@@ -470,11 +583,9 @@ impl GraphStorageEngine {
         for (_key, value) in entries {
             let slot_ref = decode_slot_ref(&value).ok_or(StorageError::IndexError)?;
             let record = Self::read_record(&self.page_manager, slot_ref, fs)?;
-            if let Some(bytes) = record {
-                if let Some(edge) = EdgeRecord::decode(&bytes) {
-                    if edge.flags & edge_flags::DELETED == 0 {
-                        results.push(edge);
-                    }
+            if let Some(edge) = record.and_then(|b| EdgeRecord::decode(&b)) {
+                if edge.flags & edge_flags::DELETED == 0 {
+                    results.push(edge);
                 }
             }
         }
@@ -520,6 +631,211 @@ impl GraphStorageEngine {
         }
         results
     }
+
+    // ------------------------------------------------------------------
+    // Adjacency list helpers (private)
+    // ------------------------------------------------------------------
+
+    /// Link `edge_slot` at the head of the source node's outgoing adjacency
+    /// list, then update the source node record's `first_outgoing_edge`.
+    ///
+    /// Operates directly on the page manager to avoid borrow conflicts.
+    fn wire_source_adjacency(
+        pm: &mut PageManager,
+        edge_slot: SlotRef,
+        node_slot: SlotRef,
+        fs: &dyn FileSystem,
+    ) -> Result<(), StorageError> {
+        // Read source node to get current head.
+        let node_bytes = Self::read_record(pm, node_slot, fs)?
+            .ok_or(StorageError::NotFound)?;
+        let mut node = NodeRecord::decode(&node_bytes).ok_or(StorageError::NotFound)?;
+        let old_head = node.first_outgoing_edge;
+
+        // Patch the new edge's next/prev pointers.
+        let edge_bytes = Self::read_record(pm, edge_slot, fs)?
+            .ok_or(StorageError::NotFound)?;
+        let mut edge = EdgeRecord::decode(&edge_bytes).ok_or(StorageError::NotFound)?;
+        edge.next_source_edge = old_head;
+        edge.prev_source_edge = SlotRef::NULL;
+        let mut edge_buf = [0u8; EdgeRecord::SIZE];
+        edge.encode(&mut edge_buf);
+        Self::overwrite_record(pm, edge_slot, &edge_buf, fs)?;
+
+        // If there was a previous head, update its prev pointer.
+        if !old_head.is_null() {
+            let head_bytes = Self::read_record(pm, old_head, fs)?
+                .ok_or(StorageError::NotFound)?;
+            let mut head_edge = EdgeRecord::decode(&head_bytes).ok_or(StorageError::NotFound)?;
+            head_edge.prev_source_edge = edge_slot;
+            let mut head_buf = [0u8; EdgeRecord::SIZE];
+            head_edge.encode(&mut head_buf);
+            Self::overwrite_record(pm, old_head, &head_buf, fs)?;
+        }
+
+        // Update the source node's first_outgoing_edge.
+        node.first_outgoing_edge = edge_slot;
+        node.generation += 1;
+        let mut node_buf = [0u8; NodeRecord::SIZE];
+        node.encode(&mut node_buf);
+        Self::overwrite_record(pm, node_slot, &node_buf, fs)
+    }
+
+    /// Link `edge_slot` at the head of the target node's incoming adjacency
+    /// list, then update the target node record's `first_incoming_edge`.
+    fn wire_target_adjacency(
+        pm: &mut PageManager,
+        edge_slot: SlotRef,
+        node_slot: SlotRef,
+        fs: &dyn FileSystem,
+    ) -> Result<(), StorageError> {
+        // Read target node to get current head.
+        let node_bytes = Self::read_record(pm, node_slot, fs)?
+            .ok_or(StorageError::NotFound)?;
+        let mut node = NodeRecord::decode(&node_bytes).ok_or(StorageError::NotFound)?;
+        let old_head = node.first_incoming_edge;
+
+        // Patch the new edge's next/prev pointers.
+        let edge_bytes = Self::read_record(pm, edge_slot, fs)?
+            .ok_or(StorageError::NotFound)?;
+        let mut edge = EdgeRecord::decode(&edge_bytes).ok_or(StorageError::NotFound)?;
+        edge.next_target_edge = old_head;
+        edge.prev_target_edge = SlotRef::NULL;
+        let mut edge_buf = [0u8; EdgeRecord::SIZE];
+        edge.encode(&mut edge_buf);
+        Self::overwrite_record(pm, edge_slot, &edge_buf, fs)?;
+
+        // If there was a previous head, update its prev pointer.
+        if !old_head.is_null() {
+            let head_bytes = Self::read_record(pm, old_head, fs)?
+                .ok_or(StorageError::NotFound)?;
+            let mut head_edge = EdgeRecord::decode(&head_bytes).ok_or(StorageError::NotFound)?;
+            head_edge.prev_target_edge = edge_slot;
+            let mut head_buf = [0u8; EdgeRecord::SIZE];
+            head_edge.encode(&mut head_buf);
+            Self::overwrite_record(pm, old_head, &head_buf, fs)?;
+        }
+
+        // Update the target node's first_incoming_edge.
+        node.first_incoming_edge = edge_slot;
+        node.generation += 1;
+        let mut node_buf = [0u8; NodeRecord::SIZE];
+        node.encode(&mut node_buf);
+        Self::overwrite_record(pm, node_slot, &node_buf, fs)
+    }
+
+    /// Unlink an edge from the source node's adjacency list, patching
+    /// neighbour pointers.  Returns the new outgoing head if the edge was
+    /// the list head.
+    fn unwire_source_adjacency(
+        pm: &mut PageManager,
+        edge_slot: SlotRef,
+        node_slot: SlotRef,
+        fs: &dyn FileSystem,
+    ) -> Result<Option<SlotRef>, StorageError> {
+        let edge_bytes = Self::read_record(pm, edge_slot, fs)?
+            .ok_or(StorageError::NotFound)?;
+        let edge = EdgeRecord::decode(&edge_bytes).ok_or(StorageError::NotFound)?;
+        let prev = edge.prev_source_edge;
+        let next = edge.next_source_edge;
+
+        if !prev.is_null() {
+            let p_bytes = Self::read_record(pm, prev, fs)?.ok_or(StorageError::NotFound)?;
+            let mut p = EdgeRecord::decode(&p_bytes).ok_or(StorageError::NotFound)?;
+            p.next_source_edge = next;
+            let mut pbuf = [0u8; EdgeRecord::SIZE];
+            p.encode(&mut pbuf);
+            Self::overwrite_record(pm, prev, &pbuf, fs)?;
+        }
+        if !next.is_null() {
+            let n_bytes = Self::read_record(pm, next, fs)?.ok_or(StorageError::NotFound)?;
+            let mut n = EdgeRecord::decode(&n_bytes).ok_or(StorageError::NotFound)?;
+            n.prev_source_edge = prev;
+            let mut nbuf = [0u8; EdgeRecord::SIZE];
+            n.encode(&mut nbuf);
+            Self::overwrite_record(pm, next, &nbuf, fs)?;
+        }
+
+        // Clear the deleted edge's own pointers.
+        let edge_bytes2 = Self::read_record(pm, edge_slot, fs)?.ok_or(StorageError::NotFound)?;
+        let mut edge2 = EdgeRecord::decode(&edge_bytes2).ok_or(StorageError::NotFound)?;
+        edge2.prev_source_edge = SlotRef::NULL;
+        edge2.next_source_edge = SlotRef::NULL;
+        let mut ebuf = [0u8; EdgeRecord::SIZE];
+        edge2.encode(&mut ebuf);
+        Self::overwrite_record(pm, edge_slot, &ebuf, fs)?;
+
+        // If this was the head, update the source node's first_outgoing_edge.
+        if prev.is_null() {
+            // Update node record.
+            let node_bytes = Self::read_record(pm, node_slot, fs)?.ok_or(StorageError::NotFound)?;
+            let mut node = NodeRecord::decode(&node_bytes).ok_or(StorageError::NotFound)?;
+            node.first_outgoing_edge = next;
+            node.generation += 1;
+            let mut nbuf = [0u8; NodeRecord::SIZE];
+            node.encode(&mut nbuf);
+            Self::overwrite_record(pm, node_slot, &nbuf, fs)?;
+            Ok(Some(next))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Unlink an edge from the target node's adjacency list, patching
+    /// neighbour pointers.  Returns the new incoming head if the edge was
+    /// the list head.
+    fn unwire_target_adjacency(
+        pm: &mut PageManager,
+        edge_slot: SlotRef,
+        node_slot: SlotRef,
+        fs: &dyn FileSystem,
+    ) -> Result<Option<SlotRef>, StorageError> {
+        let edge_bytes = Self::read_record(pm, edge_slot, fs)?
+            .ok_or(StorageError::NotFound)?;
+        let edge = EdgeRecord::decode(&edge_bytes).ok_or(StorageError::NotFound)?;
+        let prev = edge.prev_target_edge;
+        let next = edge.next_target_edge;
+
+        if !prev.is_null() {
+            let p_bytes = Self::read_record(pm, prev, fs)?.ok_or(StorageError::NotFound)?;
+            let mut p = EdgeRecord::decode(&p_bytes).ok_or(StorageError::NotFound)?;
+            p.next_target_edge = next;
+            let mut pbuf = [0u8; EdgeRecord::SIZE];
+            p.encode(&mut pbuf);
+            Self::overwrite_record(pm, prev, &pbuf, fs)?;
+        }
+        if !next.is_null() {
+            let n_bytes = Self::read_record(pm, next, fs)?.ok_or(StorageError::NotFound)?;
+            let mut n = EdgeRecord::decode(&n_bytes).ok_or(StorageError::NotFound)?;
+            n.prev_target_edge = prev;
+            let mut nbuf = [0u8; EdgeRecord::SIZE];
+            n.encode(&mut nbuf);
+            Self::overwrite_record(pm, next, &nbuf, fs)?;
+        }
+
+        // Clear the deleted edge's own pointers.
+        let edge_bytes2 = Self::read_record(pm, edge_slot, fs)?.ok_or(StorageError::NotFound)?;
+        let mut edge2 = EdgeRecord::decode(&edge_bytes2).ok_or(StorageError::NotFound)?;
+        edge2.prev_target_edge = SlotRef::NULL;
+        edge2.next_target_edge = SlotRef::NULL;
+        let mut ebuf = [0u8; EdgeRecord::SIZE];
+        edge2.encode(&mut ebuf);
+        Self::overwrite_record(pm, edge_slot, &ebuf, fs)?;
+
+        // If this was the head, update the target node's first_incoming_edge.
+        if prev.is_null() {
+            let node_bytes = Self::read_record(pm, node_slot, fs)?.ok_or(StorageError::NotFound)?;
+            let mut node = NodeRecord::decode(&node_bytes).ok_or(StorageError::NotFound)?;
+            node.first_incoming_edge = next;
+            node.generation += 1;
+            let mut nbuf = [0u8; NodeRecord::SIZE];
+            node.encode(&mut nbuf);
+            Self::overwrite_record(pm, node_slot, &nbuf, fs)?;
+            Ok(Some(next))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// Convert a `(PageId, slot)` to a [`SlotRef`], checking bounds.
@@ -545,6 +861,9 @@ impl StorageEngine for GraphStorageEngine {
         node: &NodeRecord,
         fs: &dyn FileSystem,
     ) -> Result<SlotRef, StorageError> {
+        if node.node_id == 0 {
+            return Err(StorageError::InvalidId);
+        }
         let key = node_id_key(node.node_id as u128);
         if self.node_index.search(&key).is_some() {
             return Err(StorageError::AlreadyExists);
@@ -641,6 +960,9 @@ impl StorageEngine for GraphStorageEngine {
         edge: &EdgeRecord,
         fs: &dyn FileSystem,
     ) -> Result<SlotRef, StorageError> {
+        if edge.edge_id == 0 {
+            return Err(StorageError::InvalidId);
+        }
         let key = edge_id_key(edge.edge_id as u128);
         if self.edge_index.search(&key).is_some() {
             return Err(StorageError::AlreadyExists);
@@ -648,7 +970,7 @@ impl StorageEngine for GraphStorageEngine {
 
         let mut buf = [0u8; EdgeRecord::SIZE];
         edge.encode(&mut buf);
-        let slot = Self::insert_record(
+        let edge_slot = Self::insert_record(
             &mut self.page_manager,
             &buf,
             &mut self.edge_pages,
@@ -656,21 +978,33 @@ impl StorageEngine for GraphStorageEngine {
             fs,
         )?;
 
-        let value = slot.raw.to_be_bytes().to_vec();
+        let value = edge_slot.raw.to_be_bytes().to_vec();
         self.edge_index.insert(&key, &value)?;
 
         // Secondary type index.
         let type_key = type_index_key(edge.type_id as u64, edge.edge_id as u128);
         self.type_index.insert(&type_key, &value)?;
 
-        // WAL: EdgeInsert.
+        // Adjacency list maintenance for source node (outgoing).
+        if !edge.source_node.is_null() {
+            Self::wire_source_adjacency(&mut self.page_manager, edge_slot, edge.source_node, fs)?;
+        }
+
+        // Adjacency list maintenance for target node (incoming).
+        if !edge.target_node.is_null() {
+            Self::wire_target_adjacency(&mut self.page_manager, edge_slot, edge.target_node, fs)?;
+        }
+
+        // WAL: EdgeInsert — re-encode to capture any pointer updates.
+        let final_record = Self::read_record(&self.page_manager, edge_slot, fs)?
+            .ok_or(StorageError::NotFound)?;
         let mut payload = Vec::with_capacity(8 + 4 + EdgeRecord::SIZE);
         payload.extend_from_slice(&edge.edge_id.to_be_bytes());
-        payload.extend_from_slice(&slot.raw.to_be_bytes());
-        payload.extend_from_slice(&buf);
+        payload.extend_from_slice(&edge_slot.raw.to_be_bytes());
+        payload.extend_from_slice(&final_record);
         Self::log(&mut self.page_manager, &mut self.wal_writer, fs, RecordType::EdgeInsert, 1, payload)?;
 
-        Ok(slot)
+        Ok(edge_slot)
     }
 
     fn get_edge(
@@ -711,6 +1045,18 @@ impl StorageEngine for GraphStorageEngine {
 
         let record = Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
         let mut edge = EdgeRecord::decode(&record).ok_or(StorageError::NotFound)?;
+
+        // Unlink from adjacency lists before marking as deleted.
+        if !edge.source_node.is_null() {
+            Self::unwire_source_adjacency(&mut self.page_manager, slot_ref, edge.source_node, fs)?;
+        }
+        if !edge.target_node.is_null() {
+            Self::unwire_target_adjacency(&mut self.page_manager, slot_ref, edge.target_node, fs)?;
+        }
+
+        // Re-read the record after pointer patching.
+        let record = Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
+        edge = EdgeRecord::decode(&record).ok_or(StorageError::NotFound)?;
         edge.flags |= edge_flags::DELETED;
         edge.generation += 1;
 
@@ -915,9 +1261,13 @@ mod tests {
         let (_dir, fs, path) = temp_fs();
         let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
 
-        let source = SlotRef::new(1, 0);
-        let target = SlotRef::new(2, 0);
-        let edge = EdgeRecord::new(100, 5, source, target);
+        // Insert source and target nodes first so adjacency wiring works.
+        engine.put_node(&NodeRecord::new(1, 0), &fs).unwrap();
+        engine.put_node(&NodeRecord::new(2, 0), &fs).unwrap();
+        let source = engine.lookup_node_slot(1).unwrap().unwrap();
+        let target = engine.lookup_node_slot(2).unwrap().unwrap();
+
+        let edge = EdgeRecord::new(100, 5, 1, 2, source, target);
         let slot = engine.put_edge(&edge, &fs).unwrap();
         assert!(!slot.is_null());
 
@@ -926,6 +1276,8 @@ mod tests {
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.edge_id, 100);
         assert_eq!(retrieved.type_id, 5);
+        assert_eq!(retrieved.source_id, 1);
+        assert_eq!(retrieved.target_id, 2);
         assert_eq!(retrieved.source_node, source);
         assert_eq!(retrieved.target_node, target);
     }
@@ -935,7 +1287,12 @@ mod tests {
         let (_dir, fs, path) = temp_fs();
         let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
 
-        let edge = EdgeRecord::new(100, 5, SlotRef::new(1, 0), SlotRef::new(2, 0));
+        engine.put_node(&NodeRecord::new(1, 0), &fs).unwrap();
+        engine.put_node(&NodeRecord::new(2, 0), &fs).unwrap();
+        let src_slot = engine.lookup_node_slot(1).unwrap().unwrap();
+        let tgt_slot = engine.lookup_node_slot(2).unwrap().unwrap();
+
+        let edge = EdgeRecord::new(100, 5, 1, 2, src_slot, tgt_slot);
         engine.put_edge(&edge, &fs).unwrap();
         engine.delete_edge(100, &fs).unwrap();
 
@@ -950,7 +1307,7 @@ mod tests {
         let (_dir, fs, path) = temp_fs();
         let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
 
-        let prop = PropertyRecord::inline(1, crate::graph::record::ValueType::String, b"hello".to_vec());
+        let prop = PropertyRecord::inline("msg", 1, crate::graph::record::ValueType::String, b"hello".to_vec());
         let slot = engine.put_property(&prop, &fs).unwrap();
 
         let retrieved = engine.get_property(slot, &fs).unwrap();
@@ -967,7 +1324,7 @@ mod tests {
         let node = NodeRecord::new(1, 42);
         engine.put_node(&node, &fs).unwrap();
 
-        let prop = PropertyRecord::inline(1, crate::graph::record::ValueType::String, b"name".to_vec());
+        let prop = PropertyRecord::inline("name", 1, crate::graph::record::ValueType::String, b"name".to_vec());
         let prop_slot = engine.put_property(&prop, &fs).unwrap();
 
         engine.attach_property_to_node(1, prop_slot, &fs).unwrap();
@@ -981,10 +1338,15 @@ mod tests {
         let (_dir, fs, path) = temp_fs();
         let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
 
-        let edge = EdgeRecord::new(100, 5, SlotRef::new(1, 0), SlotRef::new(2, 0));
+        engine.put_node(&NodeRecord::new(1, 0), &fs).unwrap();
+        engine.put_node(&NodeRecord::new(2, 0), &fs).unwrap();
+        let src_slot = engine.lookup_node_slot(1).unwrap().unwrap();
+        let tgt_slot = engine.lookup_node_slot(2).unwrap().unwrap();
+
+        let edge = EdgeRecord::new(100, 5, 1, 2, src_slot, tgt_slot);
         engine.put_edge(&edge, &fs).unwrap();
 
-        let prop = PropertyRecord::inline(1, crate::graph::record::ValueType::String, b"weight".to_vec());
+        let prop = PropertyRecord::inline("weight", 1, crate::graph::record::ValueType::String, b"weight".to_vec());
         let prop_slot = engine.put_property(&prop, &fs).unwrap();
 
         engine.attach_property_to_edge(100, prop_slot, &fs).unwrap();
@@ -1056,8 +1418,10 @@ mod tests {
         engine.put_node(&node2, &fs).unwrap();
 
         // Insert edges with different types.
-        let edge1 = EdgeRecord::new(100, 1, SlotRef::new(1, 0), SlotRef::new(2, 0));
-        let edge2 = EdgeRecord::new(101, 2, SlotRef::new(1, 0), SlotRef::new(2, 0));
+        let n1_slot = engine.lookup_node_slot(1).unwrap().unwrap();
+        let n2_slot = engine.lookup_node_slot(2).unwrap().unwrap();
+        let edge1 = EdgeRecord::new(100, 1, 1, 2, n1_slot, n2_slot);
+        let edge2 = EdgeRecord::new(101, 2, 1, 2, n1_slot, n2_slot);
         engine.put_edge(&edge1, &fs).unwrap();
         engine.put_edge(&edge2, &fs).unwrap();
 

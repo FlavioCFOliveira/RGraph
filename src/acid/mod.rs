@@ -69,38 +69,32 @@ impl AcidGate {
     ) {
         self.test("atomicity-commit", || {
             // Transaction with multiple inserts must commit all or none.
-            let n1 = NodeBuilder::new(1).label(1);
-            let n2 = NodeBuilder::new(2).label(1);
-            graph.create_node(n1, fs)?;
-            graph.create_node(n2, fs)?;
+            let (_, n1_id) = graph.create_node(NodeBuilder::new().label(1), fs)?;
+            let (_, n2_id) = graph.create_node(NodeBuilder::new().label(1), fs)?;
             graph.sync(fs)?;
             // Verify both nodes exist.
-            assert!(graph.get_node(1, fs)?.is_some(), "node 1 should exist after commit");
-            assert!(graph.get_node(2, fs)?.is_some(), "node 2 should exist after commit");
+            assert!(graph.get_node(n1_id, fs)?.is_some(), "node 1 should exist after commit");
+            assert!(graph.get_node(n2_id, fs)?.is_some(), "node 2 should exist after commit");
             Ok(())
         });
 
         self.test("atomicity-rollback", || {
             // Transaction abort must leave no partial state.
             // In the current model there is no explicit rollback API;
-            // we simulate by not syncing.
-            let n3 = NodeBuilder::new(3).label(1);
-            graph.create_node(n3, fs)?;
+            // we simulate by not syncing — un-flushed writes are lost on reopen.
+            let _ = graph.create_node(NodeBuilder::new().label(1), fs)?;
             // Do NOT sync — simulate rollback by dropping the graph.
-            // On reopen, node 3 should not exist.
             Ok(())
         });
 
         self.test("atomicity-relationship-with-nodes", || {
             // Creating a relationship requires both endpoints to exist.
-            let src = NodeBuilder::new(10).label(1);
-            let tgt = NodeBuilder::new(11).label(1);
-            graph.create_node(src, fs)?;
-            graph.create_node(tgt, fs)?;
-            let rel = RelationshipBuilder::new(100).from(10).to(11).type_id(1);
-            graph.create_relationship(rel, fs)?;
+            let (_, src_id) = graph.create_node(NodeBuilder::new().label(1), fs)?;
+            let (_, tgt_id) = graph.create_node(NodeBuilder::new().label(1), fs)?;
+            let rel = RelationshipBuilder::new().from(src_id).to(tgt_id).type_id(1);
+            let (_, rel_id) = graph.create_relationship(rel, fs)?;
             graph.sync(fs)?;
-            assert!(graph.get_relationship(100, fs)?.is_some());
+            assert!(graph.get_relationship(rel_id, fs)?.is_some());
             Ok(())
         });
     }
@@ -116,29 +110,31 @@ impl AcidGate {
         fs: &dyn FileSystem,
     ) {
         self.test("consistency-unique-node-id", || {
-            // Duplicate node IDs should be rejected.
-            let n1 = NodeBuilder::new(20).label(1);
-            let n2 = NodeBuilder::new(20).label(2); // same ID
-            graph.create_node(n1, fs)?;
-            let result = graph.create_node(n2, fs);
-            assert!(result.is_err() || graph.get_node(20, fs)?.map(|n| n.label_id) == Some(1));
+            // Each create_node call produces a unique id; no duplication possible
+            // through the high-level API (ids are server-allocated).
+            let (_, id1) = graph.create_node(NodeBuilder::new().label(1), fs)?;
+            let (_, id2) = graph.create_node(NodeBuilder::new().label(2), fs)?;
+            assert_ne!(id1, id2, "server-allocated ids must be unique");
             Ok(())
         });
 
         self.test("consistency-relationship-endpoints-exist", || {
             // Creating a relationship with non-existent endpoints must fail.
-            // NOTE: Endpoint validation is not yet implemented in the storage engine.
-            // This test is skipped until foreign-key enforcement is added.
-            return Ok(()); // placeholder: skip
+            let rel = RelationshipBuilder::new()
+                .from(u64::MAX - 1)
+                .to(u64::MAX)
+                .type_id(1);
+            let result = graph.create_relationship(rel, fs);
+            assert!(result.is_err(), "relationship to non-existent nodes must fail");
+            Ok(())
         });
 
         self.test("consistency-tombstone-invisibility", || {
             // Deleted nodes must remain invisible.
-            let n = NodeBuilder::new(30).label(1);
-            graph.create_node(n, fs)?;
-            graph.delete_node(30, fs)?;
+            let (_, nid) = graph.create_node(NodeBuilder::new().label(1), fs)?;
+            graph.delete_node(nid, fs)?;
             graph.sync(fs)?;
-            assert!(graph.get_node(30, fs)?.is_none());
+            assert!(graph.get_node(nid, fs)?.is_none());
             Ok(())
         });
     }
@@ -195,11 +191,10 @@ impl AcidGate {
     ) {
         self.test("durability-commit-survives-sync", || {
             // After sync, committed data must survive reopen.
-            let n = NodeBuilder::new(40).label(1);
-            graph.create_node(n, fs)?;
+            let (_, nid) = graph.create_node(NodeBuilder::new().label(1), fs)?;
             graph.sync(fs)?;
             // Re-open is validated by the test runner via new Graph instance.
-            assert!(graph.get_node(40, fs)?.is_some());
+            assert!(graph.get_node(nid, fs)?.is_some());
             Ok(())
         });
 

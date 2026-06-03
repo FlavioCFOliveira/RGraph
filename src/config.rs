@@ -417,14 +417,18 @@ impl GraphBuilder {
     ///
     /// If the directory does not exist it is created.  If the database
     /// does not yet exist it is initialised; otherwise it is opened.
+    ///
+    /// The [`GraphMode`] chosen via [`GraphBuilder::mode`] is threaded into
+    /// the returned handle so the query layer can dispatch correctly.
     pub fn build(self) -> Result<crate::db::database::Database> {
         let cfg = self.config()?;
         let fs = crate::io::posix::PosixFileSystem::new(cfg.use_odirect);
+        let mode = cfg.graph_mode;
         if cfg.database_path.exists() {
-            crate::db::database::Database::open(&cfg.database_path, &fs)
+            crate::db::database::Database::open(&cfg.database_path, &fs, mode)
                 .map_err(|e| RGraphError::Io(format!("failed to open database: {}", e)))
         } else {
-            crate::db::database::Database::init(&cfg.database_path, &fs)
+            crate::db::database::Database::init(&cfg.database_path, &fs, mode)
                 .map_err(|e| RGraphError::Io(format!("failed to init database: {}", e)))
         }
     }

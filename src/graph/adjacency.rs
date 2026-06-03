@@ -242,7 +242,7 @@ mod tests {
         let mut store = TestStore::new();
         let e1 = SlotRef::new(1, 0);
         let n1 = SlotRef::new(10, 0);
-        store.insert(e1, EdgeRecord::new(100, 1, n1, SlotRef::NULL));
+        store.insert(e1, EdgeRecord::new(100, 1, 1, 0, n1, SlotRef::NULL));
 
         let head = link_source_head(&mut store, e1, SlotRef::NULL).unwrap();
         assert_eq!(head, e1);
@@ -259,8 +259,8 @@ mod tests {
         let e1 = SlotRef::new(1, 0);
         let e2 = SlotRef::new(2, 0);
 
-        store.insert(e1, EdgeRecord::new(100, 1, n1, SlotRef::NULL));
-        store.insert(e2, EdgeRecord::new(200, 1, n1, SlotRef::NULL));
+        store.insert(e1, EdgeRecord::new(100, 1, 1, 0, n1, SlotRef::NULL));
+        store.insert(e2, EdgeRecord::new(200, 1, 1, 0, n1, SlotRef::NULL));
 
         // Link e1 first.
         let head = link_source_head(&mut store, e1, SlotRef::NULL).unwrap();
@@ -284,7 +284,7 @@ mod tests {
         let mut store = TestStore::new();
         let e1 = SlotRef::new(1, 0);
         let n1 = SlotRef::new(10, 0);
-        store.insert(e1, EdgeRecord::new(100, 1, SlotRef::NULL, n1));
+        store.insert(e1, EdgeRecord::new(100, 1, 0, 1, SlotRef::NULL, n1));
 
         let head = link_target_head(&mut store, e1, SlotRef::NULL).unwrap();
         assert_eq!(head, e1);
@@ -298,9 +298,9 @@ mod tests {
         let e2 = SlotRef::new(2, 0);
         let e3 = SlotRef::new(3, 0);
 
-        store.insert(e1, EdgeRecord::new(100, 1, n1, SlotRef::NULL));
-        store.insert(e2, EdgeRecord::new(200, 1, n1, SlotRef::NULL));
-        store.insert(e3, EdgeRecord::new(300, 1, n1, SlotRef::NULL));
+        store.insert(e1, EdgeRecord::new(100, 1, 1, 0, n1, SlotRef::NULL));
+        store.insert(e2, EdgeRecord::new(200, 1, 1, 0, n1, SlotRef::NULL));
+        store.insert(e3, EdgeRecord::new(300, 1, 1, 0, n1, SlotRef::NULL));
 
         let _ = link_source_head(&mut store, e1, SlotRef::NULL).unwrap();
         let _head = link_source_head(&mut store, e2, e1).unwrap();
@@ -328,8 +328,8 @@ mod tests {
         let e1 = SlotRef::new(1, 0);
         let e2 = SlotRef::new(2, 0);
 
-        store.insert(e1, EdgeRecord::new(100, 1, n1, SlotRef::NULL));
-        store.insert(e2, EdgeRecord::new(200, 1, n1, SlotRef::NULL));
+        store.insert(e1, EdgeRecord::new(100, 1, 1, 0, n1, SlotRef::NULL));
+        store.insert(e2, EdgeRecord::new(200, 1, 1, 0, n1, SlotRef::NULL));
 
         let _head = link_source_head(&mut store, e1, SlotRef::NULL).unwrap();
         let _head = link_source_head(&mut store, e2, _head).unwrap();
@@ -349,9 +349,9 @@ mod tests {
         let e2 = SlotRef::new(2, 0);
         let e3 = SlotRef::new(3, 0);
 
-        store.insert(e1, EdgeRecord::new(100, 1, SlotRef::NULL, n1));
-        store.insert(e2, EdgeRecord::new(200, 1, SlotRef::NULL, n1));
-        store.insert(e3, EdgeRecord::new(300, 1, SlotRef::NULL, n1));
+        store.insert(e1, EdgeRecord::new(100, 1, 0, 1, SlotRef::NULL, n1));
+        store.insert(e2, EdgeRecord::new(200, 1, 0, 1, SlotRef::NULL, n1));
+        store.insert(e3, EdgeRecord::new(300, 1, 0, 1, SlotRef::NULL, n1));
 
         let _ = link_target_head(&mut store, e1, SlotRef::NULL).unwrap();
         let _head = link_target_head(&mut store, e2, e1).unwrap();
@@ -372,9 +372,9 @@ mod tests {
         let e2 = SlotRef::new(2, 0);
         let e3 = SlotRef::new(3, 0);
 
-        store.insert(e1, EdgeRecord::new(100, 1, n1, SlotRef::NULL));
-        store.insert(e2, EdgeRecord::new(200, 1, n1, SlotRef::NULL));
-        store.insert(e3, EdgeRecord::new(300, 1, n1, SlotRef::NULL));
+        store.insert(e1, EdgeRecord::new(100, 1, 1, 0, n1, SlotRef::NULL));
+        store.insert(e2, EdgeRecord::new(200, 1, 1, 0, n1, SlotRef::NULL));
+        store.insert(e3, EdgeRecord::new(300, 1, 1, 0, n1, SlotRef::NULL));
 
         let _ = link_source_head(&mut store, e1, SlotRef::NULL).unwrap();
         let head = link_source_head(&mut store, e2, e1).unwrap();
@@ -391,8 +391,8 @@ mod tests {
         let e1 = SlotRef::new(1, 0);
         let e2 = SlotRef::new(2, 0);
 
-        store.insert(e1, EdgeRecord::new(100, 1, SlotRef::NULL, n1));
-        store.insert(e2, EdgeRecord::new(200, 1, SlotRef::NULL, n1));
+        store.insert(e1, EdgeRecord::new(100, 1, 0, 1, SlotRef::NULL, n1));
+        store.insert(e2, EdgeRecord::new(200, 1, 0, 1, SlotRef::NULL, n1));
 
         let _ = link_target_head(&mut store, e1, SlotRef::NULL).unwrap();
         let head = link_target_head(&mut store, e2, e1).unwrap();
@@ -407,8 +407,8 @@ mod tests {
         let n1 = SlotRef::new(10, 0);
         let e1 = SlotRef::new(1, 0);
         let e2 = SlotRef::new(2, 0);
-        store.insert(e1, EdgeRecord::new(100, 1, n1, SlotRef::NULL));
-        store.insert(e2, EdgeRecord::new(200, 1, n1, SlotRef::NULL));
+        store.insert(e1, EdgeRecord::new(100, 1, 1, 0, n1, SlotRef::NULL));
+        store.insert(e2, EdgeRecord::new(200, 1, 1, 0, n1, SlotRef::NULL));
 
         // Link e1 first, then e2 (so e1 gets a next pointer).
         let head = link_source_head(&mut store, e1, SlotRef::NULL).unwrap();
@@ -423,7 +423,7 @@ mod tests {
     fn link_null_node_fails() {
         let mut store = TestStore::new();
         let e1 = SlotRef::new(1, 0);
-        store.insert(e1, EdgeRecord::new(100, 1, SlotRef::NULL, SlotRef::NULL));
+        store.insert(e1, EdgeRecord::new(100, 1, 0, 0, SlotRef::NULL, SlotRef::NULL));
 
         let result = link_source_head(&mut store, e1, SlotRef::NULL);
         assert_eq!(result, Err(AdjacencyError::NullNode));

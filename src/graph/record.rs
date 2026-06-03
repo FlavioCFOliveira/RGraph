@@ -149,28 +149,42 @@ pub mod node_flags {
     pub const HAS_OVERFLOW: u16 = 0x0002;
 }
 
-/// Fixed-size edge record (48 bytes).
+/// Fixed-size edge record (64 bytes).
+///
+/// Stores both the logical node ids (`source_id`, `target_id`) and the
+/// physical slot references (`source_node`, `target_node`).  The logical
+/// ids are the authoritative endpoint identifiers; the physical slot
+/// references are cached for O(1) pointer chasing without an index lookup.
 ///
 /// ```text
 /// 0x00  edge_id              u64
-/// 0x08  type_id              u32
-/// 0x0C  source_node          SlotRef (u32)
-/// 0x10  target_node          SlotRef (u32)
-/// 0x14  prev_source_edge     SlotRef (u32)
-/// 0x18  next_source_edge     SlotRef (u32)
-/// 0x1C  prev_target_edge     SlotRef (u32)
-/// 0x20  next_target_edge     SlotRef (u32)
-/// 0x24  first_property       SlotRef (u32)
-/// 0x28  flags                u16
-/// 0x2A  generation           u16
-/// 0x2C  _pad                 u32
+/// 0x08  source_id            u64   -- logical source node id
+/// 0x10  target_id            u64   -- logical target node id
+/// 0x18  type_id              u32
+/// 0x1C  source_node          SlotRef (u32)
+/// 0x20  target_node          SlotRef (u32)
+/// 0x24  prev_source_edge     SlotRef (u32)
+/// 0x28  next_source_edge     SlotRef (u32)
+/// 0x2C  prev_target_edge     SlotRef (u32)
+/// 0x30  next_target_edge     SlotRef (u32)
+/// 0x34  first_property       SlotRef (u32)
+/// 0x38  flags                u16
+/// 0x3A  generation           u16
+/// 0x3C  _pad                 u32
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct EdgeRecord {
     pub edge_id: u64,
+    /// Logical id of the source node.  Survives round-trips regardless of
+    /// how many pages the database spans (not limited to 24-bit page ids).
+    pub source_id: u64,
+    /// Logical id of the target node.
+    pub target_id: u64,
     pub type_id: u32,
+    /// Physical slot reference of the source node (cached, derived from `source_id`).
     pub source_node: SlotRef,
+    /// Physical slot reference of the target node (cached, derived from `target_id`).
     pub target_node: SlotRef,
     pub prev_source_edge: SlotRef,
     pub next_source_edge: SlotRef,
@@ -184,9 +198,26 @@ pub struct EdgeRecord {
 
 impl EdgeRecord {
     /// Create a new empty edge record.
-    pub fn new(edge_id: u64, type_id: u32, source: SlotRef, target: SlotRef) -> Self {
+    ///
+    /// # Arguments
+    /// * `edge_id`    — unique logical edge id (must be non-zero).
+    /// * `type_id`    — edge type label id.
+    /// * `source_id`  — logical id of the source node.
+    /// * `target_id`  — logical id of the target node.
+    /// * `source`     — physical slot reference of the source node.
+    /// * `target`     — physical slot reference of the target node.
+    pub fn new(
+        edge_id: u64,
+        type_id: u32,
+        source_id: u64,
+        target_id: u64,
+        source: SlotRef,
+        target: SlotRef,
+    ) -> Self {
         Self {
             edge_id,
+            source_id,
+            target_id,
             type_id,
             source_node: source,
             target_node: target,
@@ -201,8 +232,8 @@ impl EdgeRecord {
         }
     }
 
-    /// Size of the record in bytes (always 48).
-    pub const SIZE: usize = 48;
+    /// Size of the record in bytes (always 64).
+    pub const SIZE: usize = 64;
 
     /// Encode into a byte slice.
     pub fn encode(&self, out: &mut [u8]) {
@@ -355,48 +386,61 @@ impl OverflowHandle {
     }
 }
 
-/// A complete in-memory property value (header + payload or overflow handle).
+/// A complete in-memory property value (header + next pointer + name + payload).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyRecord {
     pub header: PropertyHeader,
+    pub next_property: SlotRef,
+    pub property_name: String,
     pub payload: Vec<u8>,
 }
 
 impl PropertyRecord {
     /// Create a new inline property record.
-    pub fn inline(property_key_id: u32, value_type: ValueType, payload: Vec<u8>) -> Self {
+    pub fn inline(name: &str, property_key_id: u32, value_type: ValueType, payload: Vec<u8>) -> Self {
         assert!(
             payload.len() <= MAX_INLINE_PROPERTY_LEN,
             "inline payload exceeds {} bytes",
             MAX_INLINE_PROPERTY_LEN
         );
         Self {
-            header: PropertyHeader::new(property_key_id, value_type, payload.len() as u16),
+            header: PropertyHeader::new(property_key_id, value_type, 0),
+            next_property: SlotRef::NULL,
+            property_name: name.to_string(),
             payload,
         }
     }
 
     /// Create a new overflow property record.
-    pub fn overflow(property_key_id: u32, value_type: ValueType, handle: OverflowHandle) -> Self {
+    pub fn overflow(name: &str, property_key_id: u32, value_type: ValueType, handle: OverflowHandle) -> Self {
         let mut payload = vec![0u8; OverflowHandle::SIZE];
         handle.encode(&mut payload);
         Self {
-            header: PropertyHeader::new(property_key_id, value_type, payload.len() as u16),
+            header: PropertyHeader::new(property_key_id, value_type, 0),
+            next_property: SlotRef::NULL,
+            property_name: name.to_string(),
             payload,
         }
     }
 
-    /// Total on-disk size of this record (header + payload).
+    /// Total on-disk size of this record (header + next_property + name_len + name + payload).
     pub fn on_disk_size(&self) -> usize {
-        PropertyHeader::SIZE + self.payload.len()
+        PropertyHeader::SIZE + 4 + 2 + self.property_name.len() + self.payload.len()
     }
 
     /// Encode into a byte vector.
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.on_disk_size());
+        let name_bytes = self.property_name.as_bytes();
+        let total_len = 4 + 2 + name_bytes.len() + self.payload.len();
+        let mut buf = Vec::with_capacity(PropertyHeader::SIZE + total_len);
+        let mut header = self.header;
+        header.value_length = total_len as u16;
         let mut header_bytes = [0u8; PropertyHeader::SIZE];
-        self.header.encode(&mut header_bytes);
+        header.encode(&mut header_bytes);
         buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(&self.next_property.raw.to_be_bytes());
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
+        buf.extend_from_slice(name_bytes);
         buf.extend_from_slice(&self.payload);
         buf
     }
@@ -407,18 +451,33 @@ impl PropertyRecord {
             return None;
         }
         let header = PropertyHeader::decode(&bytes[..PropertyHeader::SIZE])?;
-        let payload_len = header.value_length as usize;
-        if bytes.len() < PropertyHeader::SIZE + payload_len {
+        let total_len = header.value_length as usize;
+        if total_len < 6 || bytes.len() < PropertyHeader::SIZE + total_len {
             return None;
         }
-        let payload = bytes[PropertyHeader::SIZE..PropertyHeader::SIZE + payload_len].to_vec();
-        Some(Self { header, payload })
+        let mut off = PropertyHeader::SIZE;
+        let next_raw = u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        off += 4;
+        let name_len = u16::from_be_bytes([bytes[off], bytes[off + 1]]) as usize;
+        off += 2;
+        if total_len < 6 + name_len {
+            return None;
+        }
+        let name = String::from_utf8(bytes[off..off + name_len].to_vec()).ok()?;
+        off += name_len;
+        let payload = bytes[off..PropertyHeader::SIZE + total_len].to_vec();
+        Some(Self {
+            header,
+            next_property: SlotRef { raw: next_raw },
+            property_name: name,
+            payload,
+        })
     }
 
     /// Is this property stored inline?
     pub fn is_inline(&self) -> bool {
         self.payload.len() <= MAX_INLINE_PROPERTY_LEN
-            && self.header.value_length as usize <= MAX_INLINE_PROPERTY_LEN
+            && self.header.value_length as usize <= MAX_INLINE_PROPERTY_LEN + 6 + self.property_name.len()
     }
 
     /// Extract the overflow handle from the payload.
@@ -437,12 +496,7 @@ impl PropertyRecord {
 impl From<&str> for PropertyRecord {
     fn from(s: &str) -> Self {
         let bytes = s.as_bytes().to_vec();
-        if bytes.len() <= MAX_INLINE_PROPERTY_LEN {
-            Self::inline(0, ValueType::String, bytes)
-        } else {
-            // Caller must convert to overflow after allocating a page.
-            Self::inline(0, ValueType::String, bytes)
-        }
+        Self::inline("", 0, ValueType::String, bytes)
     }
 }
 
@@ -519,13 +573,13 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn edge_record_size_is_48() {
-        assert_eq!(size_of::<EdgeRecord>(), 48);
+    fn edge_record_size_is_64() {
+        assert_eq!(size_of::<EdgeRecord>(), 64);
     }
 
     #[test]
     fn edge_record_encode_decode_roundtrip() {
-        let mut rec = EdgeRecord::new(999, 10, SlotRef::new(1, 2), SlotRef::new(3, 4));
+        let mut rec = EdgeRecord::new(999, 10, 1001, 1002, SlotRef::new(1, 2), SlotRef::new(3, 4));
         rec.prev_source_edge = SlotRef::new(5, 6);
         rec.next_source_edge = SlotRef::new(7, 8);
         rec.prev_target_edge = SlotRef::new(9, 10);
@@ -539,6 +593,8 @@ mod tests {
         let decoded = EdgeRecord::decode(&buf).unwrap();
 
         assert_eq!(decoded.edge_id, 999);
+        assert_eq!(decoded.source_id, 1001);
+        assert_eq!(decoded.target_id, 1002);
         assert_eq!(decoded.type_id, 10);
         assert_eq!(decoded.source_node, SlotRef::new(1, 2));
         assert_eq!(decoded.target_node, SlotRef::new(3, 4));
@@ -553,8 +609,8 @@ mod tests {
 
     #[test]
     fn edge_record_decode_wrong_size_fails() {
-        assert!(EdgeRecord::decode(&[0u8; 47]).is_none());
-        assert!(EdgeRecord::decode(&[0u8; 49]).is_none());
+        assert!(EdgeRecord::decode(&[0u8; 63]).is_none());
+        assert!(EdgeRecord::decode(&[0u8; 65]).is_none());
     }
 
     // ------------------------------------------------------------------
@@ -579,7 +635,7 @@ mod tests {
 
     #[test]
     fn inline_property_roundtrip() {
-        let rec = PropertyRecord::inline(7, ValueType::Int64, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let rec = PropertyRecord::inline("score", 7, ValueType::Int64, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         let bytes = rec.encode();
         let decoded = PropertyRecord::decode(&bytes).unwrap();
         assert_eq!(decoded.header.property_key_id, 7);
@@ -591,7 +647,7 @@ mod tests {
     #[test]
     fn overflow_property_roundtrip() {
         let handle = OverflowHandle::new(99, 123);
-        let rec = PropertyRecord::overflow(5, ValueType::String, handle);
+        let rec = PropertyRecord::overflow("big", 5, ValueType::String, handle);
         let bytes = rec.encode();
         let decoded = PropertyRecord::decode(&bytes).unwrap();
         // Overflow handle is 8 bytes, which is <= MAX_INLINE_PROPERTY_LEN,

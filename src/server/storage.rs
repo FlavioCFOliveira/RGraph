@@ -382,7 +382,9 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
             let mut guard = inner.blocking_lock();
-            guard.create_node(builder, &fs).map_err(into_rgraph_err)
+            guard.create_node(builder, &fs)
+                .map(|(slot, _id)| slot)
+                .map_err(into_rgraph_err)
         })
         .await
         .map_err(|e| RGraphError::Internal(e.to_string()))?
@@ -424,7 +426,9 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
             let mut guard = inner.blocking_lock();
-            guard.create_relationship(builder, &fs).map_err(into_rgraph_err)
+            guard.create_relationship(builder, &fs)
+                .map(|(slot, _id)| slot)
+                .map_err(into_rgraph_err)
         })
         .await
         .map_err(|e| RGraphError::Internal(e.to_string()))?
@@ -544,6 +548,7 @@ fn into_rgraph_err(e: StorageError) -> RGraphError {
         StorageError::PageFull => RGraphError::ResourceExhausted("page full".into()),
         StorageError::SlotOverflow => RGraphError::Internal("slot overflow".into()),
         StorageError::AlreadyExists => RGraphError::AlreadyExists("entity already exists".into()),
+        StorageError::InvalidId => RGraphError::Argument("id 0 is reserved".into()),
     }
 }
 
@@ -642,44 +647,56 @@ mod tests {
 
     #[tokio::test]
     async fn adapter_create_and_get_node() {
+        use crate::graph::engine::GraphStorageEngine;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rgraph.db");
-        let adapter = GraphEngineAdapter::init(path).unwrap();
 
-        let builder = NodeBuilder::new(1).label(42);
-        let slot = adapter.create_node(builder).await.unwrap();
+        // Create with full API to capture the allocated id.
+        let fs = PosixFileSystem::new(false);
+        let engine = GraphStorageEngine::init(path, &fs).unwrap();
+        let mut graph = crate::graph::graph::Graph::new(engine);
+        let (slot, node_id) = graph.create_node(NodeBuilder::new().label(42), &fs).unwrap();
         assert!(!slot.is_null());
+        assert!(node_id > 0);
 
-        let node = adapter.get_node(1).await.unwrap();
+        let node = graph.get_node(node_id, &fs).unwrap();
         assert!(node.is_some());
-        assert_eq!(node.unwrap().node_id, 1);
+        assert_eq!(node.unwrap().node_id, node_id);
     }
 
     #[tokio::test]
     async fn adapter_delete_node() {
+        use crate::graph::engine::GraphStorageEngine;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rgraph.db");
-        let adapter = GraphEngineAdapter::init(path).unwrap();
+        let fs = PosixFileSystem::new(false);
+        let engine = GraphStorageEngine::init(path, &fs).unwrap();
+        let mut graph = crate::graph::graph::Graph::new(engine);
 
-        let builder = NodeBuilder::new(1).label(42);
-        adapter.create_node(builder).await.unwrap();
-        adapter.delete_node(1).await.unwrap();
+        let (_, node_id) = graph.create_node(NodeBuilder::new().label(42), &fs).unwrap();
+        graph.delete_node(node_id, &fs).unwrap();
 
-        let node = adapter.get_node(1).await.unwrap();
+        let node = graph.get_node(node_id, &fs).unwrap();
         assert!(node.is_none());
     }
 
     #[tokio::test]
     async fn adapter_scan_by_label() {
+        use crate::graph::engine::GraphStorageEngine;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rgraph.db");
-        let adapter = GraphEngineAdapter::init(path).unwrap();
+        let fs = PosixFileSystem::new(false);
+        let engine = GraphStorageEngine::init(path, &fs).unwrap();
+        let mut graph = crate::graph::graph::Graph::new(engine);
 
-        adapter.create_node(NodeBuilder::new(1).label(10)).await.unwrap();
-        adapter.create_node(NodeBuilder::new(2).label(20)).await.unwrap();
-        adapter.create_node(NodeBuilder::new(3).label(10)).await.unwrap();
+        graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
+        graph.create_node(NodeBuilder::new().label(20), &fs).unwrap();
+        graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
 
-        let nodes = adapter.scan_nodes_by_label(10).await.unwrap();
+        let nodes = graph.scan_by_label(10, &fs).unwrap();
         assert_eq!(nodes.len(), 2);
     }
 }
