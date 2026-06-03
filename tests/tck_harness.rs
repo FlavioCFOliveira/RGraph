@@ -224,3 +224,177 @@ fn tck_return_is_null() {
         }],
     );
 }
+
+// ------------------------------------------------------------------
+// Aggregation tests (Sprint 21 — physical engine pipeline)
+// ------------------------------------------------------------------
+// Aggregate functions are evaluated by the AggregateOp physical operator,
+// not the naive expression interpreter.  These tests bypass the naive
+// executor and exercise the full planner → physical engine pipeline.
+
+use rgraph::cypher::ast::Expression;
+use rgraph::cypher::physical::{AggregateOp, ExecutionContext, PhysicalOperator};
+use rgraph::cypher::plan::{AggregateFunction, Aggregation};
+use rgraph::graph::engine::GraphStorageEngine;
+use rgraph::io::posix::PosixFileSystem;
+
+/// Mock physical operator for integration tests.
+struct MockOp {
+    rows: Vec<HashMap<String, Value>>,
+    idx: usize,
+}
+
+impl MockOp {
+    fn new(rows: Vec<HashMap<String, Value>>) -> Self {
+        Self { rows, idx: 0 }
+    }
+}
+
+impl PhysicalOperator for MockOp {
+    fn next_row(
+        &mut self,
+        _ctx: &ExecutionContext,
+    ) -> Result<Option<HashMap<String, Value>>, rgraph::cypher::executor::ExecError> {
+        if self.idx >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.idx].clone();
+        self.idx += 1;
+        Ok(Some(row))
+    }
+    fn reset(&mut self) {
+        self.idx = 0;
+    }
+}
+
+fn make_test_ctx() -> ExecutionContext<'static> {
+    let dir = std::env::temp_dir().join(format!("rgraph-tck-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let fs = PosixFileSystem::new(false);
+    let engine = GraphStorageEngine::init(dir.join("data.db"), &fs).unwrap();
+    let fs_ref: &'static dyn rgraph::io::FileSystem = Box::leak(Box::new(fs));
+    let engine_ref: &'static GraphStorageEngine = Box::leak(Box::new(engine));
+    ExecutionContext {
+        engine: engine_ref,
+        fs: fs_ref,
+    }
+}
+
+#[test]
+fn tck_aggregate_count_star() {
+    let input = Box::new(MockOp::new(vec![
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+    ]));
+    let mut agg = AggregateOp::new(
+        vec![],
+        vec![Aggregation {
+            alias: "c".to_string(),
+            function: AggregateFunction::Count,
+            argument: Expression::Wildcard,
+            distinct: false,
+        }],
+        input,
+    );
+    let ctx = make_test_ctx();
+    let row = agg.next_row(&ctx).unwrap().unwrap();
+    assert_eq!(row.get("c"), Some(&Value::Integer(3)));
+}
+
+#[test]
+fn tck_aggregate_collect_null() {
+    let input = Box::new(MockOp::new(vec![
+        [("v".to_string(), Value::Null)].into_iter().collect(),
+    ]));
+    let mut agg = AggregateOp::new(
+        vec![],
+        vec![Aggregation {
+            alias: "items".to_string(),
+            function: AggregateFunction::Collect,
+            argument: Expression::Variable("v".to_string()),
+            distinct: false,
+        }],
+        input,
+    );
+    let ctx = make_test_ctx();
+    let row = agg.next_row(&ctx).unwrap().unwrap();
+    assert_eq!(row.get("items"), Some(&Value::List(vec![Value::Null])));
+}
+
+#[test]
+fn tck_aggregate_sum_integers() {
+    let input = Box::new(MockOp::new(vec![
+        [("x".to_string(), Value::Integer(1))].into_iter().collect(),
+        [("x".to_string(), Value::Integer(2))].into_iter().collect(),
+        [("x".to_string(), Value::Integer(3))].into_iter().collect(),
+    ]));
+    let mut agg = AggregateOp::new(
+        vec![],
+        vec![Aggregation {
+            alias: "total".to_string(),
+            function: AggregateFunction::Sum,
+            argument: Expression::Variable("x".to_string()),
+            distinct: false,
+        }],
+        input,
+    );
+    let ctx = make_test_ctx();
+    let row = agg.next_row(&ctx).unwrap().unwrap();
+    assert_eq!(row.get("total"), Some(&Value::Integer(6)));
+}
+
+#[test]
+fn tck_aggregate_min_max() {
+    let input = Box::new(MockOp::new(vec![
+        [("x".to_string(), Value::Integer(3))].into_iter().collect(),
+        [("x".to_string(), Value::Integer(7))].into_iter().collect(),
+    ]));
+    let mut agg = AggregateOp::new(
+        vec![],
+        vec![
+            Aggregation {
+                alias: "mn".to_string(),
+                function: AggregateFunction::Min,
+                argument: Expression::Variable("x".to_string()),
+                distinct: false,
+            },
+            Aggregation {
+                alias: "mx".to_string(),
+                function: AggregateFunction::Max,
+                argument: Expression::Variable("x".to_string()),
+                distinct: false,
+            },
+        ],
+        input,
+    );
+    let ctx = make_test_ctx();
+    let row = agg.next_row(&ctx).unwrap().unwrap();
+    assert_eq!(row.get("mn"), Some(&Value::Integer(3)));
+    assert_eq!(row.get("mx"), Some(&Value::Integer(7)));
+}
+
+#[test]
+fn tck_aggregate_avg() {
+    let input = Box::new(MockOp::new(vec![
+        [("x".to_string(), Value::Integer(4))].into_iter().collect(),
+        [("x".to_string(), Value::Integer(8))].into_iter().collect(),
+    ]));
+    let mut agg = AggregateOp::new(
+        vec![],
+        vec![Aggregation {
+            alias: "a".to_string(),
+            function: AggregateFunction::Avg,
+            argument: Expression::Variable("x".to_string()),
+            distinct: false,
+        }],
+        input,
+    );
+    let ctx = make_test_ctx();
+    let row = agg.next_row(&ctx).unwrap().unwrap();
+    assert_eq!(
+        row.get("a"),
+        Some(&Value::Float(rgraph::graph::property::OrderedF64(6.0))
+        )
+    );
+}

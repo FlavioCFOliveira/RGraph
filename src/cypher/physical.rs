@@ -646,7 +646,7 @@ fn compute_aggregate(
             if values.is_empty() {
                 return Ok(Value::Null);
             }
-            let mut sum = Value::Integer(0);
+            let mut sum = Value::Float(crate::graph::property::OrderedF64(0.0));
             for v in &values {
                 sum = sum.add(v).ok_or_else(|| ExecError::Eval(
                     "type mismatch in avg".to_string()
