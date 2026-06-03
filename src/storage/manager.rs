@@ -1,8 +1,8 @@
 use crate::buffer::pool::BufferPool;
 use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::bitmap::{BitmapPage, FreeListCache, PAGES_PER_BITMAP};
-use crate::storage::meta::{encode_superblock, Superblock};
-use crate::storage::page::{PageId, PAGE_SIZE};
+use crate::storage::meta::{Superblock, encode_superblock};
+use crate::storage::page::{PAGE_SIZE, PageId};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -85,8 +85,8 @@ impl PageManager {
 
         // Slot 0 bitmap lives at page FIRST_BITMAP_PAGE_ID.
         let mut bitmap = BitmapPage::new(FIRST_BITMAP_PAGE_ID, 0);
-        bitmap.allocate(PRIMARY_SB_PAGE_ID);  // superblock primary
-        bitmap.allocate(MIRROR_SB_PAGE_ID);   // superblock mirror
+        bitmap.allocate(PRIMARY_SB_PAGE_ID); // superblock primary
+        bitmap.allocate(MIRROR_SB_PAGE_ID); // superblock mirror
         bitmap.allocate(FIRST_BITMAP_PAGE_ID); // bitmap page itself
         bitmap.page.update_checksum();
 
@@ -163,6 +163,12 @@ impl PageManager {
         self.pool = Arc::downgrade(pool);
     }
 
+    /// Upgrade the weak buffer-pool reference, returning `Some(Arc<BufferPool>)`
+    /// if a pool is currently attached and alive, or `None` otherwise.
+    pub fn buffer_pool(&self) -> Option<Arc<BufferPool>> {
+        self.pool.upgrade()
+    }
+
     /// Allocate a new page id.
     ///
     /// Prioritises the free-list cache, then extends the bitmap chain if
@@ -173,8 +179,7 @@ impl PageManager {
             if bitmap_idx < self.bitmaps.len() {
                 self.bitmaps[bitmap_idx].allocate(pid);
             }
-            self.superblock.free_page_count =
-                self.superblock.free_page_count.saturating_sub(1);
+            self.superblock.free_page_count = self.superblock.free_page_count.saturating_sub(1);
             return pid;
         }
 
@@ -224,7 +229,12 @@ impl PageManager {
     /// a cache hit), its bytes are copied into `buf`, and the guard is dropped
     /// immediately.  When no pool is attached, the page is read directly from
     /// the file handle and its checksum is verified.
-    pub fn read_page(&self, fs: &dyn FileSystem, page_id: PageId, buf: &mut AlignedBuffer) -> io::Result<()> {
+    pub fn read_page(
+        &self,
+        fs: &dyn FileSystem,
+        page_id: PageId,
+        buf: &mut AlignedBuffer,
+    ) -> io::Result<()> {
         if let Some(pool) = self.pool.upgrade() {
             let guard = pool.fix_page(fs, page_id)?;
             buf.copy_from_slice(guard.buf());
@@ -251,7 +261,12 @@ impl PageManager {
     /// data is copied in, and the frame is marked dirty (the background flusher
     /// handles durability in batches — no per-write `fsync`).  When no pool is
     /// attached, the write goes directly to disk with a `sync_data()` call.
-    pub fn write_page(&self, fs: &dyn FileSystem, page_id: PageId, buf: &mut AlignedBuffer) -> io::Result<()> {
+    pub fn write_page(
+        &self,
+        fs: &dyn FileSystem,
+        page_id: PageId,
+        buf: &mut AlignedBuffer,
+    ) -> io::Result<()> {
         if let Some(pool) = self.pool.upgrade() {
             // Ensure the file is large enough for this page before the pool
             // tries to read it (fix_page reads on miss).
@@ -385,12 +400,11 @@ impl PageManager {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::posix::PosixFileSystem;
     use crate::io::fault::{FaultConfig, FaultInjectFileSystem, FaultKind, FaultRule, OpMask};
+    use crate::io::posix::PosixFileSystem;
 
     fn temp_fs() -> (tempfile::TempDir, PosixFileSystem, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -433,14 +447,20 @@ mod tests {
         pm.sync_bitmap(&fs).unwrap();
 
         let pid = pm.allocate_page();
-        let mut page = crate::storage::page::SlottedPage::init(pid, crate::storage::page::PageType::SlottedData);
+        let mut page = crate::storage::page::SlottedPage::init(
+            pid,
+            crate::storage::page::PageType::SlottedData,
+        );
         page.buf[crate::storage::page::SlottedPage::HEADER_SIZE] = 0xAB;
         page.update_checksum();
         pm.write_page(&fs, pid, &mut page.buf).unwrap();
 
         let mut read_buf = AlignedBuffer::zeroed(PAGE_SIZE);
         pm.read_page(&fs, pid, &mut read_buf).unwrap();
-        assert_eq!(read_buf[crate::storage::page::SlottedPage::HEADER_SIZE], 0xAB);
+        assert_eq!(
+            read_buf[crate::storage::page::SlottedPage::HEADER_SIZE],
+            0xAB
+        );
     }
 
     #[test]
@@ -464,7 +484,10 @@ mod tests {
 
         let mut read_buf = AlignedBuffer::zeroed(PAGE_SIZE);
         let result = pm.read_page(&fs, pid, &mut read_buf);
-        assert!(result.is_err(), "corrupted page should fail checksum verification");
+        assert!(
+            result.is_err(),
+            "corrupted page should fail checksum verification"
+        );
     }
 
     #[test]
@@ -480,7 +503,10 @@ mod tests {
         // Configure every sync_all to fail.
         fs.set_config(FaultConfig {
             rules: vec![FaultRule {
-                op_mask: OpMask { sync_all: true, ..OpMask::default() },
+                op_mask: OpMask {
+                    sync_all: true,
+                    ..OpMask::default()
+                },
                 kind: FaultKind::Eio,
                 every_n: None,
             }],
@@ -489,7 +515,10 @@ mod tests {
         let pid = pm.allocate_page();
         let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
         let result = pm.write_page(&fs, pid, &mut buf);
-        assert!(result.is_err(), "write_page must call sync_all after set_len when growing");
+        assert!(
+            result.is_err(),
+            "write_page must call sync_all after set_len when growing"
+        );
     }
 
     #[test]
@@ -537,10 +566,18 @@ mod tests {
         handle.read_at(&mut sb_buf, 0).unwrap();
         let sb = decode_superblock(&sb_buf).unwrap();
         let mut bitmap_buf = AlignedBuffer::zeroed(PAGE_SIZE);
-        handle.read_at(&mut bitmap_buf, FIRST_BITMAP_PAGE_ID as u64 * PAGE_SIZE as u64).unwrap();
+        handle
+            .read_at(
+                &mut bitmap_buf,
+                FIRST_BITMAP_PAGE_ID as u64 * PAGE_SIZE as u64,
+            )
+            .unwrap();
         drop(handle);
 
         let pm = PageManager::open_multi(path, sb, vec![bitmap_buf], &fs).unwrap();
-        assert!(pm.bitmaps[0].is_set(allocated_pid), "previously allocated page must be set in restored bitmap");
+        assert!(
+            pm.bitmaps[0].is_set(allocated_pid),
+            "previously allocated page must be set in restored bitmap"
+        );
     }
 }

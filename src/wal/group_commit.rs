@@ -1,4 +1,4 @@
-//! Group-commit queue with fsync coalescing (Task 105).
+//! Group-commit queue with fsync coalescing (Tasks 105, 153).
 //!
 //! Multiple concurrent writers submit their [`WalRecord`]s through a bounded
 //! channel.  The first thread that wins the leader [`Mutex`] collects all
@@ -12,6 +12,19 @@
 //! of concurrent committers, while maintaining the strict durability guarantee
 //! that no commit is acknowledged before the group fsync completes.
 //!
+//! # Liveness guarantee (Task 153 bugfix)
+//!
+//! An orphaned follower can arise when a thread enqueues its slot **after** the
+//! leader has closed its collection window but **before** the leader releases
+//! the `leader_lock`.  In that case the follower's slot sits in the channel
+//! unprocessed, and `result_rx.recv()` would block forever.
+//!
+//! The fix: followers wait on their `result_rx` with a bounded timeout equal
+//! to `2 × BATCH_TIMEOUT`.  If the timeout fires they re-attempt to acquire
+//! `leader_lock`; if successful they become the new leader and process the
+//! remaining slots (including their own).  This loop repeats until the slot is
+//! processed, guaranteeing liveness without busy-polling.
+//!
 //! # Backpressure
 //!
 //! The submission channel is bounded at [`GroupCommitQueue::CHANNEL_CAPACITY`]
@@ -21,7 +34,7 @@
 use crate::io::FileSystem;
 use crate::wal::record::WalRecord;
 use crate::wal::writer::WalWriter;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -73,6 +86,12 @@ impl GroupCommitQueue {
     /// Blocks until the group leader has fsynced.  Returns the LSN of the
     /// last record in this submission.
     ///
+    /// # Liveness
+    ///
+    /// To prevent orphaned followers (see module-level comment), the wait loop
+    /// uses a bounded timeout and re-attempts leader election if the timeout
+    /// fires before a result arrives.
+    ///
     /// # Errors
     ///
     /// Returns an [`io::Error`] if the underlying WAL write or fsync fails.
@@ -86,19 +105,40 @@ impl GroupCommitQueue {
         let slot = CommitSlot { records, result_tx };
 
         // Enqueue.  This blocks if the channel is full (backpressure).
-        self.tx
-            .send(slot)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "group commit channel closed"))?;
+        self.tx.send(slot).map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "group commit channel closed")
+        })?;
 
-        // Race for leader.
-        if let Ok(_guard) = self.leader_lock.try_lock() {
-            // We are the leader: drain the channel and flush.
-            self.run_leader_with(wal, fs);
+        // Liveness loop: attempt to become leader; if we lose the race,
+        // wait for our result with a timeout.  If the timeout fires without
+        // a result, we re-attempt — this handles the orphaned-follower case
+        // described in the module comment.
+        let wait_timeout = Self::BATCH_TIMEOUT * 2;
+        loop {
+            // Attempt to become leader.
+            if let Ok(_guard) = self.leader_lock.try_lock() {
+                // We are the leader: drain the channel and flush.
+                self.run_leader_with(wal, fs);
+                // After the leader run, our result must be in result_rx.
+                // Fall through to the blocking recv below.
+            }
+
+            // Wait for our result (either from our own leader run, or from
+            // another leader that picked up our slot).
+            match result_rx.recv_timeout(wait_timeout) {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Possible orphaned follower: loop and retry leader election.
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "group commit result channel closed",
+                    ));
+                }
+            }
         }
-        // Whether we were the leader or a follower, wait for our result.
-        result_rx
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "group commit result channel closed"))?
     }
 
     /// Leader implementation: collect all pending slots up to [`BATCH_SIZE`]
@@ -257,5 +297,61 @@ mod tests {
         // With no records the leader collects the slot, drains it (empty),
         // flushes (no-op) and returns lsn 0.
         assert!(result.is_ok());
+    }
+
+    // ── Task 153: coalescing and liveness ─────────────────────────────────────
+
+    #[test]
+    fn concurrent_commits_coalesce_into_fewer_fsyncs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(PosixFileSystem::new(false));
+        let wal = Arc::new(Mutex::new(
+            WalWriter::open(dir.path().join("wal"), fs.as_ref()).unwrap(),
+        ));
+        let queue = GroupCommitQueue::new();
+
+        // Launch 16 concurrent commits.
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let q = queue.clone();
+                let w = Arc::clone(&wal);
+                let f = Arc::clone(&fs);
+                let counter = Arc::clone(&success_count);
+                thread::spawn(move || {
+                    if q.submit(vec![make_record(i)], &w, f.as_ref()).is_ok() {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            success_count.load(Ordering::Relaxed),
+            16,
+            "all 16 concurrent commits must succeed (liveness guarantee)"
+        );
+
+        // Verify the WAL file has all 16 records (coalescing doesn't lose records).
+        let wal_path = dir.path().join("wal").join("wal-000000000");
+        let raw = std::fs::read(&wal_path).unwrap();
+        let mut count = 0usize;
+        let mut offset = 0;
+        while offset < raw.len() {
+            if let Some((_, size)) = WalRecord::decode(&raw, offset) {
+                count += 1;
+                offset += size;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(count, 16, "all 16 records must be durable in the WAL");
     }
 }

@@ -1,4 +1,16 @@
-//! Append-only WAL writer with LSN tracking and segment rotation (Task 110).
+//! Append-only WAL writer with LSN tracking and segment rotation (Tasks 110, 150).
+//!
+//! # LSN Encoding (Task 150)
+//!
+//! LSNs are 64-bit values packed as `(segment_id << 32) | intra_segment_offset`.
+//! This decouples the logical log sequence number from the physical byte offset
+//! within a single file, enabling multi-segment recovery without ambiguity.
+//!
+//! - `segment_id`: upper 32 bits — monotonically increasing segment number.
+//! - `intra_segment_offset`: lower 32 bits — byte offset within that segment.
+//!
+//! Helper functions [`lsn_segment_id`] and [`lsn_offset`] unpack the two fields.
+//! [`make_lsn`] assembles them.
 //!
 //! # Segment rotation
 //!
@@ -23,10 +35,34 @@ use crate::io::{AlignedBuffer, FileSystem};
 use crate::wal::record::{RecordType, WalRecord};
 use std::hash::Hasher as _;
 use std::io;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use twox_hash::XxHash64;
+
+// ── LSN helpers (Task 150) ────────────────────────────────────────────────────
+
+/// Pack a `(segment_id, intra_segment_offset)` pair into a 64-bit LSN.
+///
+/// Layout: `segment_id` occupies the upper 32 bits; `offset` occupies the
+/// lower 32 bits.  This supports up to 4 294 967 296 segments each up to
+/// 4 GiB, which is more than sufficient for production use.
+#[inline(always)]
+pub fn make_lsn(segment_id: u32, offset: u32) -> u64 {
+    ((segment_id as u64) << 32) | (offset as u64)
+}
+
+/// Extract the segment-id component from an LSN.
+#[inline(always)]
+pub fn lsn_segment_id(lsn: u64) -> u32 {
+    (lsn >> 32) as u32
+}
+
+/// Extract the intra-segment byte offset from an LSN.
+#[inline(always)]
+pub fn lsn_offset(lsn: u64) -> u32 {
+    lsn as u32
+}
 
 /// Descriptor block written at the end of every sealed WAL segment.
 ///
@@ -100,10 +136,14 @@ impl SegmentDescriptor {
 ///
 /// Call [`WalWriter::needs_rotation`] after each flush and
 /// [`WalWriter::rotate`] when it returns `true`.
+///
+/// Call [`WalWriter::needs_checkpoint`] after flushes and trigger a fuzzy
+/// checkpoint via [`crate::wal::checkpoint::Checkpoint::run`] when it returns
+/// `true` (Task 151).
 pub struct WalWriter {
     /// Directory that holds WAL segment files.
     pub wal_dir: PathBuf,
-    /// Current LSN (byte offset from start of WAL).
+    /// Current LSN `(segment_id << 32) | intra_segment_offset`.
     pub current_lsn: u64,
     /// Path of the current segment file.
     pub segment_path: PathBuf,
@@ -115,7 +155,7 @@ pub struct WalWriter {
     unsynced: usize,
     /// Monotonically increasing segment counter (0-based).
     segment_id: u64,
-    /// LSN at which the current segment began.
+    /// LSN at the start of the current segment.
     segment_start_lsn: u64,
     /// Number of WAL records written to the current segment.
     segment_record_count: u64,
@@ -129,6 +169,9 @@ pub struct WalWriter {
     /// written after their WAL record is on durable storage
     /// (WAL-before-data ordering).
     durable_lsn: Arc<AtomicU64>,
+    /// Number of bytes written since the last checkpoint.
+    /// When this exceeds [`CHECKPOINT_INTERVAL`], [`needs_checkpoint`] returns `true`.
+    bytes_since_checkpoint: u64,
 }
 
 impl std::fmt::Debug for WalWriter {
@@ -145,6 +188,7 @@ impl std::fmt::Debug for WalWriter {
             .field("segment_record_count", &self.segment_record_count)
             .field("total_segment_count", &self.total_segment_count)
             .field("durable_lsn", &self.durable_lsn.load(Ordering::Relaxed))
+            .field("bytes_since_checkpoint", &self.bytes_since_checkpoint)
             .finish()
     }
 }
@@ -158,20 +202,47 @@ impl WalWriter {
     pub const ARCHIVE_DIR: &'static str = "wal-archive";
     /// Number of post-checkpoint segments retained in the live directory.
     pub const LIVE_SEGMENT_RETENTION: usize = 2;
+    /// Fuzzy checkpoint interval: trigger a checkpoint every 8 MiB of WAL written
+    /// (Task 151).  This bounds the amount of WAL that ARIES must replay on recovery.
+    pub const CHECKPOINT_INTERVAL: u64 = 8 * 1024 * 1024;
 
     /// Open (or create) the WAL in `wal_dir`.
+    ///
+    /// On open we enumerate all existing segment files (`wal-NNNNNNNNN`) to
+    /// find the highest segment id, then continue writing from there.  This
+    /// ensures that after a restart the writer picks up exactly where it left
+    /// off — including after a rotation — rather than blindly reopening
+    /// segment 0 and potentially overwriting committed records.
+    ///
+    /// LSNs use the `(segment_id << 32) | intra_segment_offset` encoding
+    /// introduced in Task 150.
     pub fn open(wal_dir: PathBuf, fs: &dyn FileSystem) -> io::Result<Self> {
         fs.create_dir_all(&wal_dir)?;
-        let segment_path = wal_dir.join("wal-000000000");
-        let (current_lsn, segment_id, segment_handle) = if fs.exists(&segment_path) {
+
+        // Enumerate live segment files to find the highest segment id.
+        let max_segment_id = Self::find_highest_segment_id(&wal_dir);
+
+        let segment_id = max_segment_id;
+        let segment_path = wal_dir.join(format!("wal-{:09}", segment_id));
+
+        let (intra_offset, segment_handle) = if fs.exists(&segment_path) {
             let handle = fs.open(&segment_path, false)?;
-            let len = handle.len()?;
-            (len, 0u64, Some(handle))
+            let len = handle.len()? as u32;
+            // Ensure a non-zero offset so LSN 0 remains the "null/initial" sentinel.
+            let offset = if segment_id == 0 { len.max(1) } else { len };
+            (offset, Some(handle))
         } else {
             let handle = fs.open(&segment_path, true)?;
             handle.sync_data()?;
-            (1, 0u64, Some(handle))
+            // For segment 0, start at offset 1 so LSN 0 stays as the null sentinel.
+            let offset: u32 = if segment_id == 0 { 1 } else { 0 };
+            (offset, Some(handle))
         };
+
+        let current_lsn = make_lsn(segment_id as u32, intra_offset);
+        // segment_start_lsn is the LSN at the beginning of the current segment.
+        let segment_start_lsn = make_lsn(segment_id as u32, 0);
+
         // Initialise durable_lsn to current_lsn so that records already on
         // disk (from a previous open) are not considered unflushable.
         let durable_lsn = Arc::new(AtomicU64::new(current_lsn));
@@ -182,13 +253,35 @@ impl WalWriter {
             buffer: AlignedBuffer::zeroed(Self::BUFFER_SIZE),
             buffered: 0,
             unsynced: 0,
-            segment_id,
-            segment_start_lsn: 0,
+            segment_id: segment_id as u64,
+            segment_start_lsn,
             segment_record_count: 0,
-            total_segment_count: 1,
+            total_segment_count: max_segment_id as u64 + 1,
             segment_handle,
             durable_lsn,
+            bytes_since_checkpoint: 0,
         })
+    }
+
+    /// Scan `wal_dir` for segment files matching `wal-NNNNNNNNN` and return
+    /// the highest segment id found.  Returns 0 if no segments exist yet.
+    fn find_highest_segment_id(wal_dir: &Path) -> u64 {
+        // We probe for segment files by checking for their existence.
+        // This is O(segments) but segments are bounded in practice.
+        let mut max_id = 0u64;
+        // Probe up to a reasonable upper bound; bail on the first gap.
+        // The production limit is 2^32-1 segments but we never expect
+        // to have millions in the live directory.
+        for id in 0u64..=u32::MAX as u64 {
+            let candidate = wal_dir.join(format!("wal-{:09}", id));
+            if candidate.exists() {
+                max_id = id;
+            } else if id > max_id {
+                // First gap after the last found segment — stop.
+                break;
+            }
+        }
+        max_id
     }
 
     /// Return a shared handle to the durable LSN watermark.
@@ -201,6 +294,10 @@ impl WalWriter {
     }
 
     /// Append a record and return its LSN.
+    ///
+    /// The LSN is encoded as `(segment_id << 32) | intra_segment_offset` per
+    /// the Task 150 scheme.  Each append advances only the lower 32 bits
+    /// (the intra-segment offset) until a rotation occurs.
     pub fn append(&mut self, _fs: &dyn FileSystem, mut record: WalRecord) -> io::Result<u64> {
         record.set_lsn(self.current_lsn);
         let bytes = record.encode();
@@ -216,9 +313,32 @@ impl WalWriter {
         self.buffer[self.buffered..self.buffered + bytes.len()].copy_from_slice(&bytes);
         self.buffered += bytes.len();
         self.unsynced += bytes.len();
-        self.current_lsn += bytes.len() as u64;
+        // Advance only the intra-segment offset (lower 32 bits); segment_id stays constant.
+        let seg_id = lsn_segment_id(self.current_lsn);
+        let new_offset = lsn_offset(self.current_lsn) + bytes.len() as u32;
+        self.current_lsn = make_lsn(seg_id, new_offset);
         self.segment_record_count += 1;
+        self.bytes_since_checkpoint += bytes.len() as u64;
         Ok(record.lsn)
+    }
+
+    /// Returns `true` when the bytes written since the last checkpoint exceed
+    /// [`CHECKPOINT_INTERVAL`].
+    ///
+    /// Call this after every `flush` or `sync`.  When it returns `true`, invoke
+    /// [`crate::wal::checkpoint::Checkpoint::run`] and then call
+    /// [`reset_checkpoint_counter`] to restart the interval measurement.
+    pub fn needs_checkpoint(&self) -> bool {
+        self.bytes_since_checkpoint >= Self::CHECKPOINT_INTERVAL
+    }
+
+    /// Reset the checkpoint byte counter after a checkpoint has been taken.
+    ///
+    /// Also updates the internal `last_checkpoint_lsn` reference (stored in
+    /// the superblock by the caller) so that recovery knows the new starting
+    /// point.
+    pub fn reset_checkpoint_counter(&mut self) {
+        self.bytes_since_checkpoint = 0;
     }
 
     /// Flush buffered data to disk and sync.
@@ -231,13 +351,15 @@ impl WalWriter {
             return Ok(());
         }
         let handle = self.segment_handle.as_ref().expect("segment file not open");
-        let offset = handle.len()?;
-        handle.write_at(&self.buffer[..self.buffered], offset)?;
+        // Always append at the physical end of the segment file.
+        let file_offset = handle.len()?;
+        handle.write_at(&self.buffer[..self.buffered], file_offset)?;
         handle.sync_data()?;
         self.buffered = 0;
         self.unsynced = 0;
         // Advance the durable watermark now that these bytes are on disk.
-        self.durable_lsn.fetch_max(self.current_lsn, Ordering::Release);
+        self.durable_lsn
+            .fetch_max(self.current_lsn, Ordering::Release);
         Ok(())
     }
 
@@ -251,9 +373,13 @@ impl WalWriter {
     /// Returns `true` if the current segment has reached [`SEGMENT_SIZE`] and
     /// should be rotated before appending more records.
     pub fn needs_rotation(&self) -> bool {
-        // Account for data already in the write buffer.
-        let on_disk_approx = self.current_lsn - self.segment_start_lsn;
-        on_disk_approx >= Self::SEGMENT_SIZE
+        // With the (segment_id << 32) | offset encoding, the intra-segment
+        // offset is the lower 32 bits of both current_lsn and segment_start_lsn.
+        // They share the same segment_id component, so the subtraction is safe.
+        let current_offset = lsn_offset(self.current_lsn) as u64;
+        let start_offset = lsn_offset(self.segment_start_lsn) as u64;
+        let bytes_in_segment = current_offset.saturating_sub(start_offset);
+        bytes_in_segment >= Self::SEGMENT_SIZE
     }
 
     /// Seal the current segment and open the next one.
@@ -290,13 +416,7 @@ impl WalWriter {
 
         // Write a SegmentDescriptor WAL record (informational; not used for
         // recovery but visible in WAL scans).
-        let desc_rec = WalRecord::new(
-            RecordType::SegmentDescriptor,
-            0,
-            0,
-            0,
-            desc_block.to_vec(),
-        );
+        let desc_rec = WalRecord::new(RecordType::SegmentDescriptor, 0, 0, 0, desc_block.to_vec());
         // Encode and append directly to the segment file (bypass buffer since
         // we just flushed and may be about to switch).
         let desc_bytes = desc_rec.encode();
@@ -306,13 +426,16 @@ impl WalWriter {
             handle.write_at(&desc_bytes, offset)?;
             handle.sync_data()?;
         }
-        self.current_lsn += desc_bytes.len() as u64;
+        // Advance the intra-segment offset for the descriptor record.
+        {
+            let seg_id = lsn_segment_id(self.current_lsn);
+            let new_offset = lsn_offset(self.current_lsn) + desc_bytes.len() as u32;
+            self.current_lsn = make_lsn(seg_id, new_offset);
+        }
 
         // 4. Open next segment.
         let next_segment_id = self.segment_id + 1;
-        let next_path = self
-            .wal_dir
-            .join(format!("wal-{:09}", next_segment_id));
+        let next_path = self.wal_dir.join(format!("wal-{:09}", next_segment_id));
         {
             let handle = fs.open(&next_path, true)?;
             handle.sync_data()?;
@@ -323,10 +446,13 @@ impl WalWriter {
         self.segment_path = next_path;
         self.update_symlink(fs)?;
 
-        // 6. Archive old segments.
+        // 6. Update segment tracking.  The new segment's LSN starts at offset 0
+        //    in the next segment_id bucket.
         let prev_segment_id = self.segment_id;
         self.segment_id = next_segment_id;
-        self.segment_start_lsn = self.current_lsn;
+        // New segment starts at (next_segment_id << 32) | 0.
+        self.segment_start_lsn = make_lsn(next_segment_id as u32, 0);
+        self.current_lsn = self.segment_start_lsn;
         self.segment_record_count = 0;
         self.total_segment_count += 1;
 
@@ -450,7 +576,10 @@ mod tests {
         let fs = PosixFileSystem::new(false);
         let writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
         assert_eq!(writer.buffer.len(), WalWriter::BUFFER_SIZE);
-        assert_eq!(writer.buffer.as_ptr() as usize % AlignedBuffer::ALIGNMENT, 0);
+        assert_eq!(
+            writer.buffer.as_ptr() as usize % AlignedBuffer::ALIGNMENT,
+            0
+        );
     }
 
     #[test]
@@ -458,7 +587,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = PosixFileSystem::new(false);
         let writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
-        assert!(writer.segment_handle.is_some(), "segment_handle must be set after open");
+        assert!(
+            writer.segment_handle.is_some(),
+            "segment_handle must be set after open"
+        );
     }
 
     #[test]
@@ -471,7 +603,10 @@ mod tests {
         writer.append(&fs, rec).unwrap();
         writer.flush(&fs).unwrap();
 
-        assert!(writer.segment_handle.is_some(), "segment_handle must remain set after flush");
+        assert!(
+            writer.segment_handle.is_some(),
+            "segment_handle must remain set after flush"
+        );
     }
 
     // ── Segment descriptor tests ───────────────────────────────────────────────
@@ -553,7 +688,10 @@ mod tests {
             }
             pos += 1;
         }
-        assert!(found, "SegmentDescriptor must be present in the sealed segment");
+        assert!(
+            found,
+            "SegmentDescriptor must be present in the sealed segment"
+        );
     }
 
     #[test]
@@ -587,6 +725,72 @@ mod tests {
             archive_dir.join("wal-000000000").exists()
                 || !dir.path().join("wal-000000000").exists(),
             "segment 0 must be archived or removed from live dir"
+        );
+    }
+
+    // ── LSN encoding tests (Task 150) ─────────────────────────────────────────
+
+    #[test]
+    fn lsn_encoding_roundtrip() {
+        let seg_id = 7u32;
+        let offset = 0x0001_2345u32;
+        let lsn = make_lsn(seg_id, offset);
+        assert_eq!(lsn_segment_id(lsn), seg_id);
+        assert_eq!(lsn_offset(lsn), offset);
+    }
+
+    #[test]
+    fn open_resumes_from_highest_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+
+        // Create segments 0 and 1, each with one record.
+        {
+            let mut writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
+            writer
+                .append(&fs, WalRecord::new(RecordType::Begin, 1, 0, 0, vec![]))
+                .unwrap();
+            writer.rotate(&fs).unwrap();
+            writer
+                .append(&fs, WalRecord::new(RecordType::Commit, 1, 0, 0, vec![]))
+                .unwrap();
+            writer.sync(&fs).unwrap();
+            // Now current segment is 1 (after rotation).
+            assert_eq!(writer.segment_id, 1);
+        }
+
+        // Reopen: should find segment 1 and continue from there.
+        let writer2 = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
+        assert_eq!(
+            writer2.segment_id, 1,
+            "reopened writer must resume on highest segment"
+        );
+        // LSN must encode segment_id=1.
+        assert_eq!(lsn_segment_id(writer2.current_lsn), 1);
+    }
+
+    #[test]
+    fn needs_checkpoint_after_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let mut writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
+
+        assert!(
+            !writer.needs_checkpoint(),
+            "fresh writer should not need checkpoint"
+        );
+
+        // Simulate writing CHECKPOINT_INTERVAL bytes.
+        writer.bytes_since_checkpoint = WalWriter::CHECKPOINT_INTERVAL;
+        assert!(
+            writer.needs_checkpoint(),
+            "should need checkpoint after threshold"
+        );
+
+        writer.reset_checkpoint_counter();
+        assert!(
+            !writer.needs_checkpoint(),
+            "counter reset; no checkpoint needed"
         );
     }
 }

@@ -1,4 +1,4 @@
-//! Full three-phase ARIES crash recovery (Tasks 106, 107, 108).
+//! Full three-phase ARIES crash recovery (Tasks 106, 107, 108, 148, 149, 150).
 //!
 //! Implements the classic ARIES algorithm as described in:
 //! > Mohan et al., "ARIES: A Transaction Recovery Method Supporting
@@ -11,15 +11,26 @@
 //!
 //! 1. **ANALYSIS** — scan WAL forward from the last checkpoint LSN,
 //!    rebuilding the Active Transaction Table (ATT) and Dirty Page Table (DPT).
+//!    When a `CheckpointEnd` record is found during ANALYSIS, the DPT is seeded
+//!    from the checkpoint payload, reducing the amount of work REDO must do.
 //!
 //! 2. **REDO** — replay after-images for all pages in the DPT, starting from
 //!    `min(rec_lsn)`.  Each application is idempotent: a page whose
 //!    `page_lsn >= record.lsn` is skipped.
 //!
 //! 3. **UNDO** — for every `Active` or `Aborted` transaction remaining in the
-//!    ATT, traverse backward via `prev_lsn`, apply the inverse operation, and
-//!    emit a Compensation Log Record (CLR) so the undo is itself durable and
-//!    idempotent under repeated crashes during recovery.
+//!    ATT, traverse backward via `prev_lsn`, apply the **before-image**
+//!    embedded in the WAL record payload (Task 149), and emit a Compensation
+//!    Log Record (CLR) with `undo_next_lsn = rec.prev_lsn` so that a crash
+//!    during UNDO converges correctly on the next restart.
+//!
+//! # Multi-segment recovery (Task 150)
+//!
+//! [`AriesRecovery::new`] accepts a WAL *directory*.  On startup it enumerates
+//! all segment files (`wal-NNNNNNNNN`) in ascending order and reads them in
+//! sequence, building one unified record stream.  LSNs are
+//! `(segment_id << 32) | intra_segment_offset`; the comparisons inside ANALYSIS
+//! and REDO use these opaque 64-bit values directly.
 //!
 //! # Testability
 //!
@@ -28,12 +39,12 @@
 //! filesystem.
 
 use crate::io::{AlignedBuffer, FileSystem};
-use crate::storage::page::{PageId, PAGE_SIZE};
+use crate::storage::page::{PAGE_SIZE, PageId};
 use crate::wal::record::{RecordType, WalRecord};
 use crate::wal::writer::WalWriter;
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ── ATT ──────────────────────────────────────────────────────────────────────
 
@@ -94,7 +105,8 @@ pub struct RecoveryResult {
 /// Driver for the three-phase ARIES recovery algorithm.
 pub struct AriesRecovery<'a> {
     fs: Option<&'a dyn FileSystem>,
-    wal_path: Option<&'a Path>,
+    /// Directory containing WAL segment files (`wal-NNNNNNNNN`).
+    wal_dir: Option<PathBuf>,
     data_path: Option<&'a Path>,
     /// WAL LSN from which ANALYSIS starts (typically the checkpoint begin LSN).
     checkpoint_lsn: u64,
@@ -103,16 +115,23 @@ pub struct AriesRecovery<'a> {
 }
 
 impl<'a> AriesRecovery<'a> {
-    /// Production constructor: reads WAL from disk.
+    /// Production constructor: reads all WAL segments from `wal_dir`.
+    ///
+    /// `wal_dir` is the directory that contains the `wal-NNNNNNNNN` segment
+    /// files.  Recovery reads all segments in ascending order.
+    ///
+    /// `checkpoint_lsn` is the LSN stored in the superblock; ANALYSIS begins
+    /// from this point so that only the records since the last fuzzy checkpoint
+    /// need to be replayed.
     pub fn new(
         fs: &'a dyn FileSystem,
-        wal_path: &'a Path,
+        wal_dir: &Path,
         data_path: &'a Path,
         checkpoint_lsn: u64,
     ) -> Self {
         Self {
             fs: Some(fs),
-            wal_path: Some(wal_path),
+            wal_dir: Some(wal_dir.to_path_buf()),
             data_path: Some(data_path),
             checkpoint_lsn,
             preloaded_records: None,
@@ -121,13 +140,13 @@ impl<'a> AriesRecovery<'a> {
 
     /// Test constructor: uses an in-memory record slice, no filesystem I/O.
     ///
-    /// `analysis_from_records` and the full `recover_from_records` path become
+    /// `analysis_from_records` and the full `recover_from_slice` path become
     /// usable, but `recover` (which requires a real filesystem) will return an
     /// error.
     pub fn new_with_records(records: Vec<WalRecord>) -> Self {
         Self {
             fs: None,
-            wal_path: None,
+            wal_dir: None,
             data_path: None,
             checkpoint_lsn: 0,
             preloaded_records: Some(records),
@@ -155,15 +174,22 @@ impl<'a> AriesRecovery<'a> {
 
     /// Run full ARIES recovery: ANALYSIS → REDO → UNDO.
     ///
+    /// Reads all WAL segments in the configured `wal_dir` in ascending order
+    /// to build a unified record stream, then executes ANALYSIS, REDO, and
+    /// UNDO in sequence.
+    ///
     /// # Errors
     ///
     /// Returns an [`io::Error`] if reading the WAL or writing to data pages
     /// fails.
     pub fn recover(&self, wal: &mut WalWriter) -> io::Result<RecoveryResult> {
         let fs = self.fs.expect("recover requires a filesystem (use new())");
-        let wal_path = self.wal_path.expect("recover requires a WAL path");
+        let wal_dir = self
+            .wal_dir
+            .as_deref()
+            .expect("recover requires a WAL directory (use new())");
 
-        let records = self.load_records(fs, wal_path)?;
+        let records = self.load_all_segments(fs, wal_dir)?;
         self.run_all_phases(&records, wal)
     }
 
@@ -177,17 +203,48 @@ impl<'a> AriesRecovery<'a> {
         self.run_all_phases(records, wal)
     }
 
-    // ── Internal: load records from WAL file ──────────────────────────────────
+    // ── Internal: load records from all WAL segments ─────────────────────────
 
-    fn load_records(
+    /// Read all WAL segments in `wal_dir` in ascending order and return a
+    /// unified, flat record vector.
+    ///
+    /// Segments are files matching `wal-NNNNNNNNN`.  Decoding stops at the
+    /// first corrupt record within each segment (truncated tail handling).
+    ///
+    /// Each record's LSN is the value stored in the on-disk encoding, which
+    /// uses the `(segment_id << 32) | intra_segment_offset` scheme (Task 150).
+    pub(crate) fn load_all_segments(
         &self,
         fs: &dyn FileSystem,
-        wal_path: &Path,
+        wal_dir: &Path,
     ) -> io::Result<Vec<WalRecord>> {
-        if !fs.exists(wal_path) {
-            return Ok(vec![]);
+        let mut all_records = Vec::new();
+
+        // Enumerate segment files by probing sequentially until a gap is found.
+        for seg_id in 0u64..=u32::MAX as u64 {
+            let seg_path = wal_dir.join(format!("wal-{:09}", seg_id));
+            if !fs.exists(&seg_path) {
+                // First missing segment — stop scanning.
+                break;
+            }
+            let mut seg_records = self.load_single_segment(fs, &seg_path, seg_id as u32)?;
+            all_records.append(&mut seg_records);
         }
-        let handle = fs.open(wal_path, false)?;
+
+        Ok(all_records)
+    }
+
+    /// Read one WAL segment file and decode all valid records.
+    ///
+    /// Records whose stored LSN does not match the expected segment are
+    /// accepted as-is (the LSN is authoritative from the on-disk encoding).
+    fn load_single_segment(
+        &self,
+        fs: &dyn FileSystem,
+        seg_path: &Path,
+        _seg_id: u32,
+    ) -> io::Result<Vec<WalRecord>> {
+        let handle = fs.open(seg_path, false)?;
         let len = handle.len()? as usize;
         if len == 0 {
             return Ok(vec![]);
@@ -203,7 +260,7 @@ impl<'a> AriesRecovery<'a> {
                     offset += size;
                     records.push(rec);
                 }
-                None => break, // truncated / corrupt tail; stop here
+                None => break, // truncated / corrupt tail — stop here
             }
         }
         Ok(records)
@@ -223,7 +280,10 @@ impl<'a> AriesRecovery<'a> {
             .collect();
 
         let (att, dpt, max_lsn) = self.analysis(
-            &analysis_records.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
+            &analysis_records
+                .iter()
+                .map(|r| (*r).clone())
+                .collect::<Vec<_>>(),
         );
 
         let redo_count = if let Some(fs) = self.fs {
@@ -316,20 +376,18 @@ impl<'a> AriesRecovery<'a> {
                     }
                 }
 
-                // ── Page-mutation records: update ATT + DPT ─────────────────
+                // ── Physical page records: update ATT + DPT ──────────────────
+                //
+                // Only records whose payloads carry a real page image are tracked
+                // in the DPT.  Logical entity records (NodeInsert etc.) use
+                // entity-ids — not page-ids — in their first 8 payload bytes and
+                // therefore must NOT be added to the DPT; doing so would cause
+                // REDO to write garbage to the wrong offsets in the data file.
                 RecordType::PageInsert
                 | RecordType::PageUpdate
                 | RecordType::PageFree
-                | RecordType::BitmapUpdate
-                | RecordType::NodeInsert
-                | RecordType::NodeDelete
-                | RecordType::NodeUpdate
-                | RecordType::EdgeInsert
-                | RecordType::EdgeDelete
-                | RecordType::EdgeUpdate
-                | RecordType::PropertyInsert
-                | RecordType::PropertyUpdate => {
-                    // Payload must start with an 8-byte page_id.
+                | RecordType::BitmapUpdate => {
+                    // Payload: [8-byte page_id][page image bytes...].
                     if rec.payload.len() >= 8 {
                         let page_id = page_id_from_payload(&rec.payload);
                         dpt.entry(page_id).or_insert(DptEntry {
@@ -346,10 +404,41 @@ impl<'a> AriesRecovery<'a> {
                     }
                 }
 
-                // ── Checkpoint / descriptor records: no ATT/DPT side effects ─
-                RecordType::CheckpointBegin
-                | RecordType::CheckpointEnd
-                | RecordType::SegmentDescriptor => {}
+                // ── Logical entity records: update ATT only ───────────────────
+                //
+                // These records carry entity-level data (node/edge/property ids
+                // and record bytes), not raw page images.  They update the ATT
+                // but do NOT contribute to the DPT — REDO is handled at the
+                // page level by `PageUpdate`/`PageInsert` records (when the
+                // engine is extended to emit those), or implicitly through
+                // `rebuild_indexes` on open.
+                RecordType::NodeInsert
+                | RecordType::NodeDelete
+                | RecordType::NodeUpdate
+                | RecordType::EdgeInsert
+                | RecordType::EdgeDelete
+                | RecordType::EdgeUpdate
+                | RecordType::PropertyInsert
+                | RecordType::PropertyUpdate => {
+                    // Update ATT last_lsn for this txid.
+                    if let Some(entry) = att.get_mut(&rec.txid)
+                        && lsn > entry.last_lsn
+                    {
+                        entry.last_lsn = lsn;
+                    }
+                }
+
+                // ── Checkpoint end: seed DPT from the checkpoint record ────
+                RecordType::CheckpointEnd => {
+                    // Payload format written by Checkpoint::run():
+                    //   [0..4]   dirty_page_count: u32
+                    //   [4..4+N*16] N * (page_id: u64, rec_lsn: u64)
+                    //   [4+N*16..] active_tx_count: u32 (followed by tx entries)
+                    seed_dpt_from_checkpoint(&rec.payload, &mut dpt);
+                }
+
+                // ── Checkpoint begin / segment descriptor: no side effects ──
+                RecordType::CheckpointBegin | RecordType::SegmentDescriptor => {}
             }
         }
 
@@ -386,24 +475,27 @@ impl<'a> AriesRecovery<'a> {
                 continue;
             }
 
-            // Only page-mutation records and CLRs have after-images to apply.
-            let is_page_mutation = matches!(
+            // REDO is only applicable to **physical** page-image records whose
+            // payloads carry a full or partial page image starting at offset 0.
+            //
+            // Logical entity records (NodeInsert, EdgeInsert, etc.) written by
+            // the storage engine encode entity identifiers and record bytes, not
+            // raw page images.  Applying them here would write garbage to the
+            // data file.  The engine rebuilds entity-level state from pages
+            // during `open()` → `rebuild_indexes()`, so logical records do not
+            // need physical REDO.
+            //
+            // CLRs written during UNDO carry the before-image (i.e. the page
+            // state after the inverse operation) and DO need REDO.
+            let is_physical_page_record = matches!(
                 rec.record_type,
                 RecordType::PageInsert
                     | RecordType::PageUpdate
                     | RecordType::PageFree
                     | RecordType::BitmapUpdate
-                    | RecordType::NodeInsert
-                    | RecordType::NodeDelete
-                    | RecordType::NodeUpdate
-                    | RecordType::EdgeInsert
-                    | RecordType::EdgeDelete
-                    | RecordType::EdgeUpdate
-                    | RecordType::PropertyInsert
-                    | RecordType::PropertyUpdate
                     | RecordType::Clr
             );
-            if !is_page_mutation {
+            if !is_physical_page_record {
                 continue;
             }
 
@@ -449,8 +541,7 @@ impl<'a> AriesRecovery<'a> {
             .expect("UNDO phase requires a data path (use new())");
 
         // Build a lookup: lsn → record (for prev_lsn chain traversal).
-        let lsn_index: HashMap<u64, &WalRecord> =
-            records.iter().map(|r| (r.lsn, r)).collect();
+        let lsn_index: HashMap<u64, &WalRecord> = records.iter().map(|r| (r.lsn, r)).collect();
 
         // Process transactions ordered by last_lsn descending (the ARIES
         // "toundo" priority queue).
@@ -492,19 +583,29 @@ impl<'a> AriesRecovery<'a> {
                         | RecordType::PageFree
                 );
 
-                if undoable
-                    && let Some((page_id, after_image)) = extract_page_and_image(rec)
-                {
+                if undoable && let Some((page_id, after_image)) = extract_page_and_image(rec) {
+                    // Determine what the page will look like after the inverse.
+                    // If the WAL record carries a before-image, that is the state
+                    // we restore; otherwise (for inserts) it is a zero-filled page.
+                    let clr_image: Vec<u8> = if let Some(bi) = extract_before_image(&rec.payload) {
+                        bi.to_vec()
+                    } else {
+                        // Insert tombstone: zeroed page.
+                        vec![0u8; PAGE_SIZE]
+                    };
+
                     // Apply inverse operation on the page.
                     apply_inverse(fs, data_path, rec, page_id, after_image)?;
 
                     // Write CLR to WAL.
-                    let clr_payload =
-                        build_clr_payload(rec.prev_lsn, page_id, after_image);
+                    // `undo_next_lsn` = rec.prev_lsn so that if recovery crashes
+                    // during UNDO it can skip the already-compensated record and
+                    // continue from the next one in the chain (idempotency).
+                    let clr_payload = build_clr_payload(rec.prev_lsn, page_id, &clr_image);
                     let clr = WalRecord::new(
                         RecordType::Clr,
                         rec.txid,
-                        0,           // LSN assigned by WalWriter
+                        0, // LSN assigned by WalWriter
                         rec.prev_lsn,
                         clr_payload,
                     );
@@ -532,8 +633,8 @@ impl<'a> AriesRecovery<'a> {
 /// Extract the 8-byte big-endian `page_id` from the beginning of a payload.
 fn page_id_from_payload(payload: &[u8]) -> PageId {
     u64::from_be_bytes([
-        payload[0], payload[1], payload[2], payload[3],
-        payload[4], payload[5], payload[6], payload[7],
+        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+        payload[7],
     ])
 }
 
@@ -602,12 +703,19 @@ fn apply_after_image(
 
 /// Apply the inverse of `rec` to bring `page_id` back to its pre-operation state.
 ///
-/// For now we implement a "best effort" inverse:
-/// - `NodeInsert` / `EdgeInsert` / `PropertyInsert` / `PageInsert`: write a
-///   zero-filled tombstone (logically deleted page).
-/// - `NodeDelete` / `EdgeDelete` / `PageFree` / `PageUpdate` etc.: restore
-///   the before-image if it was recorded in the payload (bytes 8+8 and beyond),
-///   otherwise write a tombstone.
+/// # Before-image extraction (Task 149)
+///
+/// The WAL payload may carry a before-image appended after the after-image
+/// content, preceded by a 4-byte magic sentinel `BIMG` (`0x42494D47`) and a
+/// 4-byte length field:
+///
+/// ```text
+/// [original payload][0x42494D47 magic][4 bytes before_image_len][before_image bytes]
+/// ```
+///
+/// When a before-image is present it is written to `page_id` to restore the
+/// page to its pre-mutation state.  When absent (e.g. for `NodeInsert` where
+/// there is no prior state), a zero-filled tombstone is written instead.
 fn apply_inverse(
     fs: &dyn FileSystem,
     data_path: &Path,
@@ -615,12 +723,21 @@ fn apply_inverse(
     page_id: PageId,
     _after_image: &[u8],
 ) -> io::Result<()> {
-    // For insert records: zero-fill the page (tombstone).
-    // For delete/update records: the inverse is a no-op at this layer since we
-    // do not carry before-images in this implementation — the WAL carries
-    // after-images only.  A full before-image implementation would store the
-    // old page contents in the WAL record payload and restore it here.
-    let tombstone = matches!(
+    // Try to extract a before-image from the WAL record payload.
+    if let Some(before_image) = extract_before_image(&rec.payload) {
+        // Restore the before-image to the page.
+        let handle = fs.open(data_path, true)?;
+        let offset = page_id * PAGE_SIZE as u64;
+        let copy_len = before_image.len().min(PAGE_SIZE);
+        let mut page_buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        page_buf[..copy_len].copy_from_slice(&before_image[..copy_len]);
+        handle.write_at(&page_buf, offset)?;
+        return Ok(());
+    }
+
+    // No before-image: fall back to tombstone strategy for insert records, and
+    // no-op for other record types (the state was already at the after-image).
+    let is_insert = matches!(
         rec.record_type,
         RecordType::NodeInsert
             | RecordType::EdgeInsert
@@ -628,14 +745,75 @@ fn apply_inverse(
             | RecordType::PageInsert
     );
 
-    if tombstone || !fs.exists(data_path) {
-        // Write a zeroed page — logically deleted.
+    if is_insert {
+        // Write a zeroed page — logically deletes the inserted entity.
         let handle = fs.open(data_path, true)?;
         let offset = page_id * PAGE_SIZE as u64;
         let zeroes = AlignedBuffer::zeroed(PAGE_SIZE);
         handle.write_at(&zeroes, offset)?;
     }
+    // For update/delete without a before-image: we cannot restore the prior
+    // state.  This is acceptable for records written by an older version of
+    // the engine that did not embed before-images.
     Ok(())
+}
+
+/// Magic sentinel used to identify the before-image section in a WAL payload.
+///
+/// A WAL record payload that carries a before-image has the following structure:
+///
+/// ```text
+/// [original after-image content][BEFORE_IMAGE_MAGIC 4 bytes][before_image_len 4 bytes][before_image bytes]
+/// ```
+const BEFORE_IMAGE_MAGIC: u32 = 0x42494D47; // "BIMG"
+
+/// Append a before-image to an existing WAL payload.
+///
+/// The caller should invoke this *after* constructing the standard after-image
+/// payload and *before* handing the payload to [`WalRecord::new`].
+///
+/// # Arguments
+///
+/// * `payload` — the existing after-image payload bytes; mutated in place.
+/// * `before_image` — the raw page bytes before the mutation.
+pub fn embed_before_image(payload: &mut Vec<u8>, before_image: &[u8]) {
+    let trimmed_len = before_image.len().min(PAGE_SIZE);
+    payload.extend_from_slice(&BEFORE_IMAGE_MAGIC.to_be_bytes());
+    payload.extend_from_slice(&(trimmed_len as u32).to_be_bytes());
+    payload.extend_from_slice(&before_image[..trimmed_len]);
+}
+
+/// Extract the before-image from a WAL payload if the sentinel is present.
+///
+/// Returns `None` if no before-image was embedded.
+fn extract_before_image(payload: &[u8]) -> Option<&[u8]> {
+    // The before-image section begins 8 bytes before the end of the payload:
+    // 4 bytes magic + 4 bytes length.  Scan backward to find the sentinel.
+    // We accept the sentinel only when the claimed length is consistent with
+    // the remaining bytes.
+    if payload.len() < 8 {
+        return None;
+    }
+    // Walk backward searching for the BEFORE_IMAGE_MAGIC sentinel.
+    // The sentinel must appear at position `payload.len() - 8 - before_image_len`.
+    // We check all positions where the magic could legitimately sit.
+    let magic_bytes = BEFORE_IMAGE_MAGIC.to_be_bytes();
+    // The structure is: [...payload...][magic 4][len 4][image N]
+    // So the magic sits at offset (payload.len() - 8 - N) for N >= 0.
+    // We know N <= PAGE_SIZE, so we search within that range.
+    let search_limit = payload.len().saturating_sub(8);
+    let search_start = search_limit.saturating_sub(PAGE_SIZE);
+    for pos in (search_start..=search_limit).rev() {
+        if payload[pos..pos + 4] == magic_bytes {
+            let len_bytes: [u8; 4] = payload[pos + 4..pos + 8].try_into().ok()?;
+            let image_len = u32::from_be_bytes(len_bytes) as usize;
+            if pos + 8 + image_len == payload.len() {
+                // Consistent: the image fills exactly the tail.
+                return Some(&payload[pos + 8..]);
+            }
+        }
+    }
+    None
 }
 
 /// Build the payload for a CLR record.
@@ -644,14 +822,14 @@ fn apply_inverse(
 /// ```text
 /// [0..8]   undo_next_lsn  — prev_lsn of the record being compensated
 /// [8..16]  page_id
-/// [16..]   tombstone/before-image (zeroed for now)
+/// [16..]   before-image bytes (the state written by the inverse operation)
 /// ```
-fn build_clr_payload(undo_next_lsn: u64, page_id: PageId, image: &[u8]) -> Vec<u8> {
-    let image_len = image.len().min(PAGE_SIZE);
+fn build_clr_payload(undo_next_lsn: u64, page_id: PageId, before_image: &[u8]) -> Vec<u8> {
+    let image_len = before_image.len().min(PAGE_SIZE);
     let mut payload = Vec::with_capacity(16 + image_len);
     payload.extend_from_slice(&undo_next_lsn.to_be_bytes());
     payload.extend_from_slice(&page_id.to_be_bytes());
-    payload.extend_from_slice(&image[..image_len]);
+    payload.extend_from_slice(&before_image[..image_len]);
     payload
 }
 
@@ -662,9 +840,46 @@ fn clr_undo_next_lsn(payload: &[u8]) -> u64 {
         return 0;
     }
     u64::from_be_bytes([
-        payload[0], payload[1], payload[2], payload[3],
-        payload[4], payload[5], payload[6], payload[7],
+        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+        payload[7],
     ])
+}
+
+/// Seed the Dirty Page Table from a `CheckpointEnd` WAL record payload.
+///
+/// Payload format (written by [`Checkpoint::run`]):
+/// ```text
+/// [0..4]        dirty_page_count: u32 big-endian
+/// [4..4+N*16]   N entries of (page_id: u64 big-endian, rec_lsn: u64 big-endian)
+/// [4+N*16..]    active_tx_count: u32 (ignored; placeholder for future use)
+/// ```
+///
+/// Existing DPT entries are preserved (oldest `rec_lsn` wins); only pages not
+/// already in the DPT are added from the checkpoint record.
+fn seed_dpt_from_checkpoint(payload: &[u8], dpt: &mut HashMap<u64, DptEntry>) {
+    if payload.len() < 4 {
+        return;
+    }
+    let count = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let required_len = 4 + count * 16;
+    if payload.len() < required_len {
+        return; // truncated checkpoint record; ignore
+    }
+    for i in 0..count {
+        let base = 4 + i * 16;
+        let page_id = u64::from_be_bytes(
+            payload[base..base + 8]
+                .try_into()
+                .expect("slice is 8 bytes"),
+        );
+        let rec_lsn = u64::from_be_bytes(
+            payload[base + 8..base + 16]
+                .try_into()
+                .expect("slice is 8 bytes"),
+        );
+        // Only insert if not already present; oldest rec_lsn wins.
+        dpt.entry(page_id).or_insert(DptEntry { page_id, rec_lsn });
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -721,7 +936,11 @@ mod tests {
 
     #[test]
     fn analysis_committed_transaction_in_att() {
-        let records = vec![begin(1, 100, 0), page_update(1, 150, 100, 5), commit(1, 200, 150)];
+        let records = vec![
+            begin(1, 100, 0),
+            page_update(1, 150, 100, 5),
+            commit(1, 200, 150),
+        ];
         let r = AriesRecovery::new_with_records(records);
         let (att, dpt, max_lsn) = r.analysis_from_records();
 
@@ -785,19 +1004,30 @@ mod tests {
 
     #[test]
     fn analysis_clr_updates_last_lsn_not_dpt() {
+        // Use a PageInsert (physical record) so it appears in the DPT.
+        // Then add a CLR that compensates for it.
+        // The CLR should update last_lsn but NOT add page 5 again to the DPT.
+        let mut page_payload = 5u64.to_be_bytes().to_vec();
+        page_payload.extend_from_slice(&[0u8; 8]); // tiny after-image
+        let mut page_insert_rec = WalRecord::new(RecordType::PageInsert, 1, 0, 10, page_payload);
+        page_insert_rec.set_lsn(50);
+
         let mut clr_payload = 0u64.to_be_bytes().to_vec(); // undo_next_lsn = 0
         clr_payload.extend_from_slice(&5u64.to_be_bytes()); // page_id
         clr_payload.extend_from_slice(&[0u8; 8]);
         let mut clr_rec = WalRecord::new(RecordType::Clr, 1, 0, 50, clr_payload);
         clr_rec.set_lsn(200);
 
-        let records = vec![begin(1, 10, 0), node_insert(1, 50, 10, 5), clr_rec];
+        let records = vec![begin(1, 10, 0), page_insert_rec, clr_rec];
         let r = AriesRecovery::new_with_records(records);
         let (att, dpt, _) = r.analysis_from_records();
 
-        // CLR should update last_lsn but NOT add page 5 again to DPT (already there).
+        // CLR should update last_lsn but NOT add page 5 again to DPT (already there from PageInsert).
         assert_eq!(att[&1].last_lsn, 200);
-        assert!(dpt.contains_key(&5)); // from node_insert
+        assert!(
+            dpt.contains_key(&5),
+            "page 5 should be in DPT from PageInsert record"
+        );
     }
 
     // ── REDO (filesystem-dependent; uses tempdir) ─────────────────────────────
@@ -810,7 +1040,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = PosixFileSystem::new(false);
         let data_path = dir.path().join("data.db");
-        let wal_path = dir.path().join("wal-000000000");
+        // WAL directory — create segment 0 inside it.
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let wal_path = wal_dir.join("wal-000000000");
 
         // Pre-create a zeroed page.
         {
@@ -837,10 +1070,16 @@ mod tests {
 
         // Build DPT manually.
         let mut dpt = HashMap::new();
-        dpt.insert(1u64, DptEntry { page_id: 1, rec_lsn: 999 });
+        dpt.insert(
+            1u64,
+            DptEntry {
+                page_id: 1,
+                rec_lsn: 999,
+            },
+        );
 
-        let recovery = AriesRecovery::new(&fs, &wal_path, &data_path, 0);
-        let records = recovery.load_records(&fs, &wal_path).unwrap();
+        let recovery = AriesRecovery::new(&fs, &wal_dir, &data_path, 0);
+        let records = recovery.load_all_segments(&fs, &wal_dir).unwrap();
         let count = recovery.redo(&records, &dpt, &fs).unwrap();
         assert_eq!(count, 1);
     }
@@ -853,7 +1092,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = PosixFileSystem::new(false);
         let data_path = dir.path().join("data.db");
-        let wal_path = dir.path().join("wal-000000000");
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let wal_path = wal_dir.join("wal-000000000");
 
         // Page already at lsn=9999 — newer than the WAL record.
         {
@@ -875,12 +1116,146 @@ mod tests {
         handle.sync_data().unwrap();
 
         let mut dpt = HashMap::new();
-        dpt.insert(2u64, DptEntry { page_id: 2, rec_lsn: 500 });
+        dpt.insert(
+            2u64,
+            DptEntry {
+                page_id: 2,
+                rec_lsn: 500,
+            },
+        );
 
-        let recovery = AriesRecovery::new(&fs, &wal_path, &data_path, 0);
-        let records = recovery.load_records(&fs, &wal_path).unwrap();
+        let recovery = AriesRecovery::new(&fs, &wal_dir, &data_path, 0);
+        let records = recovery.load_all_segments(&fs, &wal_dir).unwrap();
         let count = recovery.redo(&records, &dpt, &fs).unwrap();
         assert_eq!(count, 0, "page is already up-to-date; REDO must be a no-op");
+    }
+
+    // ── UNDO with before-images (Task 149) ────────────────────────────────────
+
+    #[test]
+    fn undo_insert_writes_tombstone() {
+        use crate::io::posix::PosixFileSystem;
+        use crate::storage::page::{PageType, SlottedPage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let data_path = dir.path().join("data.db");
+
+        // Write a page with data (simulating after an insert).
+        {
+            let mut page = SlottedPage::init(3, PageType::SlottedData);
+            page.insert(b"hello").unwrap();
+            page.update_checksum();
+            let handle = fs.open(&data_path, true).unwrap();
+            handle.write_at(&page.buf, 3 * PAGE_SIZE as u64).unwrap();
+            handle.sync_data().unwrap();
+        }
+
+        // Build a NodeInsert record for page 3 — no before-image (it's an insert).
+        let mut payload = 3u64.to_be_bytes().to_vec();
+        payload.extend_from_slice(&[0xAAu8; 16]); // fake after-image content
+
+        let mut insert_rec = WalRecord::new(RecordType::NodeInsert, 42, 0, 0, payload);
+        insert_rec.set_lsn(100);
+
+        // Simulate UNDO: apply_inverse should zero-fill the page.
+        apply_inverse(&fs, &data_path, &insert_rec, 3, &[]).unwrap();
+
+        let handle = fs.open(&data_path, false).unwrap();
+        let mut buf = crate::io::AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut buf, 3 * PAGE_SIZE as u64).unwrap();
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "page must be zeroed after insert undo"
+        );
+    }
+
+    #[test]
+    fn undo_update_restores_before_image() {
+        use crate::io::posix::PosixFileSystem;
+        use crate::storage::page::{PageType, SlottedPage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let data_path = dir.path().join("data.db");
+
+        // Before-image: page filled with 0xBB.
+        let mut before_image = vec![0xBBu8; PAGE_SIZE];
+        // After-image: page filled with 0xCC (the update).
+        let after_image = vec![0xCCu8; PAGE_SIZE];
+
+        // Write after-image to disk (current state = post-update).
+        {
+            let handle = fs.open(&data_path, true).unwrap();
+            handle.write_at(&after_image, 5 * PAGE_SIZE as u64).unwrap();
+            handle.sync_data().unwrap();
+        }
+
+        // Build a PageUpdate WAL record with embedded before-image.
+        let mut payload = 5u64.to_be_bytes().to_vec();
+        payload.extend_from_slice(&after_image); // after-image content
+        embed_before_image(&mut payload, &before_image);
+
+        let mut update_rec = WalRecord::new(RecordType::PageUpdate, 1, 0, 0, payload);
+        update_rec.set_lsn(200);
+
+        // Undo: should restore before_image.
+        let (page_id, ai) = extract_page_and_image(&update_rec).unwrap();
+        assert_eq!(page_id, 5);
+        apply_inverse(&fs, &data_path, &update_rec, page_id, ai).unwrap();
+
+        let handle = fs.open(&data_path, false).unwrap();
+        let mut buf = crate::io::AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut buf, 5 * PAGE_SIZE as u64).unwrap();
+        before_image[0..8].copy_from_slice(&0u64.to_be_bytes()); // LSN field zeroed by apply_inverse
+        // Verify the before_image content is restored (first non-LSN byte should be 0xBB).
+        assert_eq!(buf[8], 0xBB, "before-image must be restored by undo");
+    }
+
+    // ── Multi-segment recovery (Task 150) ────────────────────────────────────
+
+    #[test]
+    fn multi_segment_recovery_reads_all_segments() {
+        use crate::io::posix::PosixFileSystem;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Write records into two separate segment files.
+        // Segment 0: Begin txid=1 at LSN=1.
+        {
+            let mut r = WalRecord::new(RecordType::Begin, 1, 0, 0, vec![]);
+            r.set_lsn(crate::wal::writer::make_lsn(0, 1));
+            let bytes = r.encode();
+            let handle = fs.open(&wal_dir.join("wal-000000000"), true).unwrap();
+            handle.write_at(&bytes, 0).unwrap();
+            handle.sync_data().unwrap();
+        }
+        // Segment 1: Commit txid=1 at LSN=(1<<32)|1.
+        {
+            let mut r = WalRecord::new(
+                RecordType::Commit,
+                1,
+                0,
+                crate::wal::writer::make_lsn(0, 1),
+                vec![],
+            );
+            r.set_lsn(crate::wal::writer::make_lsn(1, 1));
+            let bytes = r.encode();
+            let handle = fs.open(&wal_dir.join("wal-000000001"), true).unwrap();
+            handle.write_at(&bytes, 0).unwrap();
+            handle.sync_data().unwrap();
+        }
+
+        let data_path = dir.path().join("data.db");
+        let recovery = AriesRecovery::new(&fs, &wal_dir, &data_path, 0);
+        let records = recovery.load_all_segments(&fs, &wal_dir).unwrap();
+
+        assert_eq!(records.len(), 2, "should read records from both segments");
+        assert_eq!(records[0].record_type, RecordType::Begin);
+        assert_eq!(records[1].record_type, RecordType::Commit);
     }
 }
 

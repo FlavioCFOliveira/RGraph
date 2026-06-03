@@ -3,18 +3,22 @@
 //! The [`GraphStorageEngine`] provides CRUD operations for nodes, edges,
 //! and properties on top of the page manager, B+ tree indexes, and WAL.
 
-use crate::graph::record::{EdgeRecord, NodeRecord, PropertyRecord, SlotRef, ValueType, node_flags, edge_flags};
+use crate::graph::record::{
+    EdgeRecord, NodeRecord, PropertyRecord, SlotRef, ValueType, edge_flags, node_flags,
+};
 use crate::index::btree::{BPlusTree, BPlusTreeConfig, BTreeError};
-use crate::index::key::{edge_id_key, label_index_key, node_id_key, property_index_key, type_index_key};
+use crate::index::key::{
+    edge_id_key, label_index_key, node_id_key, property_index_key, type_index_key,
+};
 use crate::index::property::PropertyIndex;
 use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::manager::PageManager;
-use crate::storage::page::{PageId, PageType, SlottedPage, PAGE_SIZE};
 use crate::storage::manager::num_bitmap_pages;
-use crate::storage::meta::{decode_superblock, load_superblock};
+use crate::storage::meta::load_superblock;
+use crate::storage::page::{PAGE_SIZE, PageId, PageType, SlottedPage};
+use crate::wal::aries::AriesRecovery;
 use crate::wal::record::{RecordType, WalRecord};
 use crate::wal::writer::WalWriter;
-use crate::wal::recovery::{recover, simple_page_replay};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -132,11 +136,8 @@ impl From<BTreeError> for StorageError {
 /// Core trait for graph storage operations.
 pub trait StorageEngine {
     /// Insert a node record. Returns its [`SlotRef`].
-    fn put_node(
-        &mut self,
-        node: &NodeRecord,
-        fs: &dyn FileSystem,
-    ) -> Result<SlotRef, StorageError>;
+    fn put_node(&mut self, node: &NodeRecord, fs: &dyn FileSystem)
+    -> Result<SlotRef, StorageError>;
 
     /// Retrieve a node by its `node_id`.
     fn get_node(
@@ -146,18 +147,11 @@ pub trait StorageEngine {
     ) -> Result<Option<NodeRecord>, StorageError>;
 
     /// Delete a node (leaves a tombstone).
-    fn delete_node(
-        &mut self,
-        node_id: u64,
-        fs: &dyn FileSystem,
-    ) -> Result<(), StorageError>;
+    fn delete_node(&mut self, node_id: u64, fs: &dyn FileSystem) -> Result<(), StorageError>;
 
     /// Insert an edge record. Returns its [`SlotRef`].
-    fn put_edge(
-        &mut self,
-        edge: &EdgeRecord,
-        fs: &dyn FileSystem,
-    ) -> Result<SlotRef, StorageError>;
+    fn put_edge(&mut self, edge: &EdgeRecord, fs: &dyn FileSystem)
+    -> Result<SlotRef, StorageError>;
 
     /// Retrieve an edge by its `edge_id`.
     fn get_edge(
@@ -167,11 +161,7 @@ pub trait StorageEngine {
     ) -> Result<Option<EdgeRecord>, StorageError>;
 
     /// Delete an edge (leaves a tombstone).
-    fn delete_edge(
-        &mut self,
-        edge_id: u64,
-        fs: &dyn FileSystem,
-    ) -> Result<(), StorageError>;
+    fn delete_edge(&mut self, edge_id: u64, fs: &dyn FileSystem) -> Result<(), StorageError>;
 
     /// Insert a property record. Returns its [`SlotRef`].
     fn put_property(
@@ -294,22 +284,22 @@ impl GraphStorageEngine {
 
         let mut pm = PageManager::open_multi(data_path.clone(), sb, bitmap_bufs, fs)?;
 
-        // Recover WAL using a buffered filesystem (WAL does not use O_DIRECT).
+        // Run full ARIES recovery (ANALYSIS → REDO → UNDO) using a buffered
+        // filesystem.  WAL does not use O_DIRECT; only data pages do.
         let wal_dir = data_path.parent().unwrap().join("wal");
-        let wal_path = wal_dir.join("wal-000000000");
         let wal_fs = crate::io::posix::PosixFileSystem::new(false);
-        let start_lsn = pm.superblock.last_checkpoint_lsn;
-        if let Some(last_lsn) = recover(
-            &wal_fs,
-            &wal_path,
-            start_lsn,
-            |pid, img, lsn| simple_page_replay(fs, &data_path, pid, img, lsn),
-        )? {
-            pm.superblock.current_wal_lsn = last_lsn;
-            pm.sync_superblock(fs)?;
-        }
+        let checkpoint_lsn = pm.superblock.last_checkpoint_lsn;
 
-        let wal_writer = WalWriter::open(wal_dir, &wal_fs)?;
+        let mut wal_writer = WalWriter::open(wal_dir.clone(), &wal_fs)?;
+
+        if wal_dir.exists() {
+            let recovery = AriesRecovery::new(&wal_fs, &wal_dir, &data_path, checkpoint_lsn);
+            let result = recovery.recover(&mut wal_writer)?;
+            if result.max_lsn > 0 {
+                pm.superblock.current_wal_lsn = result.max_lsn;
+                pm.sync_superblock(fs)?;
+            }
+        }
 
         let config = BPlusTreeConfig::default();
         let mut engine = Self {
@@ -343,9 +333,7 @@ impl GraphStorageEngine {
     /// are consistent even if the in-memory B+ trees were lost.  Also seeds
     /// the [`IdAllocator`] with the highest node/edge id observed on disk so
     /// fresh allocations never collide with existing records.
-    pub fn rebuild_indexes(&mut self,
-        fs: &dyn FileSystem,
-    ) -> Result<(), StorageError> {
+    pub fn rebuild_indexes(&mut self, fs: &dyn FileSystem) -> Result<(), StorageError> {
         use crate::index::key::{label_index_key, type_index_key};
 
         let allocated = self.page_manager.allocated_pages();
@@ -379,7 +367,9 @@ impl GraphStorageEngine {
                         if node.flags & node_flags::DELETED == 0 {
                             let slot_ref = SlotRef::new(page_id as u32, slot_idx as u8);
                             let value = slot_ref.raw.to_be_bytes().to_vec();
-                            let _ = self.node_index.insert(&node_id_key(node.node_id as u128), &value);
+                            let _ = self
+                                .node_index
+                                .insert(&node_id_key(node.node_id as u128), &value);
                             let _ = self.label_index.insert(
                                 &label_index_key(node.label_id as u64, node.node_id as u128),
                                 &value,
@@ -397,7 +387,9 @@ impl GraphStorageEngine {
                         if edge.flags & edge_flags::DELETED == 0 {
                             let slot_ref = SlotRef::new(page_id as u32, slot_idx as u8);
                             let value = slot_ref.raw.to_be_bytes().to_vec();
-                            let _ = self.edge_index.insert(&edge_id_key(edge.edge_id as u128), &value);
+                            let _ = self
+                                .edge_index
+                                .insert(&edge_id_key(edge.edge_id as u128), &value);
                             let _ = self.type_index.insert(
                                 &type_index_key(edge.type_id as u64, edge.edge_id as u128),
                                 &value,
@@ -421,16 +413,16 @@ impl GraphStorageEngine {
     /// Look up the physical [`SlotRef`] for a node by its logical `node_id`.
     ///
     /// Returns `Ok(None)` if the node does not exist or has been deleted.
-    pub fn lookup_node_slot(
-        &self,
-        node_id: u64,
-    ) -> Result<Option<SlotRef>, StorageError> {
+    pub fn lookup_node_slot(&self, node_id: u64) -> Result<Option<SlotRef>, StorageError> {
         let key = node_id_key(node_id as u128);
         let (_page_id, slot) = match self.node_index.search(&key) {
             Some(r) => r,
             None => return Ok(None),
         };
-        let page = self.node_index.get_page(_page_id).ok_or(StorageError::IndexError)?;
+        let page = self
+            .node_index
+            .get_page(_page_id)
+            .ok_or(StorageError::IndexError)?;
         let kv = page.key(slot).ok_or(StorageError::IndexError)?;
         let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
         let value = &kv[2 + key_len..];
@@ -529,11 +521,35 @@ impl GraphStorageEngine {
     }
 
     /// Sync the WAL, superblock, and bitmap to durable storage.
-    pub fn sync(
-        &mut self,
-        fs: &dyn FileSystem,
-    ) -> Result<(), StorageError> {
+    ///
+    /// If the WAL has accumulated more than [`WalWriter::CHECKPOINT_INTERVAL`]
+    /// bytes since the last fuzzy checkpoint, a checkpoint is taken here
+    /// (Task 151).  The new `last_checkpoint_lsn` is persisted to the
+    /// superblock so that ARIES ANALYSIS can bound its scan on the next restart.
+    pub fn sync(&mut self, fs: &dyn FileSystem) -> Result<(), StorageError> {
         self.wal_writer.sync(fs)?;
+
+        // Trigger a fuzzy checkpoint when the interval threshold is exceeded.
+        if self.wal_writer.needs_checkpoint() {
+            if let Some(pool) = self.page_manager.buffer_pool() {
+                let wal_fs = std::sync::Arc::new(crate::io::posix::PosixFileSystem::new(false));
+                match crate::wal::checkpoint::Checkpoint::run(&pool, wal_fs, &mut self.wal_writer) {
+                    Ok(ckpt_lsn) => {
+                        self.page_manager.superblock.last_checkpoint_lsn = ckpt_lsn;
+                        self.wal_writer.reset_checkpoint_counter();
+                    }
+                    Err(_) => {
+                        // Checkpoint failure is non-fatal — the engine can continue.
+                        // Recovery will simply replay more WAL on the next restart.
+                    }
+                }
+            } else {
+                // No buffer pool attached (e.g. in single-segment mode):
+                // reset the counter to avoid repeated no-op checks.
+                self.wal_writer.reset_checkpoint_counter();
+            }
+        }
+
         // Write superblock (both copies at pages 0 and 1), then write the
         // bitmap page (page 2).
         self.page_manager.sync_superblock(fs)?;
@@ -591,7 +607,8 @@ impl GraphStorageEngine {
         payload: &[u8],
         slot: SlotRef,
     ) -> Result<(), StorageError> {
-        self.property_index.insert(property_id, value_type, payload, entity_id, slot)
+        self.property_index
+            .insert(property_id, value_type, payload, entity_id, slot)
             .map_err(|e| e.into())
     }
 
@@ -638,14 +655,12 @@ impl GraphStorageEngine {
         fs: &dyn FileSystem,
     ) -> Result<(), StorageError> {
         // Read source node to get current head.
-        let node_bytes = Self::read_record(pm, node_slot, fs)?
-            .ok_or(StorageError::NotFound)?;
+        let node_bytes = Self::read_record(pm, node_slot, fs)?.ok_or(StorageError::NotFound)?;
         let mut node = NodeRecord::decode(&node_bytes).ok_or(StorageError::NotFound)?;
         let old_head = node.first_outgoing_edge;
 
         // Patch the new edge's next/prev pointers.
-        let edge_bytes = Self::read_record(pm, edge_slot, fs)?
-            .ok_or(StorageError::NotFound)?;
+        let edge_bytes = Self::read_record(pm, edge_slot, fs)?.ok_or(StorageError::NotFound)?;
         let mut edge = EdgeRecord::decode(&edge_bytes).ok_or(StorageError::NotFound)?;
         edge.next_source_edge = old_head;
         edge.prev_source_edge = SlotRef::NULL;
@@ -655,8 +670,7 @@ impl GraphStorageEngine {
 
         // If there was a previous head, update its prev pointer.
         if !old_head.is_null() {
-            let head_bytes = Self::read_record(pm, old_head, fs)?
-                .ok_or(StorageError::NotFound)?;
+            let head_bytes = Self::read_record(pm, old_head, fs)?.ok_or(StorageError::NotFound)?;
             let mut head_edge = EdgeRecord::decode(&head_bytes).ok_or(StorageError::NotFound)?;
             head_edge.prev_source_edge = edge_slot;
             let mut head_buf = [0u8; EdgeRecord::SIZE];
@@ -681,14 +695,12 @@ impl GraphStorageEngine {
         fs: &dyn FileSystem,
     ) -> Result<(), StorageError> {
         // Read target node to get current head.
-        let node_bytes = Self::read_record(pm, node_slot, fs)?
-            .ok_or(StorageError::NotFound)?;
+        let node_bytes = Self::read_record(pm, node_slot, fs)?.ok_or(StorageError::NotFound)?;
         let mut node = NodeRecord::decode(&node_bytes).ok_or(StorageError::NotFound)?;
         let old_head = node.first_incoming_edge;
 
         // Patch the new edge's next/prev pointers.
-        let edge_bytes = Self::read_record(pm, edge_slot, fs)?
-            .ok_or(StorageError::NotFound)?;
+        let edge_bytes = Self::read_record(pm, edge_slot, fs)?.ok_or(StorageError::NotFound)?;
         let mut edge = EdgeRecord::decode(&edge_bytes).ok_or(StorageError::NotFound)?;
         edge.next_target_edge = old_head;
         edge.prev_target_edge = SlotRef::NULL;
@@ -698,8 +710,7 @@ impl GraphStorageEngine {
 
         // If there was a previous head, update its prev pointer.
         if !old_head.is_null() {
-            let head_bytes = Self::read_record(pm, old_head, fs)?
-                .ok_or(StorageError::NotFound)?;
+            let head_bytes = Self::read_record(pm, old_head, fs)?.ok_or(StorageError::NotFound)?;
             let mut head_edge = EdgeRecord::decode(&head_bytes).ok_or(StorageError::NotFound)?;
             head_edge.prev_target_edge = edge_slot;
             let mut head_buf = [0u8; EdgeRecord::SIZE];
@@ -724,8 +735,7 @@ impl GraphStorageEngine {
         node_slot: SlotRef,
         fs: &dyn FileSystem,
     ) -> Result<Option<SlotRef>, StorageError> {
-        let edge_bytes = Self::read_record(pm, edge_slot, fs)?
-            .ok_or(StorageError::NotFound)?;
+        let edge_bytes = Self::read_record(pm, edge_slot, fs)?.ok_or(StorageError::NotFound)?;
         let edge = EdgeRecord::decode(&edge_bytes).ok_or(StorageError::NotFound)?;
         let prev = edge.prev_source_edge;
         let next = edge.next_source_edge;
@@ -781,8 +791,7 @@ impl GraphStorageEngine {
         node_slot: SlotRef,
         fs: &dyn FileSystem,
     ) -> Result<Option<SlotRef>, StorageError> {
-        let edge_bytes = Self::read_record(pm, edge_slot, fs)?
-            .ok_or(StorageError::NotFound)?;
+        let edge_bytes = Self::read_record(pm, edge_slot, fs)?.ok_or(StorageError::NotFound)?;
         let edge = EdgeRecord::decode(&edge_bytes).ok_or(StorageError::NotFound)?;
         let prev = edge.prev_target_edge;
         let next = edge.next_target_edge;
@@ -883,7 +892,14 @@ impl StorageEngine for GraphStorageEngine {
         payload.extend_from_slice(&node.node_id.to_be_bytes());
         payload.extend_from_slice(&slot.raw.to_be_bytes());
         payload.extend_from_slice(&buf);
-        Self::log(&mut self.page_manager, &mut self.wal_writer, fs, RecordType::NodeInsert, 1, payload)?;
+        Self::log(
+            &mut self.page_manager,
+            &mut self.wal_writer,
+            fs,
+            RecordType::NodeInsert,
+            1,
+            payload,
+        )?;
 
         Ok(slot)
     }
@@ -898,7 +914,10 @@ impl StorageEngine for GraphStorageEngine {
             Some(r) => r,
             None => return Ok(None),
         };
-        let page = self.node_index.get_page(_page_id).ok_or(StorageError::IndexError)?;
+        let page = self
+            .node_index
+            .get_page(_page_id)
+            .ok_or(StorageError::IndexError)?;
         let kv = page.key(slot).ok_or(StorageError::IndexError)?;
         let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
         let value = &kv[2 + key_len..];
@@ -911,20 +930,20 @@ impl StorageEngine for GraphStorageEngine {
         }
     }
 
-    fn delete_node(
-        &mut self,
-        node_id: u64,
-        fs: &dyn FileSystem,
-    ) -> Result<(), StorageError> {
+    fn delete_node(&mut self, node_id: u64, fs: &dyn FileSystem) -> Result<(), StorageError> {
         let key = node_id_key(node_id as u128);
         let (_page_id, slot) = self.node_index.search(&key).ok_or(StorageError::NotFound)?;
-        let page = self.node_index.get_page(_page_id).ok_or(StorageError::IndexError)?;
+        let page = self
+            .node_index
+            .get_page(_page_id)
+            .ok_or(StorageError::IndexError)?;
         let kv = page.key(slot).ok_or(StorageError::IndexError)?;
         let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
         let value = &kv[2 + key_len..];
         let slot_ref = decode_slot_ref(value).ok_or(StorageError::IndexError)?;
 
-        let record = Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
+        let record =
+            Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
         let mut node = NodeRecord::decode(&record).ok_or(StorageError::NotFound)?;
         node.flags |= node_flags::DELETED;
         node.generation += 1;
@@ -941,7 +960,14 @@ impl StorageEngine for GraphStorageEngine {
         let mut payload = node_id.to_be_bytes().to_vec();
         payload.extend_from_slice(&slot_ref.raw.to_be_bytes());
         payload.extend_from_slice(&buf);
-        Self::log(&mut self.page_manager, &mut self.wal_writer, fs, RecordType::NodeDelete, 1, payload)?;
+        Self::log(
+            &mut self.page_manager,
+            &mut self.wal_writer,
+            fs,
+            RecordType::NodeDelete,
+            1,
+            payload,
+        )?;
 
         Ok(())
     }
@@ -987,13 +1013,20 @@ impl StorageEngine for GraphStorageEngine {
         }
 
         // WAL: EdgeInsert — re-encode to capture any pointer updates.
-        let final_record = Self::read_record(&self.page_manager, edge_slot, fs)?
-            .ok_or(StorageError::NotFound)?;
+        let final_record =
+            Self::read_record(&self.page_manager, edge_slot, fs)?.ok_or(StorageError::NotFound)?;
         let mut payload = Vec::with_capacity(8 + 4 + EdgeRecord::SIZE);
         payload.extend_from_slice(&edge.edge_id.to_be_bytes());
         payload.extend_from_slice(&edge_slot.raw.to_be_bytes());
         payload.extend_from_slice(&final_record);
-        Self::log(&mut self.page_manager, &mut self.wal_writer, fs, RecordType::EdgeInsert, 1, payload)?;
+        Self::log(
+            &mut self.page_manager,
+            &mut self.wal_writer,
+            fs,
+            RecordType::EdgeInsert,
+            1,
+            payload,
+        )?;
 
         Ok(edge_slot)
     }
@@ -1008,7 +1041,10 @@ impl StorageEngine for GraphStorageEngine {
             Some(r) => r,
             None => return Ok(None),
         };
-        let page = self.edge_index.get_page(_page_id).ok_or(StorageError::IndexError)?;
+        let page = self
+            .edge_index
+            .get_page(_page_id)
+            .ok_or(StorageError::IndexError)?;
         let kv = page.key(slot).ok_or(StorageError::IndexError)?;
         let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
         let value = &kv[2 + key_len..];
@@ -1021,20 +1057,20 @@ impl StorageEngine for GraphStorageEngine {
         }
     }
 
-    fn delete_edge(
-        &mut self,
-        edge_id: u64,
-        fs: &dyn FileSystem,
-    ) -> Result<(), StorageError> {
+    fn delete_edge(&mut self, edge_id: u64, fs: &dyn FileSystem) -> Result<(), StorageError> {
         let key = edge_id_key(edge_id as u128);
         let (_page_id, slot) = self.edge_index.search(&key).ok_or(StorageError::NotFound)?;
-        let page = self.edge_index.get_page(_page_id).ok_or(StorageError::IndexError)?;
+        let page = self
+            .edge_index
+            .get_page(_page_id)
+            .ok_or(StorageError::IndexError)?;
         let kv = page.key(slot).ok_or(StorageError::IndexError)?;
         let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
         let value = &kv[2 + key_len..];
         let slot_ref = decode_slot_ref(value).ok_or(StorageError::IndexError)?;
 
-        let record = Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
+        let record =
+            Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
         let mut edge = EdgeRecord::decode(&record).ok_or(StorageError::NotFound)?;
 
         // Unlink from adjacency lists before marking as deleted.
@@ -1046,7 +1082,8 @@ impl StorageEngine for GraphStorageEngine {
         }
 
         // Re-read the record after pointer patching.
-        let record = Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
+        let record =
+            Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
         edge = EdgeRecord::decode(&record).ok_or(StorageError::NotFound)?;
         edge.flags |= edge_flags::DELETED;
         edge.generation += 1;
@@ -1063,7 +1100,14 @@ impl StorageEngine for GraphStorageEngine {
         let mut payload = edge_id.to_be_bytes().to_vec();
         payload.extend_from_slice(&slot_ref.raw.to_be_bytes());
         payload.extend_from_slice(&buf);
-        Self::log(&mut self.page_manager, &mut self.wal_writer, fs, RecordType::EdgeDelete, 1, payload)?;
+        Self::log(
+            &mut self.page_manager,
+            &mut self.wal_writer,
+            fs,
+            RecordType::EdgeDelete,
+            1,
+            payload,
+        )?;
 
         Ok(())
     }
@@ -1086,7 +1130,14 @@ impl StorageEngine for GraphStorageEngine {
         let mut payload = Vec::with_capacity(4 + bytes.len());
         payload.extend_from_slice(&slot.raw.to_be_bytes());
         payload.extend_from_slice(&bytes);
-        Self::log(&mut self.page_manager, &mut self.wal_writer, fs, RecordType::PropertyInsert, 1, payload)?;
+        Self::log(
+            &mut self.page_manager,
+            &mut self.wal_writer,
+            fs,
+            RecordType::PropertyInsert,
+            1,
+            payload,
+        )?;
 
         Ok(slot)
     }
@@ -1111,13 +1162,17 @@ impl StorageEngine for GraphStorageEngine {
     ) -> Result<(), StorageError> {
         let key = node_id_key(node_id as u128);
         let (_page_id, slot) = self.node_index.search(&key).ok_or(StorageError::NotFound)?;
-        let page = self.node_index.get_page(_page_id).ok_or(StorageError::IndexError)?;
+        let page = self
+            .node_index
+            .get_page(_page_id)
+            .ok_or(StorageError::IndexError)?;
         let kv = page.key(slot).ok_or(StorageError::IndexError)?;
         let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
         let value = &kv[2 + key_len..];
         let slot_ref = decode_slot_ref(value).ok_or(StorageError::IndexError)?;
 
-        let record = Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
+        let record =
+            Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
         let mut node = NodeRecord::decode(&record).ok_or(StorageError::NotFound)?;
         node.first_property = prop_slot;
         node.generation += 1;
@@ -1131,7 +1186,14 @@ impl StorageEngine for GraphStorageEngine {
         payload.extend_from_slice(&node_id.to_be_bytes());
         payload.extend_from_slice(&slot_ref.raw.to_be_bytes());
         payload.extend_from_slice(&buf);
-        Self::log(&mut self.page_manager, &mut self.wal_writer, fs, RecordType::NodeInsert, 1, payload)?;
+        Self::log(
+            &mut self.page_manager,
+            &mut self.wal_writer,
+            fs,
+            RecordType::NodeInsert,
+            1,
+            payload,
+        )?;
 
         Ok(())
     }
@@ -1144,13 +1206,17 @@ impl StorageEngine for GraphStorageEngine {
     ) -> Result<(), StorageError> {
         let key = edge_id_key(edge_id as u128);
         let (_page_id, slot) = self.edge_index.search(&key).ok_or(StorageError::NotFound)?;
-        let page = self.edge_index.get_page(_page_id).ok_or(StorageError::IndexError)?;
+        let page = self
+            .edge_index
+            .get_page(_page_id)
+            .ok_or(StorageError::IndexError)?;
         let kv = page.key(slot).ok_or(StorageError::IndexError)?;
         let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
         let value = &kv[2 + key_len..];
         let slot_ref = decode_slot_ref(value).ok_or(StorageError::IndexError)?;
 
-        let record = Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
+        let record =
+            Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
         let mut edge = EdgeRecord::decode(&record).ok_or(StorageError::NotFound)?;
         edge.first_property = prop_slot;
         edge.generation += 1;
@@ -1164,7 +1230,14 @@ impl StorageEngine for GraphStorageEngine {
         payload.extend_from_slice(&edge_id.to_be_bytes());
         payload.extend_from_slice(&slot_ref.raw.to_be_bytes());
         payload.extend_from_slice(&buf);
-        Self::log(&mut self.page_manager, &mut self.wal_writer, fs, RecordType::EdgeInsert, 1, payload)?;
+        Self::log(
+            &mut self.page_manager,
+            &mut self.wal_writer,
+            fs,
+            RecordType::EdgeInsert,
+            1,
+            payload,
+        )?;
 
         Ok(())
     }
@@ -1174,6 +1247,7 @@ impl StorageEngine for GraphStorageEngine {
 mod tests {
     use super::*;
     use crate::io::posix::PosixFileSystem;
+    use crate::storage::meta::decode_superblock;
 
     fn temp_fs() -> (tempfile::TempDir, PosixFileSystem, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -1298,7 +1372,12 @@ mod tests {
         let (_dir, fs, path) = temp_fs();
         let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
 
-        let prop = PropertyRecord::inline("msg", 1, crate::graph::record::ValueType::String, b"hello".to_vec());
+        let prop = PropertyRecord::inline(
+            "msg",
+            1,
+            crate::graph::record::ValueType::String,
+            b"hello".to_vec(),
+        );
         let slot = engine.put_property(&prop, &fs).unwrap();
 
         let retrieved = engine.get_property(slot, &fs).unwrap();
@@ -1315,7 +1394,12 @@ mod tests {
         let node = NodeRecord::new(1, 42);
         engine.put_node(&node, &fs).unwrap();
 
-        let prop = PropertyRecord::inline("name", 1, crate::graph::record::ValueType::String, b"name".to_vec());
+        let prop = PropertyRecord::inline(
+            "name",
+            1,
+            crate::graph::record::ValueType::String,
+            b"name".to_vec(),
+        );
         let prop_slot = engine.put_property(&prop, &fs).unwrap();
 
         engine.attach_property_to_node(1, prop_slot, &fs).unwrap();
@@ -1337,7 +1421,12 @@ mod tests {
         let edge = EdgeRecord::new(100, 5, 1, 2, src_slot, tgt_slot);
         engine.put_edge(&edge, &fs).unwrap();
 
-        let prop = PropertyRecord::inline("weight", 1, crate::graph::record::ValueType::String, b"weight".to_vec());
+        let prop = PropertyRecord::inline(
+            "weight",
+            1,
+            crate::graph::record::ValueType::String,
+            b"weight".to_vec(),
+        );
         let prop_slot = engine.put_property(&prop, &fs).unwrap();
 
         engine.attach_property_to_edge(100, prop_slot, &fs).unwrap();
@@ -1420,7 +1509,10 @@ mod tests {
         engine.sync(&fs).unwrap();
 
         // Verify data exists before crash.
-        assert!(engine.get_node(1, &fs).unwrap().is_some(), "node 1 should exist before crash");
+        assert!(
+            engine.get_node(1, &fs).unwrap().is_some(),
+            "node 1 should exist before crash"
+        );
 
         // Simulate crash: drop the engine and reopen from disk.
         drop(engine);
@@ -1446,14 +1538,26 @@ mod tests {
         // Verify secondary label index is rebuilt.
         let label_key1 = label_index_key(10, 1);
         let label_key2 = label_index_key(20, 2);
-        assert!(recovered.label_index.search(&label_key1).is_some(), "label index for node 1 should be rebuilt");
-        assert!(recovered.label_index.search(&label_key2).is_some(), "label index for node 2 should be rebuilt");
+        assert!(
+            recovered.label_index.search(&label_key1).is_some(),
+            "label index for node 1 should be rebuilt"
+        );
+        assert!(
+            recovered.label_index.search(&label_key2).is_some(),
+            "label index for node 2 should be rebuilt"
+        );
 
         // Verify secondary type index is rebuilt.
         let type_key1 = type_index_key(1, 100);
         let type_key2 = type_index_key(2, 101);
-        assert!(recovered.type_index.search(&type_key1).is_some(), "type index for edge 100 should be rebuilt");
-        assert!(recovered.type_index.search(&type_key2).is_some(), "type index for edge 101 should be rebuilt");
+        assert!(
+            recovered.type_index.search(&type_key1).is_some(),
+            "type index for edge 100 should be rebuilt"
+        );
+        assert!(
+            recovered.type_index.search(&type_key2).is_some(),
+            "type index for edge 101 should be rebuilt"
+        );
     }
 
     #[test]
@@ -1538,5 +1642,53 @@ mod tests {
         // Open should recover from the mirror with the last good generation.
         let engine = GraphStorageEngine::open(path, &fs).unwrap();
         assert_eq!(engine.page_manager.superblock.generation, old_generation);
+    }
+
+    // ── Task 148: ARIES recovery wired at startup ──────────────────────────
+
+    #[test]
+    fn committed_data_survives_restart() {
+        // This test verifies the Task 148 acceptance criteria: committed
+        // transactions are fully redone after a simulated restart.
+        let (_dir, fs, path) = temp_fs();
+
+        let node_id;
+        {
+            let mut engine = GraphStorageEngine::init(path.clone(), &fs).unwrap();
+            let node = NodeRecord::new(1, 42);
+            engine.put_node(&node, &fs).unwrap();
+            engine.sync(&fs).unwrap();
+            node_id = 1u64;
+        }
+
+        // Reopen — ARIES recovery must restore the committed state.
+        let engine = GraphStorageEngine::open(path, &fs).unwrap();
+        let result = engine.get_node(node_id, &fs).unwrap();
+        assert!(
+            result.is_some(),
+            "committed node must be present after restart"
+        );
+        let n = result.unwrap();
+        assert_eq!(n.node_id, 1);
+        assert_eq!(n.label_id, 42);
+    }
+
+    #[test]
+    fn aries_recovery_runs_without_error_on_empty_wal() {
+        // When no WAL segments exist (fresh database opened normally), ARIES
+        // must complete without error (no segments → no records → no-op).
+        let (_dir, fs, path) = temp_fs();
+        {
+            let mut engine = GraphStorageEngine::init(path.clone(), &fs).unwrap();
+            engine.sync(&fs).unwrap();
+        }
+        // Remove the WAL directory to simulate a missing WAL.
+        let wal_dir = path.parent().unwrap().join("wal");
+        if wal_dir.exists() {
+            std::fs::remove_dir_all(&wal_dir).unwrap();
+        }
+        // Open must succeed even with no WAL.
+        let engine = GraphStorageEngine::open(path, &fs).unwrap();
+        assert_eq!(engine.page_manager.superblock.total_page_count, 3);
     }
 }
