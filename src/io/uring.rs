@@ -131,17 +131,30 @@ struct IoUringFileHandle {
 
 impl FileHandle for IoUringFileHandle {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.readv_at(&mut [buf], offset)
+    }
+
+    fn readv_at(&self, bufs: &mut [&mut [u8]], offset: u64) -> io::Result<()> {
         let fd = types::Fd(self.file.as_raw_fd());
         let mut ring = self.ring.lock().unwrap();
 
-        let read_e = opcode::Read::new(fd, buf.as_mut_ptr(), buf.len() as u32)
+        // Build an array of libc::iovec for the vectored read.
+        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(bufs.len());
+        for buf in bufs.iter_mut() {
+            iovecs.push(libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            });
+        }
+
+        let readv_e = opcode::Readv::new(fd, iovecs.as_ptr(), iovecs.len() as u32)
             .offset(offset)
             .build()
-            .user_data(0x01);
+            .user_data(0x04);
 
         unsafe {
             let mut sq = ring.submission();
-            sq.push(&read_e).map_err(|_| {
+            sq.push(&readv_e).map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "io_uring submission queue full")
             })?;
         }
@@ -157,11 +170,12 @@ impl FileHandle for IoUringFileHandle {
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
         }
+        let total_expected: usize = bufs.iter().map(|b| b.len()).sum();
         let bytes_read = res as usize;
-        if bytes_read != buf.len() {
+        if bytes_read != total_expected {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("short read: expected {}, got {}", buf.len(), bytes_read),
+                format!("short readv: expected {}, got {}", total_expected, bytes_read),
             ));
         }
         Ok(())
@@ -210,6 +224,16 @@ impl FileHandle for IoUringFileHandle {
 
     fn sync_data(&self) -> io::Result<()> {
         self.fsync_sq(false)
+    }
+
+    fn advise_random(&self) -> io::Result<()> {
+        let fd = self.file.as_raw_fd();
+        let res = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM) };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(res))
+        }
     }
 
     fn len(&self) -> io::Result<u64> {

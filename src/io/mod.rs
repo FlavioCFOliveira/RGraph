@@ -43,6 +43,18 @@ pub trait FileHandle: Send + Sync {
     /// Read exactly `buf.len()` bytes from `offset` into `buf`.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
 
+    /// Vectored read: fill each buffer slice sequentially starting at `offset`.
+    ///
+    /// The default implementation calls `read_at` for each slice in order.
+    fn readv_at(&self, bufs: &mut [&mut [u8]], offset: u64) -> io::Result<()> {
+        let mut off = offset;
+        for buf in bufs {
+            self.read_at(buf, off)?;
+            off += buf.len() as u64;
+        }
+        Ok(())
+    }
+
     /// Write `buf` to `offset`.
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
 
@@ -51,6 +63,12 @@ pub trait FileHandle: Send + Sync {
 
     /// Flush data buffers to disk (cheaper than `sync_all`).
     fn sync_data(&self) -> io::Result<()>;
+
+    /// Advise the kernel that this file will be accessed randomly,
+    /// disabling readahead.  Default is a no-op.
+    fn advise_random(&self) -> io::Result<()> {
+        Ok(())
+    }
 
     /// Current file size in bytes.
     fn len(&self) -> io::Result<u64>;

@@ -2,6 +2,7 @@ use super::{FileHandle, FileSystem};
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 /// A POSIX-based `FileSystem` implementation.
@@ -107,6 +108,26 @@ impl FileHandle for PosixFileHandle {
         Ok(())
     }
 
+    fn readv_at(&self, bufs: &mut [&mut [u8]], offset: u64) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let mut off = offset;
+        for buf in bufs {
+            let mut total = 0;
+            while total < buf.len() {
+                let n = self.file.read_at(&mut buf[total..], off + total as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short read in readv_at",
+                    ));
+                }
+                total += n;
+            }
+            off += buf.len() as u64;
+        }
+        Ok(())
+    }
+
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let mut total = 0;
@@ -129,6 +150,19 @@ impl FileHandle for PosixFileHandle {
 
     fn sync_data(&self) -> io::Result<()> {
         self.file.sync_data()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn advise_random(&self) -> io::Result<()> {
+        let fd = self.file.as_raw_fd();
+        let res = unsafe {
+            libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM)
+        };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(res))
+        }
     }
 
     fn len(&self) -> io::Result<u64> {

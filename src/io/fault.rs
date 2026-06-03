@@ -170,6 +170,10 @@ impl FaultInjectFileHandle {
 
 impl FileHandle for FaultInjectFileHandle {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.readv_at(&mut [buf], offset)
+    }
+
+    fn readv_at(&self, bufs: &mut [&mut [u8]], offset: u64) -> io::Result<()> {
         if let Some(kind) = self.maybe_fault(OpMask {
             read: true,
             ..OpMask::default()
@@ -187,7 +191,7 @@ impl FileHandle for FaultInjectFileHandle {
                 _ => {}
             }
         }
-        self.inner.read_at(buf, offset)
+        self.inner.readv_at(bufs, offset)
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
@@ -217,6 +221,10 @@ impl FileHandle for FaultInjectFileHandle {
             }
         }
         self.inner.write_at(buf_to_write, offset)
+    }
+
+    fn advise_random(&self) -> io::Result<()> {
+        self.inner.advise_random()
     }
 
     fn sync_all(&self) -> io::Result<()> {

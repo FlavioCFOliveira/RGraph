@@ -276,11 +276,77 @@ impl BufferPool {
             }
         }
 
+        // Sequential readahead: if the per-thread tracker signals a prefetch,
+        // load the next batch of pages into free frames.
+        if let Some(prefetch_start) = crate::buffer::readahead::track_access(page_id) {
+            let _ = self.prefetch_range(fs, prefetch_start, crate::buffer::readahead::MAX_PREFETCH_PAGES as u32);
+        }
+
         Ok(PageGuard {
             pool: self,
             frame_id: fid,
             page_id,
         })
+    }
+
+    /// Prefetch a contiguous range of pages into free frames.
+    ///
+    /// This is best-effort: if free frames run out, or a page is already
+    /// resident, the method simply skips the remaining pages.
+    pub fn prefetch_range(
+        &self,
+        fs: &dyn FileSystem,
+        start_page: PageId,
+        count: u32,
+    ) -> std::io::Result<()> {
+        let mut bufs: Vec<&mut [u8]> = Vec::with_capacity(count as usize);
+        let mut frames_to_fill: Vec<(FrameId, PageId)> = Vec::with_capacity(count as usize);
+
+        for i in 0..count {
+            let page_id = start_page + i as u64;
+            let shard_idx = Self::shard_index(page_id);
+            {
+                let shard = self.shards[shard_idx].lock().unwrap();
+                if shard.contains_key(&page_id) {
+                    continue; // already resident
+                }
+            }
+            match self.find_free_frame(fs) {
+                Ok(fid) => {
+                    let frame = self.frame(fid);
+                    // SAFETY: we have exclusive access to this free frame.
+                    let buf = unsafe { &mut (&mut (*self.frames.get()))[fid as usize].buf };
+                    bufs.push(&mut buf[..]);
+                    frames_to_fill.push((fid, page_id));
+                }
+                Err(_) => break, // no free frames available
+            }
+        }
+
+        if bufs.is_empty() {
+            return Ok(());
+        }
+
+        // Issue a single vectored read for all buffers.
+        let offset = start_page * PAGE_SIZE as u64;
+        let handle = fs.open(&self.data_path, false)?;
+        handle.readv_at(&mut bufs, offset)?;
+
+        // Update descriptors and insert into page table.
+        for (fid, page_id) in frames_to_fill {
+            let frame = self.frame(fid);
+            frame.desc.reset();
+            frame.desc.page_id.store(page_id, Ordering::Relaxed);
+            frame.desc.state.store(FrameState::Clean as u8, Ordering::Relaxed);
+            frame.desc.pin_count.store(0, Ordering::Relaxed);
+            frame.desc.clock_ref.store(false, Ordering::Relaxed);
+
+            let shard_idx = Self::shard_index(page_id);
+            let mut shard = self.shards[shard_idx].lock().unwrap();
+            shard.entry(page_id).or_insert(fid);
+        }
+
+        Ok(())
     }
 
     /// Unpin a frame (called automatically by [`PageGuard::drop`]).
@@ -616,6 +682,52 @@ mod tests {
         // Verify basic operations still work.
         let guard = pool2.fix_page(&fs, 1).unwrap();
         assert_eq!(guard.desc().pin_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn readahead_prefetches_sequential_pages() {
+        let (_dir, fs, pool) = temp_pool(64);
+        // Pre-write pages 10, 11, 12, 13 to disk.
+        let handle = fs.open(&pool.data_path, false).unwrap();
+        for pid in 10..=13 {
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            buf[0] = pid as u8;
+            handle.write_at(&buf, pid * PAGE_SIZE as u64).unwrap();
+        }
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        // Access pages 10, 11, 12 sequentially to trigger readahead.
+        let _g10 = pool.fix_page(&fs, 10).unwrap();
+        let _g11 = pool.fix_page(&fs, 11).unwrap();
+        let _g12 = pool.fix_page(&fs, 12).unwrap();
+
+        // After the third access, readahead should have prefetched page 13.
+        let shard_idx = BufferPool::shard_index(13);
+        let shard = pool.shards[shard_idx].lock().unwrap();
+        assert!(shard.contains_key(&13), "page 13 should have been prefetched");
+    }
+
+    #[test]
+    fn random_access_does_not_prefetch() {
+        let (_dir, fs, pool) = temp_pool(64);
+        // Pre-write pages 100 and 200.
+        let handle = fs.open(&pool.data_path, false).unwrap();
+        for pid in [100u64, 200] {
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            buf[0] = pid as u8;
+            handle.write_at(&buf, pid * PAGE_SIZE as u64).unwrap();
+        }
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        // Access random pages — should not trigger prefetch.
+        let _g100 = pool.fix_page(&fs, 100).unwrap();
+        let _g200 = pool.fix_page(&fs, 200).unwrap();
+
+        let shard_idx = BufferPool::shard_index(101);
+        let shard = pool.shards[shard_idx].lock().unwrap();
+        assert!(!shard.contains_key(&101), "page 101 should NOT be prefetched after random access");
     }
 
     #[test]
