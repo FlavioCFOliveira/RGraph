@@ -13,6 +13,7 @@ pub mod tck;
 pub mod acid;
 pub mod server;
 pub mod telemetry;
+pub mod config;
 
 // Re-export the top-level error types at crate root for ergonomic use.
 pub use error::{RGraphError, Result};
