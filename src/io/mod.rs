@@ -7,7 +7,10 @@ pub mod posix;
 #[cfg(target_os = "linux")]
 pub mod uring;
 
+pub mod fault;
+
 pub use aligned_buffer::AlignedBuffer;
+pub use fault::{DeterministicIoUring, FaultConfig, FaultInjectFileSystem, FaultKind, FaultRule, OpMask};
 
 /// A portable abstraction over file-system operations.
 ///

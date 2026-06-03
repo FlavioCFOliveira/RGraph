@@ -182,8 +182,15 @@ mod tests {
         let reader_flags = SsiFlags::new();
         let writer_flags = SsiFlags::new();
 
+        // Single rw-antidependency: reader gets out_conflict, writer gets in_conflict.
+        // Neither is doomed yet because each only holds one of the two flags.
         tracker.record_rw_antidependency(1, 2, &reader_flags, &writer_flags);
+        assert!(!tracker.is_doomed(1, &reader_flags));
+        assert!(!tracker.is_doomed(2, &writer_flags));
 
+        // A second antidependency in the reverse direction gives both transactions
+        // both flags, dooming them.
+        tracker.record_rw_antidependency(2, 1, &writer_flags, &reader_flags);
         assert!(tracker.is_doomed(1, &reader_flags));
         assert!(tracker.is_doomed(2, &writer_flags));
     }

@@ -68,9 +68,26 @@ impl ProtocolMultiplexer {
 }
 
 /// A connection stream that is either plaintext TCP or TLS-wrapped TCP.
-pub enum ServerStream {
+///
+/// Holds an [`OwnedSemaphorePermit`] so that the connection slot is released
+/// only when the stream is dropped.
+pub struct ServerStream {
+    inner: ServerStreamInner,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+enum ServerStreamInner {
     Plain(TcpStream),
     Tls(TlsStream<TcpStream>),
+}
+
+impl ServerStream {
+    fn new(inner: ServerStreamInner, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            inner,
+            _permit: Some(permit),
+        }
+    }
 }
 
 impl AsyncRead for ServerStream {
@@ -79,9 +96,9 @@ impl AsyncRead for ServerStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            ServerStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            ServerStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        match &mut self.get_mut().inner {
+            ServerStreamInner::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            ServerStreamInner::Tls(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -92,16 +109,16 @@ impl AsyncWrite for ServerStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
-        match self.get_mut() {
-            ServerStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            ServerStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        match &mut self.get_mut().inner {
+            ServerStreamInner::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            ServerStreamInner::Tls(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        match self.get_mut() {
-            ServerStream::Plain(s) => Pin::new(s).poll_flush(cx),
-            ServerStream::Tls(s) => Pin::new(s).poll_flush(cx),
+        match &mut self.get_mut().inner {
+            ServerStreamInner::Plain(s) => Pin::new(s).poll_flush(cx),
+            ServerStreamInner::Tls(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -109,9 +126,9 @@ impl AsyncWrite for ServerStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        match self.get_mut() {
-            ServerStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            ServerStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        match &mut self.get_mut().inner {
+            ServerStreamInner::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            ServerStreamInner::Tls(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -194,23 +211,21 @@ impl ConnectionAcceptor {
         let protocol = ProtocolMultiplexer::detect(&mut stream).await?;
 
         // Perform TLS handshake if configured.
-        let stream = if let Some(ref acceptor) = self.tls_acceptor {
+        let inner = if let Some(ref acceptor) = self.tls_acceptor {
             match acceptor.accept(stream).await {
-                Ok(tls_stream) => ServerStream::Tls(tls_stream),
+                Ok(tls_stream) => ServerStreamInner::Tls(tls_stream),
                 Err(e) => {
                     warn!("TLS handshake failed for {}: {}", peer, e);
                     return Ok(None);
                 }
             }
         } else {
-            ServerStream::Plain(stream)
+            ServerStreamInner::Plain(stream)
         };
 
-        // The permit is intentionally leaked into the returned stream so the
-        // slot is held for the lifetime of the connection.  In production we
-        // would wrap the stream in a drop-guard, but for Sprint 23 this is
-        // sufficient to enforce the limit.
-        let _ = permit;
+        // The permit is moved into the stream so the connection slot is held
+        // for the lifetime of the stream and released on drop.
+        let stream = ServerStream::new(inner, permit);
         Ok(Some((protocol, stream)))
     }
 
@@ -297,16 +312,31 @@ mod tests {
             .unwrap();
         let port = acceptor.local_port;
 
-        // Hold the only connection slot by never dropping the stream.
-        let _first = acceptor.accept().await;
-        // With no client connecting, accept() blocks.  Spawn a client.
+        // Spawn a client so the first accept can complete.
         tokio::spawn(async move {
             let _ = TcpStream::connect(format!("127.0.0.1:{port}")).await;
         });
 
-        // The second accept should eventually succeed because the first
-        // accept hasn't completed yet.  In practice we verify the semaphore
-        // state directly.
-        assert_eq!(acceptor.connection_limit.available_permits(), 1);
+        // Accept the first connection and hold the only slot.
+        let _first = acceptor.accept().await.unwrap();
+
+        // The semaphore should now have zero available permits.
+        assert_eq!(acceptor.connection_limit.available_permits(), 0);
+
+        // Spawn a second client; the acceptor should not be able to acquire.
+        tokio::spawn(async move {
+            let _ = TcpStream::connect(format!("127.0.0.1:{port}")).await;
+        });
+
+        // Second accept should time out because the semaphore is exhausted.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            acceptor.accept(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "second accept should block on exhausted semaphore"
+        );
     }
 }
