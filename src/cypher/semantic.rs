@@ -55,20 +55,52 @@ pub fn analyse(stmt: &Statement) -> Result<Scope, SemanticError> {
                     });
                 }
                 check_expression_variables(&w.predicate, &scope)?;
+                if contains_aggregate(&w.predicate) {
+                    return Err(SemanticError {
+                        message: "aggregate functions cannot be used in WHERE".to_string(),
+                    });
+                }
             }
             Clause::Return(r) => {
                 // RETURN-only queries (e.g. "RETURN 1+2") are valid in openCypher.
                 // They operate on an empty scope, so any variable references will
                 // be caught by check_expression_variables.
                 has_scope = true;
+
+                // Detect implicit grouping: if any projection contains an aggregate,
+                // non-aggregated expressions become grouping keys and must not contain
+                // nested aggregates.
+                let has_aggregates = r.projections.iter().any(|p| contains_aggregate(&p.expression));
+
                 for proj in &r.projections {
                     check_expression_variables(&proj.expression, &scope)?;
+                    if has_aggregates && !is_aggregate_expression(&proj.expression) {
+                        // Grouping key must be a simple variable or property access.
+                        if !is_valid_grouping_key(&proj.expression) {
+                            return Err(SemanticError {
+                                message: format!(
+                                    "'{}' must be an aggregate expression or a grouping key",
+                                    proj.expression
+                                ),
+                            });
+                        }
+                    }
                     if let Some(alias) = &proj.alias {
                         scope.variables.insert(alias.clone());
                     }
                 }
                 for item in &r.order_by {
                     check_expression_variables(&item.expression, &scope)?;
+                    if has_aggregates && !is_aggregate_expression(&item.expression)
+                        && !is_valid_grouping_key(&item.expression)
+                    {
+                        return Err(SemanticError {
+                            message: format!(
+                                "'{}' in ORDER BY must be an aggregate expression or a grouping key",
+                                item.expression
+                            ),
+                        });
+                    }
                 }
             }
             Clause::Create(c) => {
@@ -173,6 +205,56 @@ fn check_expression_variables(
     Ok(())
 }
 
+/// Return `true` if the expression is an aggregate function call.
+fn is_aggregate_expression(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::FunctionCall { name, .. }
+            if is_aggregate_function_name(name)
+    )
+}
+
+/// Return `true` if `name` is a known aggregate function.
+fn is_aggregate_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "COUNT" | "COLLECT" | "SUM" | "AVG" | "MIN" | "MAX"
+    )
+}
+
+/// Return `true` if `expr` contains any aggregate function call anywhere.
+fn contains_aggregate(expr: &Expression) -> bool {
+    match expr {
+        Expression::FunctionCall { name, args, .. } => {
+            if is_aggregate_function_name(name) {
+                return true;
+            }
+            args.iter().any(contains_aggregate)
+        }
+        Expression::BinaryOp { left, right, .. } => {
+            contains_aggregate(left) || contains_aggregate(right)
+        }
+        Expression::Comparison { left, right, .. } => {
+            contains_aggregate(left) || contains_aggregate(right)
+        }
+        Expression::UnaryOp { expr, .. } => contains_aggregate(expr),
+        Expression::PropertyAccess { base, .. } => contains_aggregate(base),
+        Expression::List(items) => items.iter().any(contains_aggregate),
+        Expression::Map(entries) => entries.iter().any(|(_, v)| contains_aggregate(v)),
+        Expression::IsNull(e) | Expression::IsNotNull(e) => contains_aggregate(e),
+        _ => false,
+    }
+}
+
+/// A valid implicit grouping key is a simple variable or property access.
+fn is_valid_grouping_key(expr: &Expression) -> bool {
+    match expr {
+        Expression::Variable(_) => true,
+        Expression::PropertyAccess { base, .. } => matches!(base.as_ref(), Expression::Variable(_)),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +310,28 @@ mod tests {
         let stmt = parse("CREATE (n:Person {name: 'Alice'}) RETURN n").unwrap();
         let scope = analyse(&stmt).unwrap();
         assert!(scope.variables.contains("n"));
+    }
+
+    #[test]
+    fn analyse_aggregate_in_where_is_error() {
+        let stmt = parse("MATCH (n) WHERE count(n) > 1 RETURN n").unwrap();
+        let err = analyse(&stmt).unwrap_err();
+        assert!(err.message.contains("aggregate functions cannot be used in WHERE"));
+    }
+
+    #[test]
+    fn analyse_mixed_aggregate_and_non_aggregate() {
+        let stmt = parse("MATCH (n) RETURN n.dept, count(*)").unwrap();
+        let scope = analyse(&stmt).unwrap();
+        // count(*) has no alias, so the scope does not gain a new variable.
+        // The query itself is valid (implicit grouping by n.dept).
+        assert!(scope.variables.contains("n"));
+    }
+
+    #[test]
+    fn analyse_invalid_grouping_key() {
+        let stmt = parse("MATCH (n) RETURN n.dept + 1, count(*)").unwrap();
+        let err = analyse(&stmt).unwrap_err();
+        assert!(err.message.contains("must be an aggregate expression or a grouping key"));
     }
 }
