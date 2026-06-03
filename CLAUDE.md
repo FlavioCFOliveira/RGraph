@@ -132,6 +132,8 @@ Todas as interações no projeto devem ser baseadas **EXCLUSIVAMENTE** nos conhe
 
 Quando a informação que tens não é suficiente, deves procurar as respostas na internet em fontes oficiais ou autoritativas, papers, livros ou autores da especialidade a fim de determinar qual o melhor resultado.
 
+Usa o **Knowledge Graph** (KG) como fonte de informação primária — tanto como forma de consulta, como como forma de guardar as relações que fores descobrindo.
+
 ---
 
 ## Medir para Decidir
