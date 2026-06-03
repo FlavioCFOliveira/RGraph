@@ -36,21 +36,22 @@ impl PageManager {
     pub const CACHE_BATCH: usize = 64;
 
     /// Initialise a brand-new page manager and open the data file.
-    /// The file is pre-extended to two pages and `sync_all` is issued.
+    /// The file is pre-extended to three pages and `sync_all` is issued.
     pub fn init(data_path: PathBuf, page_size: u32, fs: &dyn FileSystem) -> io::Result<Self> {
         let mut sb = Superblock::new(page_size);
-        sb.total_page_count = 2; // page 0 = superblock, page 1 = bitmap
+        sb.total_page_count = 3; // page 0 = superblock primary, page 1 = superblock mirror, page 2 = bitmap
         sb.free_page_count = 0;
-        sb.next_free_page_id = 2;
+        sb.next_free_page_id = 3;
         sb.update_checksum();
 
-        let mut bitmap = BitmapPage::new(1);
-        bitmap.allocate(0); // superblock
-        bitmap.allocate(1); // bitmap page
+        let mut bitmap = BitmapPage::new(2);
+        bitmap.allocate(0); // superblock primary
+        bitmap.allocate(1); // superblock mirror
+        bitmap.allocate(2); // bitmap page
         bitmap.page.update_checksum();
 
         let handle = fs.open(&data_path, true)?;
-        let required_len = (2 * PAGE_SIZE) as u64;
+        let required_len = (3 * PAGE_SIZE) as u64;
         let current_len = handle.len().unwrap_or(0);
         if current_len < required_len {
             handle.set_len(required_len)?;
@@ -210,9 +211,9 @@ mod tests {
         pm.sync_bitmap(&fs).unwrap();
 
         let pid = pm.allocate_page();
-        assert_eq!(pid, 2);
+        assert_eq!(pid, 3);
         let pid2 = pm.allocate_page();
-        assert_eq!(pid2, 3);
+        assert_eq!(pid2, 4);
     }
 
     #[test]

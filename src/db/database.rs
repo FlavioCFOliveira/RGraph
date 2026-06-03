@@ -36,12 +36,7 @@ impl Database {
         }
 
         let data_path = path.join(PageManager::DATA_FILE);
-        let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32)?;
-
-        // Pre-extend the data file to two pages (superblock + bitmap).
-        let handle = fs.open(&data_path, true)?;
-        handle.set_len((2 * PAGE_SIZE) as u64)?;
-        handle.sync_data()?;
+        let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32, fs)?;
 
         // Write superblock (both copies).
         pm.sync_superblock(fs)?;
@@ -49,9 +44,10 @@ impl Database {
         // Write bitmap page.
         pm.sync_bitmap(fs)?;
 
-        // Initialise WAL.
+        // Initialise WAL with a buffered filesystem (WAL does not use O_DIRECT).
         let wal_dir = path.join("wal");
-        let wal_writer = WalWriter::open(wal_dir, fs)?;
+        let wal_fs = crate::io::posix::PosixFileSystem::new(false);
+        let wal_writer = WalWriter::open(wal_dir, &wal_fs)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -116,16 +112,17 @@ impl Database {
 
         // Read bitmap page.
         let mut bitmap_buf = AlignedBuffer::zeroed(PAGE_SIZE);
-        handle.read_at(&mut bitmap_buf, PAGE_SIZE as u64)?;
+        handle.read_at(&mut bitmap_buf, (2 * PAGE_SIZE) as u64)?;
 
-        let mut pm = PageManager::open(data_path.clone(), sb, bitmap_buf)?;
+        let mut pm = PageManager::open(data_path.clone(), sb, bitmap_buf, fs)?;
 
-        // Recover WAL.
+        // Recover WAL using a buffered filesystem (WAL does not use O_DIRECT).
         let wal_dir = path.join("wal");
         let wal_path = wal_dir.join("wal-000000000");
+        let wal_fs = crate::io::posix::PosixFileSystem::new(false);
         let start_lsn = pm.superblock.last_checkpoint_lsn;
         if let Some(last_lsn) = recover(
-            fs,
+            &wal_fs,
             &wal_path,
             start_lsn,
             |pid, img, lsn| simple_page_replay(fs, &data_path, pid, img, lsn),
@@ -134,7 +131,7 @@ impl Database {
             pm.sync_superblock(fs)?;
         }
 
-        let wal_writer = WalWriter::open(wal_dir, fs)?;
+        let wal_writer = WalWriter::open(wal_dir, &wal_fs)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -157,12 +154,12 @@ mod tests {
 
         {
             let db = Database::init(&db_path, &fs).unwrap();
-            assert_eq!(db.page_manager.superblock.total_page_count, 2);
+            assert_eq!(db.page_manager.superblock.total_page_count, 3);
         }
 
         {
             let db = Database::open(&db_path, &fs).unwrap();
-            assert_eq!(db.page_manager.superblock.total_page_count, 2);
+            assert_eq!(db.page_manager.superblock.total_page_count, 3);
         }
     }
 
@@ -177,5 +174,99 @@ mod tests {
 
         let err = Database::open(&db_path, &fs).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn corrupt_primary_superblock_recover_from_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let db_path = dir.path().join("db");
+
+        {
+            let db = Database::init(&db_path, &fs).unwrap();
+            assert_eq!(db.page_manager.superblock.total_page_count, 3);
+            drop(db);
+        }
+
+        // Corrupt the primary superblock (offset 0).
+        let data_path = db_path.join(PageManager::DATA_FILE);
+        let handle = fs.open(&data_path, true).unwrap();
+        let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut buf, 0).unwrap();
+        buf[20] ^= 0xFF;
+        handle.write_at(&buf, 0).unwrap();
+        handle.sync_all().unwrap();
+        drop(handle);
+
+        // Open should recover from the mirror copy.
+        let db = Database::open(&db_path, &fs).unwrap();
+        assert_eq!(db.page_manager.superblock.total_page_count, 3);
+    }
+
+    #[test]
+    fn corrupt_mirror_superblock_recover_from_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let db_path = dir.path().join("db");
+
+        {
+            let db = Database::init(&db_path, &fs).unwrap();
+            drop(db);
+        }
+
+        // Corrupt the mirror superblock (offset PAGE_SIZE).
+        let data_path = db_path.join(PageManager::DATA_FILE);
+        let handle = fs.open(&data_path, true).unwrap();
+        let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut buf, PAGE_SIZE as u64).unwrap();
+        buf[20] ^= 0xFF;
+        handle.write_at(&buf, PAGE_SIZE as u64).unwrap();
+        handle.sync_all().unwrap();
+        drop(handle);
+
+        // Open should recover from the primary copy.
+        let db = Database::open(&db_path, &fs).unwrap();
+        assert_eq!(db.page_manager.superblock.total_page_count, 3);
+    }
+
+    #[test]
+    fn crash_mid_superblock_write_recovers_last_good_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let db_path = dir.path().join("db");
+
+        {
+            let db = Database::init(&db_path, &fs).unwrap();
+            drop(db);
+        }
+
+        let data_path = db_path.join(PageManager::DATA_FILE);
+        let handle = fs.open(&data_path, true).unwrap();
+
+        // Read the current mirror superblock to get the last good generation.
+        let mut mirror_buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut mirror_buf, PAGE_SIZE as u64).unwrap();
+        let sb_mirror = decode_superblock(&mirror_buf).unwrap();
+        let old_generation = sb_mirror.generation;
+
+        // Simulate a torn write: write a newer generation to primary, then corrupt it.
+        let mut primary_buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut primary_buf, 0).unwrap();
+        let mut sb = decode_superblock(&primary_buf).unwrap();
+        sb.generation += 1;
+        sb.update_checksum();
+        let encoded = crate::storage::meta::encode_superblock(&sb);
+        primary_buf[..encoded.len()].copy_from_slice(&encoded);
+        primary_buf[30] ^= 0xFF; // corrupt the primary
+        handle.write_at(&primary_buf, 0).unwrap();
+
+        // Mirror remains with the old generation.
+        handle.write_at(&mirror_buf, PAGE_SIZE as u64).unwrap();
+        handle.sync_all().unwrap();
+        drop(handle);
+
+        // Open should recover from the mirror with the last good generation.
+        let db = Database::open(&db_path, &fs).unwrap();
+        assert_eq!(db.page_manager.superblock.generation, old_generation);
     }
 }

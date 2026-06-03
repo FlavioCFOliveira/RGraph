@@ -159,21 +159,17 @@ pub struct GraphStorageEngine {
 impl GraphStorageEngine {
     /// Initialise a brand-new graph storage engine.
     pub fn init(data_path: PathBuf, fs: &dyn FileSystem) -> io::Result<Self> {
-        let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32)?;
-
-        // Pre-extend the data file to two pages (superblock + bitmap).
-        let handle = fs.open(&data_path, true)?;
-        handle.set_len((2 * PAGE_SIZE) as u64)?;
-        handle.sync_data()?;
+        let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32, fs)?;
 
         // Write superblock (both copies).
         pm.sync_superblock(fs)?;
         // Write bitmap page.
         pm.sync_bitmap(fs)?;
 
-        // Initialise WAL.
+        // Initialise WAL with a buffered filesystem (WAL does not use O_DIRECT).
         let wal_dir = data_path.parent().unwrap().join("wal");
-        let wal_writer = WalWriter::open(wal_dir, fs)?;
+        let wal_fs = crate::io::posix::PosixFileSystem::new(false);
+        let wal_writer = WalWriter::open(wal_dir, &wal_fs)?;
 
         let config = BPlusTreeConfig::default();
         Ok(Self {
@@ -206,27 +202,40 @@ impl GraphStorageEngine {
         handle.read_at(&mut primary, 0)?;
         handle.read_at(&mut mirror, PAGE_SIZE as u64)?;
 
-        let sb_primary = decode_superblock(&primary
-        ).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid primary superblock"))?;
+        let sb_primary = decode_superblock(&primary);
         let sb_mirror = decode_superblock(&mirror);
 
-        let sb = match sb_mirror {
-            Some(m) if m.generation > sb_primary.generation => m,
-            _ => sb_primary,
+        let sb = match (sb_primary, sb_mirror) {
+            (Some(p), Some(m)) => {
+                if m.generation > p.generation {
+                    m
+                } else {
+                    p
+                }
+            }
+            (Some(p), None) => p,
+            (None, Some(m)) => m,
+            (None, None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "both superblock copies invalid",
+                ));
+            }
         };
 
         // Read bitmap page.
         let mut bitmap_buf = AlignedBuffer::zeroed(PAGE_SIZE);
-        handle.read_at(&mut bitmap_buf, PAGE_SIZE as u64)?;
+        handle.read_at(&mut bitmap_buf, (2 * PAGE_SIZE) as u64)?;
 
-        let mut pm = PageManager::open(data_path.clone(), sb, bitmap_buf)?;
+        let mut pm = PageManager::open(data_path.clone(), sb, bitmap_buf, fs)?;
 
-        // Recover WAL.
+        // Recover WAL using a buffered filesystem (WAL does not use O_DIRECT).
         let wal_dir = data_path.parent().unwrap().join("wal");
         let wal_path = wal_dir.join("wal-000000000");
+        let wal_fs = crate::io::posix::PosixFileSystem::new(false);
         let start_lsn = pm.superblock.last_checkpoint_lsn;
         if let Some(last_lsn) = recover(
-            fs,
+            &wal_fs,
             &wal_path,
             start_lsn,
             |pid, img, lsn| simple_page_replay(fs, &data_path, pid, img, lsn),
@@ -235,7 +244,7 @@ impl GraphStorageEngine {
             pm.sync_superblock(fs)?;
         }
 
-        let wal_writer = WalWriter::open(wal_dir, fs)?;
+        let wal_writer = WalWriter::open(wal_dir, &wal_fs)?;
 
         let config = BPlusTreeConfig::default();
         let mut engine = Self {
@@ -419,8 +428,8 @@ impl GraphStorageEngine {
         fs: &dyn FileSystem,
     ) -> Result<(), StorageError> {
         self.wal_writer.sync(fs)?;
-        // Write superblock first (both copies), then overwrite the mirror
-        // copy (page 1) with the bitmap page.
+        // Write superblock (both copies at pages 0 and 1), then write the
+        // bitmap page (page 2).
         self.page_manager.sync_superblock(fs)?;
         self.page_manager.sync_bitmap(fs)?;
         Ok(())
@@ -845,7 +854,7 @@ mod tests {
         }
         {
             let engine = GraphStorageEngine::open(path, &fs).unwrap();
-            assert_eq!(engine.page_manager.superblock.total_page_count, 2);
+            assert_eq!(engine.page_manager.superblock.total_page_count, 3);
         }
     }
 
@@ -1090,5 +1099,89 @@ mod tests {
         let type_key2 = type_index_key(2, 101);
         assert!(recovered.type_index.search(&type_key1).is_some(), "type index for edge 100 should be rebuilt");
         assert!(recovered.type_index.search(&type_key2).is_some(), "type index for edge 101 should be rebuilt");
+    }
+
+    #[test]
+    fn corrupt_primary_superblock_recover_from_mirror() {
+        let (_dir, fs, path) = temp_fs();
+        {
+            let mut engine = GraphStorageEngine::init(path.clone(), &fs).unwrap();
+            engine.sync(&fs).unwrap();
+            drop(engine);
+        }
+
+        // Corrupt the primary superblock (offset 0).
+        let handle = fs.open(&path, true).unwrap();
+        let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut buf, 0).unwrap();
+        buf[20] ^= 0xFF;
+        handle.write_at(&buf, 0).unwrap();
+        handle.sync_all().unwrap();
+        drop(handle);
+
+        // Open should recover from the mirror copy.
+        let engine = GraphStorageEngine::open(path, &fs).unwrap();
+        assert_eq!(engine.page_manager.superblock.total_page_count, 3);
+    }
+
+    #[test]
+    fn corrupt_mirror_superblock_recover_from_primary() {
+        let (_dir, fs, path) = temp_fs();
+        {
+            let mut engine = GraphStorageEngine::init(path.clone(), &fs).unwrap();
+            engine.sync(&fs).unwrap();
+            drop(engine);
+        }
+
+        // Corrupt the mirror superblock (offset PAGE_SIZE).
+        let handle = fs.open(&path, true).unwrap();
+        let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut buf, PAGE_SIZE as u64).unwrap();
+        buf[20] ^= 0xFF;
+        handle.write_at(&buf, PAGE_SIZE as u64).unwrap();
+        handle.sync_all().unwrap();
+        drop(handle);
+
+        // Open should recover from the primary copy.
+        let engine = GraphStorageEngine::open(path, &fs).unwrap();
+        assert_eq!(engine.page_manager.superblock.total_page_count, 3);
+    }
+
+    #[test]
+    fn crash_mid_superblock_write_recovers_last_good_generation() {
+        let (_dir, fs, path) = temp_fs();
+        {
+            let mut engine = GraphStorageEngine::init(path.clone(), &fs).unwrap();
+            engine.sync(&fs).unwrap();
+            drop(engine);
+        }
+
+        let handle = fs.open(&path, true).unwrap();
+
+        // Read the current mirror superblock to get the last good generation.
+        let mut mirror_buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut mirror_buf, PAGE_SIZE as u64).unwrap();
+        let sb_mirror = decode_superblock(&mirror_buf).unwrap();
+        let old_generation = sb_mirror.generation;
+
+        // Simulate a torn write: write a newer generation to primary, then corrupt it.
+        let mut primary_buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut primary_buf, 0).unwrap();
+        let mut sb = decode_superblock(&primary_buf).unwrap();
+        sb.generation += 1;
+        sb.update_checksum();
+        let encoded = crate::storage::meta::encode_superblock(&sb);
+        primary_buf[..encoded.len()].copy_from_slice(&encoded);
+        primary_buf[30] ^= 0xFF; // corrupt the primary
+        handle.write_at(&primary_buf, 0).unwrap();
+
+        // Mirror remains with the old generation.
+        handle.write_at(&mirror_buf, PAGE_SIZE as u64).unwrap();
+        handle.sync_all().unwrap();
+        drop(handle);
+
+        // Open should recover from the mirror with the last good generation.
+        let engine = GraphStorageEngine::open(path, &fs).unwrap();
+        assert_eq!(engine.page_manager.superblock.generation, old_generation);
     }
 }

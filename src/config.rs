@@ -72,6 +72,9 @@ pub struct Config {
 
     /// Enable TCK strict mode (extra validation, no extensions).
     pub tck_mode: bool,
+
+    /// Enable O_DIRECT for data file I/O.
+    pub use_odirect: bool,
 }
 
 impl Default for Config {
@@ -87,6 +90,7 @@ impl Default for Config {
             default_page_size: 4096,
             enable_compression: true,
             tck_mode: false,
+            use_odirect: false,
         }
     }
 }
@@ -148,6 +152,9 @@ impl Config {
                 }
                 "tck_mode" => {
                     cfg.tck_mode = parse_bool(value)?;
+                }
+                "use_odirect" => {
+                    cfg.use_odirect = parse_bool(value)?;
                 }
                 _ => {
                     return Err(RGraphError::Argument(format!(
@@ -214,6 +221,11 @@ impl Config {
                 self.tck_mode = b;
             }
         }
+        if let Ok(v) = std::env::var(format!("{}USE_ODIRECT", prefix)) {
+            if let Ok(b) = v.parse() {
+                self.use_odirect = b;
+            }
+        }
     }
 }
 
@@ -271,6 +283,7 @@ pub struct GraphBuilder {
     default_page_size: Option<usize>,
     enable_compression: Option<bool>,
     tck_mode: Option<bool>,
+    use_odirect: Option<bool>,
     env_prefix: Option<String>,
     config_file: Option<PathBuf>,
 }
@@ -341,6 +354,12 @@ impl GraphBuilder {
         self
     }
 
+    /// Enable or disable O_DIRECT for data file I/O.
+    pub fn use_odirect(mut self, enabled: bool) -> Self {
+        self.use_odirect = Some(enabled);
+        self
+    }
+
     /// Load configuration from a TOML file before applying builder overrides.
     ///
     /// The file is read at `build()` time, not immediately.
@@ -389,6 +408,7 @@ impl GraphBuilder {
         if let Some(v) = self.default_page_size { cfg.default_page_size = v; }
         if let Some(v) = self.enable_compression { cfg.enable_compression = v; }
         if let Some(v) = self.tck_mode { cfg.tck_mode = v; }
+        if let Some(v) = self.use_odirect { cfg.use_odirect = v; }
 
         Self::validate(cfg)
     }
@@ -399,7 +419,7 @@ impl GraphBuilder {
     /// does not yet exist it is initialised; otherwise it is opened.
     pub fn build(self) -> Result<crate::db::database::Database> {
         let cfg = self.config()?;
-        let fs = crate::io::posix::PosixFileSystem::new(false);
+        let fs = crate::io::posix::PosixFileSystem::new(cfg.use_odirect);
         if cfg.database_path.exists() {
             crate::db::database::Database::open(&cfg.database_path, &fs)
                 .map_err(|e| RGraphError::Io(format!("failed to open database: {}", e)))
