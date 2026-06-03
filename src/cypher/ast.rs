@@ -31,6 +31,7 @@ pub enum Clause {
     Delete(DeleteClause),
     Set(SetClause),
     Remove(RemoveClause),
+    Merge(MergeClause),
 }
 
 impl Clause {
@@ -44,6 +45,7 @@ impl Clause {
             Clause::Delete(c) => c.span,
             Clause::Set(c) => c.span,
             Clause::Remove(c) => c.span,
+            Clause::Merge(c) => c.span,
         }
     }
 }
@@ -105,6 +107,15 @@ pub enum SetItem {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoveClause {
     pub items: Vec<RemoveItem>,
+    pub span: Option<TextRange>,
+}
+
+/// `MERGE (pattern)` clause with optional ON CREATE / ON MATCH actions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeClause {
+    pub pattern: Pattern,
+    pub on_create: Vec<SetItem>,
+    pub on_match: Vec<SetItem>,
     pub span: Option<TextRange>,
 }
 
@@ -392,6 +403,18 @@ impl std::fmt::Display for Clause {
                 write!(f, "REMOVE ")?;
                 let items: Vec<String> = r.items.iter().map(|i| i.to_string()).collect();
                 write!(f, "{}", items.join(", "))
+            }
+            Clause::Merge(m) => {
+                write!(f, "MERGE {}", m.pattern)?;
+                if !m.on_create.is_empty() {
+                    let items: Vec<String> = m.on_create.iter().map(|i| i.to_string()).collect();
+                    write!(f, " ON CREATE SET {}", items.join(", "))?;
+                }
+                if !m.on_match.is_empty() {
+                    let items: Vec<String> = m.on_match.iter().map(|i| i.to_string()).collect();
+                    write!(f, " ON MATCH SET {}", items.join(", "))?;
+                }
+                Ok(())
             }
         }
     }

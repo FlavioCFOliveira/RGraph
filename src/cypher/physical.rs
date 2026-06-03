@@ -590,6 +590,48 @@ impl PhysicalOperator for RemoveOp {
     }
 }
 
+/// MERGE pattern with ON CREATE / ON MATCH actions.
+pub struct MergeOp {
+    pattern: crate::cypher::ast::Pattern,
+    on_create: Vec<SetItem>,
+    on_match: Vec<SetItem>,
+    input: Box<dyn PhysicalOperator>,
+}
+
+impl MergeOp {
+    pub fn new(
+        pattern: crate::cypher::ast::Pattern,
+        on_create: Vec<SetItem>,
+        on_match: Vec<SetItem>,
+        input: Box<dyn PhysicalOperator>,
+    ) -> Self {
+        Self { pattern, on_create, on_match, input }
+    }
+}
+
+impl PhysicalOperator for MergeOp {
+    fn next_row(
+        &mut self,
+        _ctx: &ExecutionContext,
+    ) -> Result<Option<Row>, ExecError> {
+        // Stub: consume input and return a placeholder row.
+        while self.input.next_row(_ctx)?.is_some() {}
+        let mut row = empty_row();
+        for elem in &self.pattern.elements {
+            if let crate::cypher::ast::PatternElement::Node(n) = elem {
+                if let Some(v) = &n.variable {
+                    row.insert(v.clone(), Value::Null);
+                }
+            }
+        }
+        Ok(Some(row))
+    }
+
+    fn reset(&mut self) {
+        self.input.reset();
+    }
+}
+
 /// Aggregate operator with implicit grouping.
 pub struct AggregateOp {
     grouping_keys: Vec<Expression>,
@@ -895,6 +937,14 @@ fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
             let _l = build_physical_operator(left);
             let _r = build_physical_operator(right);
             Box::new(AllNodesScanOp::new()) // stub
+        }
+        LogicalOperator::Merge { pattern, on_create, on_match, .. } => {
+            Box::new(MergeOp::new(
+                pattern.clone(),
+                on_create.clone(),
+                on_match.clone(),
+                Box::new(AllNodesScanOp::new()),
+            ))
         }
     }
 }

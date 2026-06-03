@@ -97,6 +97,14 @@ pub enum LogicalOperator {
         items: Vec<RemoveItem>,
     },
 
+    /// MERGE pattern with ON CREATE / ON MATCH actions.
+    Merge {
+        input: Box<LogicalOperator>,
+        pattern: Pattern,
+        on_create: Vec<SetItem>,
+        on_match: Vec<SetItem>,
+    },
+
     /// Nested-loop apply for sub-queries (stub for Sprint 21).
     Apply {
         left: Box<LogicalOperator>,
@@ -240,6 +248,10 @@ impl LogicalOperator {
                 out.push_str(&format!("{}Remove\n", indent));
                 input.explain_inner(out, depth + 1);
             }
+            LogicalOperator::Merge { input, .. } => {
+                out.push_str(&format!("{}Merge\n", indent));
+                input.explain_inner(out, depth + 1);
+            }
             LogicalOperator::Apply { left, right } => {
                 out.push_str(&format!("{}Apply\n", indent));
                 left.explain_inner(out, depth + 1);
@@ -335,6 +347,7 @@ impl LogicalOperator {
             LogicalOperator::Delete { .. } => {}
             LogicalOperator::Set { .. } => {}
             LogicalOperator::Remove { .. } => {}
+            LogicalOperator::Merge { .. } => {}
             LogicalOperator::Apply { left, right } => {
                 vars.extend(left.output_variables());
                 vars.extend(right.output_variables());
@@ -410,6 +423,20 @@ impl LogicalOperator {
                         }
                         RemoveItem::Label { variable, .. } => {
                             vars.push(variable.clone());
+                        }
+                    }
+                }
+            }
+            LogicalOperator::Merge { pattern, .. } => {
+                for elem in &pattern.elements {
+                    if let PatternElement::Node(n) = elem {
+                        if let Some(v) = &n.variable {
+                            vars.push(v.clone());
+                        }
+                    }
+                    if let PatternElement::Relationship(r) = elem {
+                        if let Some(v) = &r.variable {
+                            vars.push(v.clone());
                         }
                     }
                 }

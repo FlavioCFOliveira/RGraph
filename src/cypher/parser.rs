@@ -288,6 +288,51 @@ impl Parser {
                     span: Some(TextRange::new(clause_start, clause_end)),
                 }))
             }
+            "MERGE" => {
+                self.skip_whitespace();
+                let pattern = self.parse_pattern()?;
+                let mut on_create = Vec::new();
+                let mut on_match = Vec::new();
+                loop {
+                    self.skip_whitespace();
+                    let start_pos = self.pos;
+                    let start_line = self.line;
+                    let start_col = self.column;
+                    let kw = self.read_keyword().to_ascii_uppercase();
+                    if kw == "ON" {
+                        self.skip_whitespace();
+                        let next_kw = self.read_keyword().to_ascii_uppercase();
+                        if next_kw == "CREATE" {
+                            self.skip_whitespace();
+                            self.expect_keyword("SET")?;
+                            self.skip_whitespace();
+                            on_create = self.parse_set_items()?;
+                        } else if next_kw == "MATCH" {
+                            self.skip_whitespace();
+                            self.expect_keyword("SET")?;
+                            self.skip_whitespace();
+                            on_match = self.parse_set_items()?;
+                        } else {
+                            self.pos = start_pos;
+                            self.line = start_line;
+                            self.column = start_col;
+                            break;
+                        }
+                    } else {
+                        self.pos = start_pos;
+                        self.line = start_line;
+                        self.column = start_col;
+                        break;
+                    }
+                }
+                let clause_end = self.offset();
+                Ok(Clause::Merge(MergeClause {
+                    pattern,
+                    on_create,
+                    on_match,
+                    span: Some(TextRange::new(clause_start, clause_end)),
+                }))
+            }
             _ => {
                 self.pos = clause_start.into();
                 Err(self.error(&format!("unexpected keyword or token: '{}'", keyword)))
@@ -1609,6 +1654,64 @@ mod tests {
             assert!(matches!(r.items[0], RemoveItem::Label { .. }));
         } else {
             panic!("expected REMOVE clause");
+        }
+    }
+
+    #[test]
+    fn parse_merge_clause() {
+        let stmt = parse("MERGE (n:Person {name: 'Alice'})").unwrap();
+        assert_eq!(stmt.clauses.len(), 1);
+        if let Clause::Merge(m) = &stmt.clauses[0] {
+            assert_eq!(m.pattern.elements.len(), 1);
+            assert!(m.on_create.is_empty());
+            assert!(m.on_match.is_empty());
+        } else {
+            panic!("expected MERGE clause");
+        }
+    }
+
+    #[test]
+    fn parse_merge_with_on_create() {
+        let stmt = parse(
+            "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.created = timestamp()",
+        )
+        .unwrap();
+        assert_eq!(stmt.clauses.len(), 1);
+        if let Clause::Merge(m) = &stmt.clauses[0] {
+            assert_eq!(m.on_create.len(), 1);
+            assert!(m.on_match.is_empty());
+        } else {
+            panic!("expected MERGE clause");
+        }
+    }
+
+    #[test]
+    fn parse_merge_with_on_match() {
+        let stmt = parse(
+            "MERGE (n:Person {name: 'Alice'}) ON MATCH SET n.seen = n.seen + 1",
+        )
+        .unwrap();
+        assert_eq!(stmt.clauses.len(), 1);
+        if let Clause::Merge(m) = &stmt.clauses[0] {
+            assert!(m.on_create.is_empty());
+            assert_eq!(m.on_match.len(), 1);
+        } else {
+            panic!("expected MERGE clause");
+        }
+    }
+
+    #[test]
+    fn parse_merge_with_on_create_and_on_match() {
+        let stmt = parse(
+            "MERGE (n:Person {name: 'Alice'}) ON CREATE SET n.created = timestamp() ON MATCH SET n.seen = n.seen + 1",
+        )
+        .unwrap();
+        assert_eq!(stmt.clauses.len(), 1);
+        if let Clause::Merge(m) = &stmt.clauses[0] {
+            assert_eq!(m.on_create.len(), 1);
+            assert_eq!(m.on_match.len(), 1);
+        } else {
+            panic!("expected MERGE clause");
         }
     }
 }

@@ -69,6 +69,11 @@ fn convert_clause(b: &mut CstBuilder, clause: &ast::Clause) {
             b.token(SyntaxKind::KEYWORD, "REMOVE");
             b.finish_node();
         }
+        ast::Clause::Merge(_) => {
+            b.start_node(SyntaxKind::CLAUSE);
+            b.token(SyntaxKind::KEYWORD, "MERGE");
+            b.finish_node();
+        }
         ast::Clause::Return(r) => {
             b.start_node(SyntaxKind::RETURN_CLAUSE);
             b.token(SyntaxKind::KEYWORD, "RETURN");

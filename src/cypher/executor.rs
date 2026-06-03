@@ -97,6 +97,7 @@ pub fn execute_naive(stmt: &Statement) -> Result<QueryResult, ExecError> {
                 Clause::Delete(_) => "DELETE".to_string(),
                 Clause::Set(_) => "SET".to_string(),
                 Clause::Remove(_) => "REMOVE".to_string(),
+                Clause::Merge(_) => "MERGE".to_string(),
                 Clause::Return(_) => unreachable!(),
             })
             .collect();

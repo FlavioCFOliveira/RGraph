@@ -108,6 +108,15 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
                     items: r.items.clone(),
                 });
             }
+            Clause::Merge(m) => {
+                let input = current.unwrap_or(LogicalOperator::AllNodesScan);
+                current = Some(LogicalOperator::Merge {
+                    input: Box::new(input),
+                    pattern: m.pattern.clone(),
+                    on_create: m.on_create.clone(),
+                    on_match: m.on_match.clone(),
+                });
+            }
             Clause::Return(r) => {
                 current = Some(build_return_plan(r, current)?);
             }

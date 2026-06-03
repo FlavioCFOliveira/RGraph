@@ -102,6 +102,40 @@ pub fn analyse(stmt: &Statement) -> Result<Scope, SemanticError> {
                     }
                 }
             }
+            Clause::Merge(m) => {
+                has_scope = true;
+                collect_pattern_variables(&m.pattern, &mut scope)?;
+                for item in &m.on_create {
+                    match item {
+                        SetItem::Property { target, value } => {
+                            check_expression_variables(target, &scope)?;
+                            check_expression_variables(value, &scope)?;
+                        }
+                        SetItem::Label { variable, .. } => {
+                            if !scope.variables.contains(variable) {
+                                return Err(SemanticError {
+                                    message: format!("undefined variable '{}'", variable),
+                                });
+                            }
+                        }
+                    }
+                }
+                for item in &m.on_match {
+                    match item {
+                        SetItem::Property { target, value } => {
+                            check_expression_variables(target, &scope)?;
+                            check_expression_variables(value, &scope)?;
+                        }
+                        SetItem::Label { variable, .. } => {
+                            if !scope.variables.contains(variable) {
+                                return Err(SemanticError {
+                                    message: format!("undefined variable '{}'", variable),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             Clause::Return(r) => {
                 // RETURN-only queries (e.g. "RETURN 1+2") are valid in openCypher.
                 // They operate on an empty scope, so any variable references will
