@@ -1,0 +1,17 @@
+# Rustfmt configuration for RGraph
+# Maintains consistent formatting across the entire codebase.
+
+edition = "2024"
+max_width = 100
+tab_spaces = 4
+use_small_heuristics = "Default"
+reorder_imports = true
+reorder_modules = true
+remove_nested_parens = true
+merge_derives = true
+use_try_shorthand = true
+use_field_init_shorthand = true
+
+# Nightly-only features (commented out until CI uses nightly fmt)
+# imports_granularity = "Crate"
+# group_imports = "StdExternalCrate"

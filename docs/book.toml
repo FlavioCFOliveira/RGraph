@@ -1,0 +1,19 @@
+[book]
+title = "RGraph User Guide"
+authors = ["RGraph Contributors"]
+description = "Production-grade documentation for the RGraph graph database engine."
+src = "src"
+language = "en"
+
+[build]
+build-dir = "book"
+
+[preprocessor.index]
+
+[preprocessor.links]
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/FlavioCFOliveira/RGraph"
+edit-url-template = "https://github.com/FlavioCFOliveira/RGraph/edit/main/docs/{path}"

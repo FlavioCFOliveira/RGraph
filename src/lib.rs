@@ -12,3 +12,4 @@ pub mod cypher;
 pub mod tck;
 pub mod acid;
 pub mod server;
+pub mod telemetry;

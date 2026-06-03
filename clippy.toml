@@ -1,0 +1,8 @@
+# Clippy configuration for RGraph
+# Enforces production-grade code quality.
+
+avoid-breaking-exported-api = false
+msrv = "1.96.0"
+
+# Explicitly deny categories that are treated as warnings by default.
+# The CI workflow passes `-D warnings`, so any lint at "warn" level becomes an error.

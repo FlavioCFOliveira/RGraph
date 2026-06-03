@@ -15,6 +15,15 @@ use tracing::info;
 #[command(name = "rgraph")]
 #[command(about = "RGraph - A high-performance graph database engine")]
 struct Cli {
+    /// Increase logging verbosity (repeat for more detail).
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    /// Suppress all output except errors.
+    #[arg(short, long)]
+    quiet: bool,
+    /// Emit structured JSON log lines.
+    #[arg(long)]
+    json_log: bool,
     #[command(subcommand)]
     cmd: Command,
 }
@@ -62,28 +71,81 @@ enum Command {
         #[arg(long, requires = "tls")]
         tls_key: Option<PathBuf>,
     },
+    /// Import data from CSV, JSONL, or Turtle.
+    Import {
+        /// Path to database directory.
+        path: PathBuf,
+        /// Input file to import.
+        #[arg(short, long)]
+        file: PathBuf,
+        /// Format: csv, jsonl, turtle.
+        #[arg(short, long, default_value = "csv")]
+        format: String,
+    },
+    /// Export data to Cypher or Turtle.
+    Export {
+        /// Path to database directory.
+        path: PathBuf,
+        /// Output file.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Format: cypher, turtle.
+        #[arg(short, long, default_value = "cypher")]
+        format: String,
+        /// Optional label filter.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Run a benchmark workload.
+    Benchmark {
+        /// Path to database directory.
+        path: PathBuf,
+        /// Number of iterations.
+        #[arg(short, long, default_value_t = 1000)]
+        iterations: usize,
+        /// Concurrency level.
+        #[arg(short, long, default_value_t = 10)]
+        concurrency: usize,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    let verbose = cli.verbose >= 2 || cli.verbose == 1;
+    let quiet = cli.quiet;
+    let json_log = cli.json_log;
+
+    rgraph::telemetry::init_subscriber(json_log, verbose, quiet);
+
     let fs = PosixFileSystem::new(false);
 
     match cli.cmd {
         Command::Init { path } => {
+            let _span = tracing::info_span!("cmd", command = "init").entered();
             match Database::init(&path, &fs) {
                 Ok(db) => {
-                    println!("Database initialised at {:?}", path);
+                    info!("Database initialised at {:?}", path);
+                    println!(
+                        "Database initialised at {:?}",
+                        path
+                    );
                     println!(
                         "  total pages: {}",
                         db.page_manager.superblock.total_page_count
                     );
                 }
-                Err(e) => eprintln!("Error: {}", e),
+                Err(e) => {
+                    tracing::error!("Database init failed: {}", e);
+                    eprintln!("Error: {}", e);
+                }
             }
         }
         Command::Open { path } => {
+            let _span = tracing::info_span!("cmd", command = "open").entered();
             match Database::open(&path, &fs) {
                 Ok(db) => {
+                    info!("Database opened at {:?}", path);
                     println!("Database opened at {:?}", path);
                     println!(
                         "  total pages: {}",
@@ -98,10 +160,14 @@ fn main() {
                         db.page_manager.superblock.current_wal_lsn
                     );
                 }
-                Err(e) => eprintln!("Error: {}", e),
+                Err(e) => {
+                    tracing::error!("Database open failed: {}", e);
+                    eprintln!("Error: {}", e);
+                }
             }
         }
         Command::Insert { path, data } => {
+            let _span = tracing::info_span!("cmd", command = "insert").entered();
             match Database::open(&path, &fs) {
                 Ok(mut db) => {
                     let pid = db.page_manager.allocate_page();
@@ -112,7 +178,6 @@ fn main() {
                         .write_page(&fs, pid, &page.buf)
                         .expect("write page");
 
-                    // Simple WAL record for the page update.
                     let payload = {
                         let mut p = pid.to_be_bytes().to_vec();
                         p.extend_from_slice(&page.buf);
@@ -130,9 +195,13 @@ fn main() {
                     db.page_manager.superblock.current_wal_lsn = lsn;
                     db.page_manager.sync_superblock(&fs).expect("sync meta");
 
+                    info!("Inserted record into page {} slot {}", pid, idx);
                     println!("Inserted record into page {} slot {}", pid, idx);
                 }
-                Err(e) => eprintln!("Error: {}", e),
+                Err(e) => {
+                    tracing::error!("Database insert failed: {}", e);
+                    eprintln!("Error: {}", e);
+                }
             }
         }
         Command::Read {
@@ -140,12 +209,14 @@ fn main() {
             page_id,
             slot,
         } => {
+            let _span = tracing::info_span!("cmd", command = "read").entered();
             match Database::open(&path, &fs) {
                 Ok(db) => {
                     let mut buf = rgraph::io::AlignedBuffer::zeroed(
                         rgraph::storage::page::PAGE_SIZE
                     );
                     if let Err(e) = db.page_manager.read_page(&fs, page_id, &mut buf) {
+                        tracing::error!("Error reading page: {}", e);
                         eprintln!("Error reading page: {}", e);
                         return;
                     }
@@ -162,7 +233,10 @@ fn main() {
                         None => println!("No record at page {} slot {}", page_id, slot),
                     }
                 }
-                Err(e) => eprintln!("Error: {}", e),
+                Err(e) => {
+                    tracing::error!("Database read failed: {}", e);
+                    eprintln!("Error: {}", e);
+                }
             }
         }
         Command::Serve {
@@ -176,6 +250,7 @@ fn main() {
             tls_cert,
             tls_key,
         } => {
+            let _span = tracing::info_span!("cmd", command = "serve").entered();
             let worker_threads = if workers == 0 {
                 num_cpus::get().max(2)
             } else {
@@ -202,13 +277,11 @@ fn main() {
             let runtime = ServerRuntime::new(config.clone()).expect("create runtime");
             let in_flight = Arc::new(AtomicUsize::new(0));
 
-            // Initialise graph engine adapter.
             let data_path = path.join("rgraph.db");
             let engine: Arc<dyn AsyncGraphEngine> =
                 if data_path.exists() {
                     Arc::new(GraphEngineAdapter::init(data_path).expect("open graph engine"))
                 } else {
-                    // Fallback to in-memory adapter for quick testing.
                     info!("database file not found; initialising new graph engine");
                     Arc::new(GraphEngineAdapter::init(data_path).expect("init graph engine"))
                 };
@@ -239,9 +312,6 @@ fn main() {
 
                     info!("listening on port {}", acceptor.local_port);
 
-                    // For Sprint 23, we serve gRPC directly via tonic's transport
-                    // server instead of the manual acceptor loop.  The acceptor
-                    // module is fully tested and ready for the future Bolt layer.
                     let grpc_routes = GraphGrpcServer::routes(engine, metrics);
                     let addr = format!("{}:{}", host_clone, port_clone).parse().unwrap();
                     grpc_routes.serve(addr).await.map_err(|e| {
@@ -250,6 +320,29 @@ fn main() {
                 },
                 in_flight,
             );
+        }
+        Command::Import { path, file, format } => {
+            let _span = tracing::info_span!("cmd", command = "import", file = %file.display(), format = %format).entered();
+            info!("Importing {:?} as {} into {:?}", file, format, path);
+            println!("Import from {:?} (format: {}) into {:?}", file, format, path);
+            println!("Import is a stub — full implementation depends on the query execution engine (Sprint 21).");
+        }
+        Command::Export { path, output, format, label } => {
+            let _span = tracing::info_span!("cmd", command = "export", output = %output.display(), format = %format).entered();
+            info!("Exporting {:?} as {} to {:?}", path, format, output);
+            println!("Export to {:?} (format: {}) from {:?}", output, format, path);
+            if let Some(l) = label {
+                println!("  label filter: {}", l);
+            }
+            println!("Export is a stub — full implementation depends on the query execution engine (Sprint 21).");
+        }
+        Command::Benchmark { path, iterations, concurrency } => {
+            let _span = tracing::info_span!("cmd", command = "benchmark", iterations = iterations, concurrency = concurrency).entered();
+            info!("Running benchmark on {:?} (iterations={}, concurrency={})", path, iterations, concurrency);
+            println!("Benchmark on {:?}", path);
+            println!("  iterations: {}", iterations);
+            println!("  concurrency: {}", concurrency);
+            println!("Benchmark is a stub — full implementation depends on the query execution engine (Sprint 21).");
         }
     }
 }

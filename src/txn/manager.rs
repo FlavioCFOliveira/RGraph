@@ -265,7 +265,7 @@ impl TransactionManager {
 
     /// Stage an index mutation in the transaction-local write set.
     ///
-    /// The mutation is not applied until [`commit_with_indexes`] is called.
+    /// The mutation is not applied until `commit_with_indexes` is called.
     /// If the transaction rolls back, staged mutations are simply discarded.
     pub fn stage_index_mutation(
         &self,

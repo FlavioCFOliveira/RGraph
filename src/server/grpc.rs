@@ -1,7 +1,7 @@
 //! gRPC service handlers (Task 51).
 //!
-//! Implements [`CypherQuery`](proto::cypher_query_server), [`TransactionManager`]
-//! and [`Health`](proto::health_server) services using [`tonic`].
+//! Implements `CypherQuery`, `TransactionManager`
+//! and `Health` services using [`tonic`].
 //!
 //! The query evaluator is intentionally minimal: it handles `RETURN` with
 //! literals and arithmetic so that the acceptance criterion "a basic query
