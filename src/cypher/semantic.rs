@@ -57,11 +57,10 @@ pub fn analyse(stmt: &Statement) -> Result<Scope, SemanticError> {
                 check_expression_variables(&w.predicate, &scope)?;
             }
             Clause::Return(r) => {
-                if !has_scope {
-                    return Err(SemanticError {
-                        message: "RETURN clause must follow MATCH or CREATE".to_string(),
-                    });
-                }
+                // RETURN-only queries (e.g. "RETURN 1+2") are valid in openCypher.
+                // They operate on an empty scope, so any variable references will
+                // be caught by check_expression_variables.
+                has_scope = true;
                 for proj in &r.projections {
                     check_expression_variables(&proj.expression, &scope)?;
                     if let Some(alias) = &proj.alias {
@@ -210,10 +209,12 @@ mod tests {
     }
 
     #[test]
-    fn analyse_return_without_match() {
+    fn analyse_return_without_match_is_valid() {
+        // RETURN-only queries (e.g. "RETURN 42") are valid openCypher.
         let stmt = parse("RETURN 42").unwrap();
-        let err = analyse(&stmt).unwrap_err();
-        assert!(err.message.contains("RETURN clause must follow MATCH or CREATE"));
+        let scope = analyse(&stmt).unwrap();
+        // No variables introduced, no errors.
+        assert!(scope.variables.is_empty());
     }
 
     #[test]

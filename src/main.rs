@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::info;
+use rgraph::cypher::executor::execute_expression_query;
 
 #[derive(Parser)]
 #[command(name = "rgraph")]
@@ -70,6 +71,16 @@ enum Command {
         /// Path to TLS private key.
         #[arg(long, requires = "tls")]
         tls_key: Option<PathBuf>,
+    },
+    /// Run a Cypher query against the database (or in expression-only mode).
+    Query {
+        /// Path to database directory.
+        path: PathBuf,
+        /// The Cypher query string to execute.
+        query: String,
+        /// Emit results as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
     },
     /// Import data from CSV, JSONL, or Turtle.
     Import {
@@ -320,6 +331,23 @@ fn main() {
                 },
                 in_flight,
             );
+        }
+        Command::Query { path, query, json } => {
+            let _span = tracing::info_span!("cmd", command = "query", path = %path.display()).entered();
+            info!("Executing query '{}' on {:?}", query, path);
+            match execute_expression_query(&query) {
+                Ok(result) => {
+                    if json {
+                        println!("{}", result.render_json());
+                    } else {
+                        print!("{}", result.render_table());
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Query execution failed: {}", e);
+                    eprintln!("Error: {}", e);
+                }
+            }
         }
         Command::Import { path, file, format } => {
             let _span = tracing::info_span!("cmd", command = "import", file = %file.display(), format = %format).entered();

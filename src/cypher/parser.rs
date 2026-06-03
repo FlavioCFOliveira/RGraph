@@ -598,6 +598,8 @@ impl Parser {
                 self.advance();
                 Ok(expr)
             }
+            Some('[') => self.parse_list_literal(),
+            Some('{') => self.parse_map_literal(),
             Some('-') => {
                 self.advance();
                 let expr = self.parse_primary()?;
@@ -637,6 +639,81 @@ impl Parser {
             }
             Some(c) => Err(self.error(&format!("unexpected character: '{}'", c))),
         }
+    }
+
+    fn parse_list_literal(&mut self) -> Result<Expression, ParseError> {
+        self.skip_whitespace();
+        if self.peek_char() != Some('[') {
+            return Err(self.error("expected '[' to start list literal"));
+        }
+        self.advance(); // consume '['
+        self.skip_whitespace();
+
+        let mut items = Vec::new();
+        if self.peek_char() == Some(']') {
+            self.advance();
+            return Ok(Expression::List(items));
+        }
+
+        loop {
+            self.skip_whitespace();
+            let expr = self.parse_expression(0)?;
+            items.push(expr);
+            self.skip_whitespace();
+            if self.peek_char() == Some(',') {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        self.skip_whitespace();
+        if self.peek_char() != Some(']') {
+            return Err(self.error("expected ']' to end list literal"));
+        }
+        self.advance();
+        Ok(Expression::List(items))
+    }
+
+    fn parse_map_literal(&mut self) -> Result<Expression, ParseError> {
+        self.skip_whitespace();
+        if self.peek_char() != Some('{') {
+            return Err(self.error("expected '{' to start map literal"));
+        }
+        self.advance(); // consume '{'
+        self.skip_whitespace();
+
+        let mut entries = Vec::new();
+        if self.peek_char() == Some('}') {
+            self.advance();
+            return Ok(Expression::Map(entries));
+        }
+
+        loop {
+            self.skip_whitespace();
+            let key = self.parse_identifier()?;
+            self.skip_whitespace();
+            if self.peek_char() != Some(':') {
+                return Err(self.error("expected ':' after map key"));
+            }
+            self.advance();
+            self.skip_whitespace();
+            let value = self.parse_expression(0)?;
+            entries.push((key, value));
+            self.skip_whitespace();
+            if self.peek_char() == Some(',') {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        self.skip_whitespace();
+        if self.peek_char() != Some('}') {
+            return Err(self.error("expected '}' to end map literal"));
+        }
+        self.advance();
+        Ok(Expression::Map(entries))
     }
 
     fn parse_string_literal(&mut self) -> Result<Expression, ParseError> {
@@ -835,6 +912,64 @@ mod tests {
                 assert_eq!(s, "hello\nworld");
             } else {
                 panic!("expected string literal");
+            }
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_list_literal() {
+        let stmt = parse("RETURN [1, 2, 3]").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            if let Expression::List(items) = &r.projections[0].expression {
+                assert_eq!(items.len(), 3);
+            } else {
+                panic!("expected list literal");
+            }
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_empty_list_literal() {
+        let stmt = parse("RETURN []").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            if let Expression::List(items) = &r.projections[0].expression {
+                assert!(items.is_empty());
+            } else {
+                panic!("expected list literal");
+            }
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_map_literal() {
+        let stmt = parse("RETURN {a: 1, b: 'two'}").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            if let Expression::Map(entries) = &r.projections[0].expression {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].0, "a");
+                assert_eq!(entries[1].0, "b");
+            } else {
+                panic!("expected map literal");
+            }
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_empty_map_literal() {
+        let stmt = parse("RETURN {}").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            if let Expression::Map(entries) = &r.projections[0].expression {
+                assert!(entries.is_empty());
+            } else {
+                panic!("expected map literal");
             }
         } else {
             panic!("expected RETURN clause");
