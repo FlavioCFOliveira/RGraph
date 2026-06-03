@@ -182,17 +182,29 @@ impl FileHandle for IoUringFileHandle {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.writev_at(&[buf], offset)
+    }
+
+    fn writev_at(&self, bufs: &[&[u8]], offset: u64) -> io::Result<()> {
         let fd = types::Fd(self.file.as_raw_fd());
         let mut ring = self.ring.lock().unwrap();
 
-        let write_e = opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)
+        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(bufs.len());
+        for buf in bufs {
+            iovecs.push(libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            });
+        }
+
+        let writev_e = opcode::Writev::new(fd, iovecs.as_ptr(), iovecs.len() as u32)
             .offset(offset)
             .build()
-            .user_data(0x02);
+            .user_data(0x06);
 
         unsafe {
             let mut sq = ring.submission();
-            sq.push(&write_e).map_err(|_| {
+            sq.push(&writev_e).map_err(|_| {
                 io::Error::new(io::ErrorKind::Other, "io_uring submission queue full")
             })?;
         }
@@ -208,11 +220,12 @@ impl FileHandle for IoUringFileHandle {
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
         }
+        let total_expected: usize = bufs.iter().map(|b| b.len()).sum();
         let bytes_written = res as usize;
-        if bytes_written != buf.len() {
+        if bytes_written != total_expected {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
-                format!("short write: expected {}, got {}", buf.len(), bytes_written),
+                format!("short writev: expected {}, got {}", total_expected, bytes_written),
             ));
         }
         Ok(())

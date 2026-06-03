@@ -129,17 +129,25 @@ impl FileHandle for PosixFileHandle {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.writev_at(&[buf], offset)
+    }
+
+    fn writev_at(&self, bufs: &[&[u8]], offset: u64) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
-        let mut total = 0;
-        while total < buf.len() {
-            let n = self.file.write_at(&buf[total..], offset + total as u64)?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "short write in write_at",
-                ));
+        let mut off = offset;
+        for buf in bufs {
+            let mut total = 0;
+            while total < buf.len() {
+                let n = self.file.write_at(&buf[total..], off + total as u64)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short write in writev_at",
+                    ));
+                }
+                total += n;
             }
-            total += n;
+            off += buf.len() as u64;
         }
         Ok(())
     }

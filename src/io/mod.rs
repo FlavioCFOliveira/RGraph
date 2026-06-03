@@ -58,6 +58,18 @@ pub trait FileHandle: Send + Sync {
     /// Write `buf` to `offset`.
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
 
+    /// Vectored write: write each buffer slice sequentially starting at `offset`.
+    ///
+    /// The default implementation calls `write_at` for each slice in order.
+    fn writev_at(&self, bufs: &[&[u8]], offset: u64) -> io::Result<()> {
+        let mut off = offset;
+        for buf in bufs {
+            self.write_at(buf, off)?;
+            off += buf.len() as u64;
+        }
+        Ok(())
+    }
+
     /// Flush all buffers and metadata to disk.
     fn sync_all(&self) -> io::Result<()>;
 

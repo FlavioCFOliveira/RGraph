@@ -195,7 +195,19 @@ impl FileHandle for FaultInjectFileHandle {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        let mut buf_to_write = buf;
+        self.writev_at(&[buf], offset)
+    }
+
+    fn writev_at(&self, bufs: &[&[u8]], offset: u64) -> io::Result<()> {
+        // Flatten the vectored write into a single buffer for fault injection.
+        // This is slightly sub-optimal for performance but keeps fault injection
+        // semantics simple (e.g. PartialWrite applies to the whole batch).
+        let total_len: usize = bufs.iter().map(|b| b.len()).sum();
+        let mut flat = Vec::with_capacity(total_len);
+        for buf in bufs {
+            flat.extend_from_slice(buf);
+        }
+        let mut buf_to_write = flat.as_slice();
         let mut truncated_buf: Vec<u8> = Vec::new();
 
         if let Some(kind) = self.maybe_fault(OpMask {
@@ -213,8 +225,8 @@ impl FileHandle for FaultInjectFileHandle {
                     return Err(io::Error::from_raw_os_error(libc::ENOSPC));
                 }
                 FaultKind::PartialWrite { factor } => {
-                    let new_len = (buf.len() as f64 * factor.clamp(0.0, 1.0)) as usize;
-                    truncated_buf.extend_from_slice(&buf[..new_len]);
+                    let new_len = (flat.len() as f64 * factor.clamp(0.0, 1.0)) as usize;
+                    truncated_buf.extend_from_slice(&flat[..new_len]);
                     buf_to_write = &truncated_buf;
                 }
                 _ => {}

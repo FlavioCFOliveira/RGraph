@@ -1,16 +1,28 @@
-use crate::buffer::frame::FrameState;
+use crate::buffer::frame::{FrameId, FrameState};
 use crate::buffer::pool::BufferPool;
 use crate::io::FileSystem;
+use crate::storage::page::PageId;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{sleep, spawn, JoinHandle};
 use std::time::Duration;
+
+/// A pending dirty page ready for batch flush.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    fid: FrameId,
+    page_id: PageId,
+    last_lsn: u64,
+}
 
 /// Default threshold: start flushing when > 10 % of frames are dirty.
 pub const DEFAULT_DIRTY_RATIO: f64 = 0.10;
 
 /// Default sleep interval between sweeps.
 pub const DEFAULT_FLUSH_INTERVAL_MS: u64 = 10;
+
+/// Maximum size of a merged write batch (4 MiB).
+pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Request sent to the flusher thread.
 #[derive(Debug)]
@@ -62,41 +74,13 @@ impl Flusher {
 
                 if dirty_pct > dirty_ratio {
                     let candidates = pool.dirty_candidates();
-                    for fid in candidates {
-                        let frame = pool.frame(fid);
-                        let page_id = frame.desc.page_id.load(Ordering::Relaxed);
-                        if page_id == 0 {
-                            continue;
-                        }
-
-                        // WAL-before-data ordering: do not flush if the
-                        // frame's rec_lsn is ahead of the last known flushed
-                        // LSN.  In a full ARIES implementation this would
-                        // coordinate with the WAL writer; here we simply
-                        // skip the frame and let the WAL fsync advance
-                        // the watermark first.
-                        let rec_lsn = frame.desc.rec_lsn.load(Ordering::Relaxed);
-                        let current_flushed = flushed_lsn_clone.load(Ordering::Relaxed);
-                        if rec_lsn != u64::MAX && rec_lsn > current_flushed {
-                            continue;
-                        }
-
-                        if frame.desc.io_inflight.swap(true, Ordering::Acquire) {
-                            continue; // another thread already flushing
-                        }
-
-                        let offset = page_id * crate::storage::page::PAGE_SIZE as u64;
-                        if let Ok(handle) = fs.open(&pool.data_path, false)
-                            && handle.write_at(&frame.buf, offset).is_ok()
-                            && handle.sync_data().is_ok()
-                        {
-                            frame.desc.dirty.store(false, Ordering::Release);
-                            frame.desc.state.store(FrameState::Clean as u8, Ordering::Release);
-                            let last = frame.desc.last_lsn.load(Ordering::Relaxed);
-                            flushed_lsn_clone.fetch_max(last, Ordering::Release);
-                            frame.desc.rec_lsn.store(u64::MAX, Ordering::Relaxed);
-                        }
-                        frame.desc.io_inflight.store(false, Ordering::Release);
+                    if !candidates.is_empty() {
+                        Self::flush_batch(
+                            &pool,
+                            fs.as_ref(),
+                            &candidates,
+                            &flushed_lsn_clone,
+                        );
                     }
                 }
 
@@ -109,6 +93,121 @@ impl Flusher {
             shutdown,
             flushed_lsn,
         }
+    }
+
+    /// Flush a batch of dirty frames using sort-merge elevator batching.
+    ///
+    /// 1. Gather pending writes, skipping frames whose `rec_lsn` is ahead
+    ///    of the flushed watermark (WAL-before-data ordering).
+    /// 2. Sort by `page_id` (disk offset).
+    /// 3. Group adjacent pages into merged extents up to [`MAX_BATCH_BYTES`].
+    /// 4. Write each extent via vectored I/O.
+    /// 5. Update descriptors and advance the flushed LSN watermark.
+    fn flush_batch(
+        pool: &BufferPool,
+        fs: &dyn FileSystem,
+        candidates: &[crate::buffer::frame::FrameId],
+        flushed_lsn: &AtomicU64,
+    ) {
+        let mut pending: Vec<Pending> = Vec::with_capacity(candidates.len());
+        for &fid in candidates {
+            let frame = pool.frame(fid);
+            let page_id = frame.desc.page_id.load(Ordering::Relaxed);
+            if page_id == 0 {
+                continue;
+            }
+            let rec_lsn = frame.desc.rec_lsn.load(Ordering::Relaxed);
+            let current_flushed = flushed_lsn.load(Ordering::Relaxed);
+            if rec_lsn != u64::MAX && rec_lsn > current_flushed {
+                // WAL-before-data ordering: skip until WAL is flushed.
+                continue;
+            }
+            if frame.desc.io_inflight.swap(true, Ordering::Acquire) {
+                continue; // another thread already flushing
+            }
+            pending.push(Pending {
+                fid,
+                page_id,
+                last_lsn: frame.desc.last_lsn.load(Ordering::Relaxed),
+            });
+        }
+
+        if pending.is_empty() {
+            return;
+        }
+
+        // Sort by page_id (disk order).
+        pending.sort_by_key(|p| p.page_id);
+
+        // Group adjacent pages into extents and write each extent.
+        let mut group_start = 0;
+        while group_start < pending.len() {
+            let mut group_end = group_start + 1;
+            let mut group_bytes = crate::storage::page::PAGE_SIZE;
+            while group_end < pending.len()
+                && pending[group_end].page_id == pending[group_end - 1].page_id + 1
+                && group_bytes + crate::storage::page::PAGE_SIZE <= MAX_BATCH_BYTES
+            {
+                group_bytes += crate::storage::page::PAGE_SIZE;
+                group_end += 1;
+            }
+
+            let extent = &pending[group_start..group_end];
+            if let Err(e) = Self::write_extent(pool, fs, extent) {
+                eprintln!("flusher batch write failed for page {}..{}: {}",
+                    extent[0].page_id,
+                    extent.last().unwrap().page_id,
+                    e);
+                // Mark frames as no longer inflight so they can be retried.
+                for p in extent {
+                    let frame = pool.frame(p.fid);
+                    frame.desc.io_inflight.store(false, Ordering::Release);
+                }
+            } else {
+                // Update descriptors and advance flushed LSN.
+                let mut max_lsn = 0u64;
+                for p in extent {
+                    let frame = pool.frame(p.fid);
+                    frame.desc.dirty.store(false, Ordering::Release);
+                    frame.desc.state.store(FrameState::Clean as u8, Ordering::Release);
+                    frame.desc.io_inflight.store(false, Ordering::Release);
+                    frame.desc.rec_lsn.store(u64::MAX, Ordering::Relaxed);
+                    max_lsn = max_lsn.max(p.last_lsn);
+                }
+                if max_lsn > 0 {
+                    flushed_lsn.fetch_max(max_lsn, Ordering::Release);
+                }
+            }
+
+            group_start = group_end;
+        }
+    }
+
+    /// Write a contiguous extent of frames using vectored I/O.
+    fn write_extent(
+        pool: &BufferPool,
+        fs: &dyn FileSystem,
+        extent: &[Pending],
+    ) -> std::io::Result<()> {
+        use crate::storage::page::PAGE_SIZE;
+
+        if extent.is_empty() {
+            return Ok(());
+        }
+
+        let offset = extent[0].page_id * PAGE_SIZE as u64;
+        let handle = fs.open(&pool.data_path, false)?;
+
+        // Build a list of buffer slices for vectored write.
+        let mut slices: Vec<&[u8]> = Vec::with_capacity(extent.len());
+        for p in extent {
+            let frame = pool.frame(p.fid);
+            slices.push(&frame.buf[..]);
+        }
+
+        handle.writev_at(&slices, offset)?;
+        handle.sync_data()?;
+        Ok(())
     }
 
     /// Signal the flusher to stop and wait for it.
@@ -198,5 +297,41 @@ mod tests {
             }
         }
         assert!(found);
+    }
+
+    #[test]
+    fn batch_merge_groups_adjacent_pages() {
+        let (_dir, fs, pool) = setup(8);
+        // Dirty pages 1 and 2 (adjacent).
+        // Use LSN 0 so WAL-before-data filter does not block the flush.
+        {
+            let mut g1 = pool.fix_page(fs.as_ref(), 1).unwrap();
+            g1.buf_mut()[0] = 0xA1;
+            g1.set_dirty(0);
+            let mut g2 = pool.fix_page(fs.as_ref(), 2).unwrap();
+            g2.buf_mut()[0] = 0xA2;
+            g2.set_dirty(0);
+        }
+
+        let flusher = Flusher::new(pool.clone(), fs.clone(), 0.05, 5);
+        sleep(Duration::from_millis(200));
+        drop(flusher);
+
+        // Both frames should be clean.
+        let mut found1 = false;
+        let mut found2 = false;
+        for frame in pool.iter_frames() {
+            let pid = frame.desc.page_id.load(Ordering::Relaxed);
+            let dirty = frame.desc.dirty.load(Ordering::Relaxed);
+            let state = frame.desc.state.load(Ordering::Relaxed);
+            if pid == 1 {
+                assert!(!dirty, "page 1 still dirty, state={}", state);
+                found1 = true;
+            } else if pid == 2 {
+                assert!(!dirty, "page 2 still dirty, state={}", state);
+                found2 = true;
+            }
+        }
+        assert!(found1 && found2, "both adjacent pages should be flushed");
     }
 }
