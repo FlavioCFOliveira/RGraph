@@ -42,7 +42,8 @@ tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 num_cpus = "1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+bincode = "1"
 rowan = "0.16"
 text-size = "1.1"
 logos = "0.15"
