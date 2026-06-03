@@ -4,5 +4,7 @@ pub mod ast;
 pub mod executor;
 pub mod interpreter;
 pub mod parser;
+pub mod plan;
+pub mod planner;
 pub mod semantic;
 pub mod value;

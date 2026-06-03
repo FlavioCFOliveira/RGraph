@@ -215,7 +215,9 @@ impl Parser {
         s
     }
 
-    fn parse_return_body(&mut self) -> Result<(
+    fn parse_return_body(
+        &mut self,
+    ) -> Result<(
         Vec<Projection>,
         Vec<OrderItem>,
         Option<Expression>,
@@ -226,8 +228,11 @@ impl Parser {
         let mut skip = None;
         let mut limit = None;
 
-        self.skip_whitespace();
         loop {
+            self.skip_whitespace();
+            if self.is_eof() {
+                break;
+            }
             let kw = self.read_keyword().to_ascii_uppercase();
             match kw.as_str() {
                 "ORDER" => {
@@ -247,30 +252,46 @@ impl Parser {
                 "" => break,
                 _ => {
                     // Not a keyword we recognise; backtrack.
-                    // Simple backtrack: move pos back by keyword len.
-                    // This is approximate but sufficient for Sprint 8.
                     break;
                 }
             }
-            self.skip_whitespace();
         }
 
         Ok((projections, order_by, skip, limit))
     }
 
-    fn parse_projection_list(&mut self) -> Result<Vec<Projection>, ParseError> {
+    fn parse_projection_list(
+        &mut self,
+    ) -> Result<Vec<Projection>, ParseError> {
         let mut projections = Vec::new();
         loop {
             self.skip_whitespace();
             let expr = self.parse_expression(0)?;
             self.skip_whitespace();
-            let alias = if self.read_keyword().to_ascii_uppercase() == "AS" {
-                self.skip_whitespace();
-                Some(self.parse_identifier()?)
-            } else {
-                None
+
+            // Attempt to read an optional AS alias.
+            let alias = {
+                let start_pos = self.pos;
+                let start_line = self.line;
+                let start_col = self.column;
+                let kw = self.read_keyword().to_ascii_uppercase();
+                if kw == "AS" {
+                    self.skip_whitespace();
+                    Some(self.parse_identifier()?)
+                } else {
+                    // Backtrack so that any RETURN-body keyword (ORDER, SKIP,
+                    // LIMIT) remains unconsumed for the caller.
+                    self.pos = start_pos;
+                    self.line = start_line;
+                    self.column = start_col;
+                    None
+                }
             };
-            projections.push(Projection { expression: expr, alias });
+
+            projections.push(Projection {
+                expression: expr,
+                alias,
+            });
             self.skip_whitespace();
             if self.peek_char() == Some(',') {
                 self.advance();
@@ -971,6 +992,29 @@ mod tests {
             } else {
                 panic!("expected map literal");
             }
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_return_with_limit() {
+        let stmt = parse("RETURN n LIMIT 10").unwrap();
+        assert_eq!(stmt.clauses.len(), 1);
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            assert_eq!(r.limit, Some(Expression::Literal(Literal::Integer(10))));
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_return_with_skip_and_limit() {
+        let stmt = parse("RETURN n SKIP 5 LIMIT 10").unwrap();
+        assert_eq!(stmt.clauses.len(), 1);
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            assert_eq!(r.skip, Some(Expression::Literal(Literal::Integer(5))));
+            assert_eq!(r.limit, Some(Expression::Literal(Literal::Integer(10))));
         } else {
             panic!("expected RETURN clause");
         }
