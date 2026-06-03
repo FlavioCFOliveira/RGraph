@@ -381,7 +381,15 @@ fn collect_expression_variables(expr: &Expression, vars: &mut Vec<String>) {
             collect_expression_variables(left, vars);
             collect_expression_variables(right, vars);
         }
-        Expression::Comparison { left, right, .. } => {
+        Expression::Comparison { left, right, .. }
+        | Expression::And { left, right, .. }
+        | Expression::Or { left, right, .. }
+        | Expression::Xor { left, right, .. }
+        | Expression::StartsWith { left, right, .. }
+        | Expression::EndsWith { left, right, .. }
+        | Expression::Contains { left, right, .. }
+        | Expression::In { left, right, .. }
+        | Expression::Regex { left, right, .. } => {
             collect_expression_variables(left, vars);
             collect_expression_variables(right, vars);
         }

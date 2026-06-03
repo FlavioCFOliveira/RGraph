@@ -583,6 +583,25 @@ impl Parser {
         Ok(s)
     }
 
+    /// Return the next keyword without advancing the cursor.
+    fn peek_keyword(&self) -> Option<String> {
+        let mut s = String::new();
+        let mut pos = self.pos;
+        while let Some(&c) = self.input.get(pos) {
+            if c.is_ascii_alphabetic() || c == '_' {
+                s.push(c);
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
     // Pratt parser for expressions.
     fn parse_expression(&mut self,
         min_bp: u8,
@@ -593,74 +612,103 @@ impl Parser {
 
         loop {
             self.skip_whitespace();
-            let op = match self.peek_operator() {
-                Some(op) => op,
-                None => break,
+
+            // Determine the next infix operator (symbolic or keyword).
+            let op = if let Some(sym_op) = self.peek_operator() {
+                sym_op
+            } else if let Some(kw) = self.peek_keyword() {
+                let kw_upper = kw.to_ascii_uppercase();
+                match kw_upper.as_str() {
+                    "AND" | "OR" | "XOR" | "STARTS" | "ENDS" | "CONTAINS" | "IN" => kw_upper,
+                    _ => break,
+                }
+            } else {
+                break;
             };
+
             let (lbp, rbp) = infix_binding_power(&op);
             if lbp < min_bp {
                 break;
             }
-            self.advance_operator(&op)?;
+
+            // Consume the operator.
+            if op == "STARTS" || op == "ENDS" {
+                self.read_keyword(); // consume STARTS / ENDS
+                self.skip_whitespace();
+                self.expect_keyword("WITH")?;
+            } else if op.len() == 1 || op.starts_with('<') || op.starts_with('>') || op.starts_with('=') || op.starts_with('!') {
+                // Symbolic operator (including multi-char like <=, >=, <>, =~).
+                for _ in 0..op.len() {
+                    self.advance();
+                }
+            } else {
+                // Single-word keyword operator (AND, OR, XOR, CONTAINS, IN).
+                self.read_keyword();
+            }
+
             self.skip_whitespace();
             let rhs = self.parse_expression(rbp)?;
             let expr_end = self.offset();
-            if let Some(bin_op) = arithmetic_op(&op) {
-                lhs = Expression::BinaryOp {
-                    op: bin_op,
-                    left: Box::new(lhs),
-                    right: Box::new(rhs),
-                    span: Some(TextRange::new(expr_start, expr_end)),
-                };
-            } else {
-                lhs = Expression::Comparison {
-                    op: comparison_op(&op),
-                    left: Box::new(lhs),
-                    right: Box::new(rhs),
-                    span: Some(TextRange::new(expr_start, expr_end)),
-                };
-            }
-        }
 
-        // Handle AND / OR (lowest precedence)
-        loop {
-            self.skip_whitespace();
-            let start_pos = self.pos;
-            let start_line = self.line;
-            let start_col = self.column;
-            let kw = self.read_keyword().to_ascii_uppercase();
-            let expr_end = self.offset();
-            match kw.as_str() {
-                "AND" => {
-                    self.skip_whitespace();
-                    let rhs = self.parse_expression(0)?;
-                    let expr_end = self.offset();
-                    lhs = Expression::BinaryOp {
-                        op: BinaryOperator::Mul, // reuse Mul as AND placeholder
-                        left: Box::new(lhs),
-                        right: Box::new(rhs),
-                        span: Some(TextRange::new(expr_start, expr_end)),
-                    };
-                }
-                "OR" => {
-                    self.skip_whitespace();
-                    let rhs = self.parse_expression(0)?;
-                    let expr_end = self.offset();
-                    lhs = Expression::BinaryOp {
-                        op: BinaryOperator::Add, // reuse Add as OR placeholder
-                        left: Box::new(lhs),
-                        right: Box::new(rhs),
-                        span: Some(TextRange::new(expr_start, expr_end)),
-                    };
-                }
+            lhs = match op.as_str() {
+                "AND" => Expression::And {
+                    left: Box::new(lhs),
+                    right: Box::new(rhs),
+                    span: Some(TextRange::new(expr_start, expr_end)),
+                },
+                "OR" => Expression::Or {
+                    left: Box::new(lhs),
+                    right: Box::new(rhs),
+                    span: Some(TextRange::new(expr_start, expr_end)),
+                },
+                "XOR" => Expression::Xor {
+                    left: Box::new(lhs),
+                    right: Box::new(rhs),
+                    span: Some(TextRange::new(expr_start, expr_end)),
+                },
+                "STARTS" => Expression::StartsWith {
+                    left: Box::new(lhs),
+                    right: Box::new(rhs),
+                    span: Some(TextRange::new(expr_start, expr_end)),
+                },
+                "ENDS" => Expression::EndsWith {
+                    left: Box::new(lhs),
+                    right: Box::new(rhs),
+                    span: Some(TextRange::new(expr_start, expr_end)),
+                },
+                "CONTAINS" => Expression::Contains {
+                    left: Box::new(lhs),
+                    right: Box::new(rhs),
+                    span: Some(TextRange::new(expr_start, expr_end)),
+                },
+                "IN" => Expression::In {
+                    left: Box::new(lhs),
+                    right: Box::new(rhs),
+                    span: Some(TextRange::new(expr_start, expr_end)),
+                },
+                "=~" => Expression::Regex {
+                    left: Box::new(lhs),
+                    right: Box::new(rhs),
+                    span: Some(TextRange::new(expr_start, expr_end)),
+                },
                 _ => {
-                    // Backtrack: restore position so the caller can parse the keyword.
-                    self.pos = start_pos;
-                    self.line = start_line;
-                    self.column = start_col;
-                    break;
+                    if let Some(bin_op) = arithmetic_op(&op) {
+                        Expression::BinaryOp {
+                            op: bin_op,
+                            left: Box::new(lhs),
+                            right: Box::new(rhs),
+                            span: Some(TextRange::new(expr_start, expr_end)),
+                        }
+                    } else {
+                        Expression::Comparison {
+                            op: comparison_op(&op),
+                            left: Box::new(lhs),
+                            right: Box::new(rhs),
+                            span: Some(TextRange::new(expr_start, expr_end)),
+                        }
+                    }
                 }
-            }
+            };
         }
 
         // Handle IS NULL / IS NOT NULL postfix operators.
@@ -953,7 +1001,7 @@ impl Parser {
         let mut op = String::new();
         let mut lookahead = self.pos;
         while let Some(&c) = self.input.get(lookahead) {
-            if "<>=!+-*/%".contains(c) {
+            if "<>=!+-*/%~".contains(c) {
                 op.push(c);
                 lookahead += 1;
             } else {
@@ -977,10 +1025,18 @@ impl Parser {
 
 fn infix_binding_power(op: &str) -> (u8, u8) {
     match op {
-        "=" | "<>" => (1, 2),
-        "<" | ">" | "<=" | ">=" => (3, 4),
-        "+" | "-" => (5, 6),
-        "*" | "/" | "%" => (7, 8),
+        // Logical (lowest precedence)
+        "OR" => (10, 11),
+        "XOR" => (20, 21),
+        "AND" => (30, 31),
+        // Comparisons and string/list operators
+        "=" | "<>" | "<" | ">" | "<=" | ">=" | "=~" | "STARTS" | "ENDS" | "CONTAINS" | "IN" => {
+            (40, 41)
+        }
+        // Additive
+        "+" | "-" => (50, 51),
+        // Multiplicative
+        "*" | "/" | "%" => (60, 61),
         _ => (0, 0),
     }
 }
@@ -1227,6 +1283,116 @@ mod tests {
             assert_eq!(mrange.end(), TextSize::from(10));
         } else {
             panic!("expected MATCH clause");
+        }
+    }
+
+    #[test]
+    fn parse_and_or_precedence() {
+        // AND binds tighter than OR.
+        let stmt = parse("RETURN a AND b OR c").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            assert!(
+                matches!(
+                    r.projections[0].expression,
+                    Expression::Or { .. }
+                ),
+                "expected top-level OR"
+            );
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_xor_expression() {
+        let stmt = parse("RETURN a XOR b").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            assert!(
+                matches!(r.projections[0].expression, Expression::Xor { .. }),
+                "expected XOR expression"
+            );
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_starts_with() {
+        let stmt = parse("RETURN n.name STARTS WITH 'Al'").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            assert!(
+                matches!(r.projections[0].expression, Expression::StartsWith { .. }),
+                "expected STARTS WITH expression"
+            );
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_ends_with() {
+        let stmt = parse("RETURN n.name ENDS WITH 'ce'").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            assert!(
+                matches!(r.projections[0].expression, Expression::EndsWith { .. }),
+                "expected ENDS WITH expression"
+            );
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_contains() {
+        let stmt = parse("RETURN n.name CONTAINS 'li'").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            assert!(
+                matches!(r.projections[0].expression, Expression::Contains { .. }),
+                "expected CONTAINS expression"
+            );
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_in_expression() {
+        let stmt = parse("RETURN n IN [1, 2, 3]").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            assert!(
+                matches!(r.projections[0].expression, Expression::In { .. }),
+                "expected IN expression"
+            );
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_regex_expression() {
+        let stmt = parse("RETURN n.email =~ '.*@example.com'").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            assert!(
+                matches!(r.projections[0].expression, Expression::Regex { .. }),
+                "expected =~ expression"
+            );
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_complex_mixed_precedence() {
+        // a + b * c < 10 AND d STARTS WITH 'x' OR e IN [1,2]
+        let stmt = parse("RETURN a + b * c < 10 AND d STARTS WITH 'x' OR e IN [1,2]").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            // Top-level must be OR
+            assert!(
+                matches!(r.projections[0].expression, Expression::Or { .. }),
+                "expected top-level OR"
+            );
+        } else {
+            panic!("expected RETURN clause");
         }
     }
 }

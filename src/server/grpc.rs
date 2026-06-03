@@ -130,6 +130,16 @@ impl CypherQueryService {
             Expression::Wildcard => Err(RGraphError::Semantic(
                 "Wildcard * not yet implemented in gRPC evaluator".into(),
             )),
+            Expression::And { .. }
+            | Expression::Or { .. }
+            | Expression::Xor { .. }
+            | Expression::StartsWith { .. }
+            | Expression::EndsWith { .. }
+            | Expression::Contains { .. }
+            | Expression::In { .. }
+            | Expression::Regex { .. } => Err(RGraphError::Semantic(
+                "Logical and string operators not yet implemented in gRPC evaluator".into(),
+            )),
             Expression::FunctionCall { .. } => Err(RGraphError::Semantic(
                 "Function calls not yet implemented in gRPC evaluator".into(),
             )),

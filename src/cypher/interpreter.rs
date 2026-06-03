@@ -158,6 +158,92 @@ pub fn evaluate(expr: &Expression, ctx: &EvalContext) -> Result<Value, EvalError
             Ok(v.is_not_null_predicate())
         }
 
+        Expression::And { left, right, .. } => {
+            let l = evaluate(left, ctx)?;
+            let r = evaluate(right, ctx)?;
+            match (l, r) {
+                (Value::Boolean(a), Value::Boolean(b)) => Ok(Value::Boolean(a && b)),
+                (a, b) => Err(EvalError {
+                    message: format!("expected Boolean, got '{}' and '{}'", a.type_name(), b.type_name()),
+                }),
+            }
+        }
+
+        Expression::Or { left, right, .. } => {
+            let l = evaluate(left, ctx)?;
+            let r = evaluate(right, ctx)?;
+            match (l, r) {
+                (Value::Boolean(a), Value::Boolean(b)) => Ok(Value::Boolean(a || b)),
+                (a, b) => Err(EvalError {
+                    message: format!("expected Boolean, got '{}' and '{}'", a.type_name(), b.type_name()),
+                }),
+            }
+        }
+
+        Expression::Xor { left, right, .. } => {
+            let l = evaluate(left, ctx)?;
+            let r = evaluate(right, ctx)?;
+            match (l, r) {
+                (Value::Boolean(a), Value::Boolean(b)) => Ok(Value::Boolean(a ^ b)),
+                (a, b) => Err(EvalError {
+                    message: format!("expected Boolean, got '{}' and '{}'", a.type_name(), b.type_name()),
+                }),
+            }
+        }
+
+        Expression::StartsWith { left, right, .. } => {
+            let l = evaluate(left, ctx)?;
+            let r = evaluate(right, ctx)?;
+            match (l, r) {
+                (Value::String(a), Value::String(b)) => Ok(Value::Boolean(a.starts_with(&b))),
+                (a, b) => Err(EvalError {
+                    message: format!("expected String, got '{}' and '{}'", a.type_name(), b.type_name()),
+                }),
+            }
+        }
+
+        Expression::EndsWith { left, right, .. } => {
+            let l = evaluate(left, ctx)?;
+            let r = evaluate(right, ctx)?;
+            match (l, r) {
+                (Value::String(a), Value::String(b)) => Ok(Value::Boolean(a.ends_with(&b))),
+                (a, b) => Err(EvalError {
+                    message: format!("expected String, got '{}' and '{}'", a.type_name(), b.type_name()),
+                }),
+            }
+        }
+
+        Expression::Contains { left, right, .. } => {
+            let l = evaluate(left, ctx)?;
+            let r = evaluate(right, ctx)?;
+            match (l, r) {
+                (Value::String(a), Value::String(b)) => Ok(Value::Boolean(a.contains(&b))),
+                (a, b) => Err(EvalError {
+                    message: format!("expected String, got '{}' and '{}'", a.type_name(), b.type_name()),
+                }),
+            }
+        }
+
+        Expression::In { left, right, .. } => {
+            let l = evaluate(left, ctx)?;
+            let r = evaluate(right, ctx)?;
+            match r {
+                Value::List(items) => Ok(Value::Boolean(items.contains(&l))),
+                _ => Err(EvalError {
+                    message: format!("expected List, got '{}'", r.type_name()),
+                }),
+            }
+        }
+
+        Expression::Regex { left, right, .. } => {
+            let _l = evaluate(left, ctx)?;
+            let _r = evaluate(right, ctx)?;
+            // TODO: implement regex matching (requires regex crate integration)
+            Err(EvalError {
+                message: "regex matching (=~) not yet implemented".to_string(),
+            })
+        }
+
         Expression::List(items) => {
             let mut values = Vec::with_capacity(items.len());
             for item in items {

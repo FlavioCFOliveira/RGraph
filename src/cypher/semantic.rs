@@ -174,7 +174,15 @@ fn check_expression_variables(
             check_expression_variables(left, scope)?;
             check_expression_variables(right, scope)?;
         }
-        Expression::Comparison { left, right, .. } => {
+        Expression::Comparison { left, right, .. }
+        | Expression::And { left, right, .. }
+        | Expression::Or { left, right, .. }
+        | Expression::Xor { left, right, .. }
+        | Expression::StartsWith { left, right, .. }
+        | Expression::EndsWith { left, right, .. }
+        | Expression::Contains { left, right, .. }
+        | Expression::In { left, right, .. }
+        | Expression::Regex { left, right, .. } => {
             check_expression_variables(left, scope)?;
             check_expression_variables(right, scope)?;
         }

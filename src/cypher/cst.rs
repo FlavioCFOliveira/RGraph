@@ -209,6 +209,58 @@ fn convert_expression(b: &mut CstBuilder, expr: &ast::Expression) {
             convert_expression(b, right);
             b.finish_node();
         }
+        ast::Expression::And { left, right, .. }
+        | ast::Expression::Or { left, right, .. }
+        | ast::Expression::Xor { left, right, .. } => {
+            b.start_node(SyntaxKind::BINARY_EXPR);
+            convert_expression(b, left);
+            b.token(
+                SyntaxKind::KEYWORD,
+                match expr {
+                    ast::Expression::And { .. } => "AND",
+                    ast::Expression::Or { .. } => "OR",
+                    ast::Expression::Xor { .. } => "XOR",
+                    _ => unreachable!(),
+                },
+            );
+            convert_expression(b, right);
+            b.finish_node();
+        }
+        ast::Expression::StartsWith { left, right, .. } => {
+            b.start_node(SyntaxKind::COMPARISON_EXPR);
+            convert_expression(b, left);
+            b.token(SyntaxKind::KEYWORD, "STARTS WITH");
+            convert_expression(b, right);
+            b.finish_node();
+        }
+        ast::Expression::EndsWith { left, right, .. } => {
+            b.start_node(SyntaxKind::COMPARISON_EXPR);
+            convert_expression(b, left);
+            b.token(SyntaxKind::KEYWORD, "ENDS WITH");
+            convert_expression(b, right);
+            b.finish_node();
+        }
+        ast::Expression::Contains { left, right, .. } => {
+            b.start_node(SyntaxKind::COMPARISON_EXPR);
+            convert_expression(b, left);
+            b.token(SyntaxKind::KEYWORD, "CONTAINS");
+            convert_expression(b, right);
+            b.finish_node();
+        }
+        ast::Expression::In { left, right, .. } => {
+            b.start_node(SyntaxKind::COMPARISON_EXPR);
+            convert_expression(b, left);
+            b.token(SyntaxKind::KEYWORD, "IN");
+            convert_expression(b, right);
+            b.finish_node();
+        }
+        ast::Expression::Regex { left, right, .. } => {
+            b.start_node(SyntaxKind::COMPARISON_EXPR);
+            convert_expression(b, left);
+            b.token(SyntaxKind::PUNCT, "=~");
+            convert_expression(b, right);
+            b.finish_node();
+        }
         ast::Expression::UnaryOp { op, expr, .. } => {
             b.start_node(SyntaxKind::UNARY_EXPR);
             b.token(SyntaxKind::PUNCT, &op.to_string().trim());

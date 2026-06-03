@@ -174,6 +174,22 @@ pub enum Expression {
         distinct: bool,
         span: Option<TextRange>,
     },
+    /// Boolean AND: `left AND right`.
+    And { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
+    /// Boolean OR: `left OR right`.
+    Or { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
+    /// Boolean XOR: `left XOR right`.
+    Xor { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
+    /// String STARTS WITH: `left STARTS WITH right`.
+    StartsWith { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
+    /// String ENDS WITH: `left ENDS WITH right`.
+    EndsWith { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
+    /// String CONTAINS: `left CONTAINS right`.
+    Contains { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
+    /// List/map membership: `left IN right`.
+    In { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
+    /// Regex match: `left =~ right`.
+    Regex { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
     /// Wildcard `*` used inside `count(*)`.
     Wildcard,
 }
@@ -192,6 +208,14 @@ impl Expression {
             Expression::List(_) => None,
             Expression::Map(_) => None,
             Expression::FunctionCall { span, .. } => *span,
+            Expression::And { span, .. } => *span,
+            Expression::Or { span, .. } => *span,
+            Expression::Xor { span, .. } => *span,
+            Expression::StartsWith { span, .. } => *span,
+            Expression::EndsWith { span, .. } => *span,
+            Expression::Contains { span, .. } => *span,
+            Expression::In { span, .. } => *span,
+            Expression::Regex { span, .. } => *span,
             Expression::Wildcard => None,
         }
     }
@@ -401,6 +425,14 @@ impl std::fmt::Display for Expression {
                     .collect();
                 write!(f, "{{{}}}", elems.join(", "))
             }
+            Expression::And { left, right, .. } => write!(f, "({} AND {})", left, right),
+            Expression::Or { left, right, .. } => write!(f, "({} OR {})", left, right),
+            Expression::Xor { left, right, .. } => write!(f, "({} XOR {})", left, right),
+            Expression::StartsWith { left, right, .. } => write!(f, "({} STARTS WITH {})", left, right),
+            Expression::EndsWith { left, right, .. } => write!(f, "({} ENDS WITH {})", left, right),
+            Expression::Contains { left, right, .. } => write!(f, "({} CONTAINS {})", left, right),
+            Expression::In { left, right, .. } => write!(f, "({} IN {})", left, right),
+            Expression::Regex { left, right, .. } => write!(f, "({} =~ {})", left, right),
             Expression::FunctionCall { name, args, distinct, .. } => {
                 let prefix = if *distinct { "DISTINCT " } else { "" };
                 let elems: Vec<String> = args.iter().map(|a| a.to_string()).collect();
