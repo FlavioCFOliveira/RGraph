@@ -48,6 +48,8 @@ tempfile = "3.10"
 proptest = "1.4"
 tokio-test = "0.4"
 criterion = "0.5"
+cucumber = "0.23"
+gherkin = "0.14"
 
 [[bench]]
 name = "btree_bench"

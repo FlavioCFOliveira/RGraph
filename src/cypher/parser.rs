@@ -601,6 +601,39 @@ impl Parser {
             }
         }
 
+        // Handle IS NULL / IS NOT NULL postfix operators.
+        loop {
+            self.skip_whitespace();
+            let start_pos = self.pos;
+            let start_line = self.line;
+            let start_col = self.column;
+            let kw = self.read_keyword().to_ascii_uppercase();
+            if kw == "IS" {
+                self.skip_whitespace();
+                let next_kw = self.read_keyword().to_ascii_uppercase();
+                if next_kw == "NOT" {
+                    self.skip_whitespace();
+                    let null_kw = self.read_keyword().to_ascii_uppercase();
+                    if null_kw == "NULL" {
+                        lhs = Expression::IsNotNull(Box::new(lhs));
+                        continue;
+                    } else {
+                        return Err(self.error("expected NULL after IS NOT"));
+                    }
+                } else if next_kw == "NULL" {
+                    lhs = Expression::IsNull(Box::new(lhs));
+                    continue;
+                } else {
+                    return Err(self.error("expected NULL or NOT NULL after IS"));
+                }
+            } else {
+                self.pos = start_pos;
+                self.line = start_line;
+                self.column = start_col;
+                break;
+            }
+        }
+
         Ok(lhs)
     }
 
