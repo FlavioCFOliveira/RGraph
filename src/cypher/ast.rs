@@ -28,7 +28,9 @@ pub enum Clause {
     Return(ReturnClause),
     Where(WhereClause),
     Create(CreateClause),
-    // TODO: DELETE, SET, WITH, UNWIND, etc.
+    Delete(DeleteClause),
+    Set(SetClause),
+    Remove(RemoveClause),
 }
 
 impl Clause {
@@ -39,6 +41,9 @@ impl Clause {
             Clause::Return(c) => c.span,
             Clause::Where(c) => c.span,
             Clause::Create(c) => c.span,
+            Clause::Delete(c) => c.span,
+            Clause::Set(c) => c.span,
+            Clause::Remove(c) => c.span,
         }
     }
 }
@@ -72,6 +77,42 @@ pub struct WhereClause {
 pub struct CreateClause {
     pub pattern: Pattern,
     pub span: Option<TextRange>,
+}
+
+/// `DELETE expression_list` clause (can be DETACH DELETE).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteClause {
+    pub expressions: Vec<Expression>,
+    pub detach: bool,
+    pub span: Option<TextRange>,
+}
+
+/// `SET item_list` clause where each item is `variable.prop = expr` or `variable:Label`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetClause {
+    pub items: Vec<SetItem>,
+    pub span: Option<TextRange>,
+}
+
+/// A single item inside a SET clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetItem {
+    Property { target: Box<Expression>, value: Expression },
+    Label { variable: String, labels: Vec<String> },
+}
+
+/// `REMOVE item_list` clause where each item is `variable.prop` or `variable:Label`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoveClause {
+    pub items: Vec<RemoveItem>,
+    pub span: Option<TextRange>,
+}
+
+/// A single item inside a REMOVE clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RemoveItem {
+    Property { target: Box<Expression> },
+    Label { variable: String, labels: Vec<String> },
 }
 
 /// A pattern is an alternating sequence of nodes and relationships.
@@ -333,6 +374,25 @@ impl std::fmt::Display for Clause {
             }
             Clause::Where(w) => write!(f, "WHERE {}", w.predicate),
             Clause::Create(c) => write!(f, "CREATE {}", c.pattern),
+            Clause::Delete(d) => {
+                if d.detach {
+                    write!(f, "DETACH DELETE ")?;
+                } else {
+                    write!(f, "DELETE ")?;
+                }
+                let exprs: Vec<String> = d.expressions.iter().map(|e| e.to_string()).collect();
+                write!(f, "{}", exprs.join(", "))
+            }
+            Clause::Set(s) => {
+                write!(f, "SET ")?;
+                let items: Vec<String> = s.items.iter().map(|i| i.to_string()).collect();
+                write!(f, "{}", items.join(", "))
+            }
+            Clause::Remove(r) => {
+                write!(f, "REMOVE ")?;
+                let items: Vec<String> = r.items.iter().map(|i| i.to_string()).collect();
+                write!(f, "{}", items.join(", "))
+            }
         }
     }
 }
@@ -499,6 +559,36 @@ impl std::fmt::Display for Projection {
             write!(f, "{} AS {}", self.expression, alias)
         } else {
             write!(f, "{}", self.expression)
+        }
+    }
+}
+
+impl std::fmt::Display for SetItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetItem::Property { target, value } => write!(f, "{} = {}", target, value),
+            SetItem::Label { variable, labels } => {
+                write!(f, "{}", variable)?;
+                for label in labels {
+                    write!(f, ":{}", label)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for RemoveItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoveItem::Property { target } => write!(f, "{}", target),
+            RemoveItem::Label { variable, labels } => {
+                write!(f, "{}", variable)?;
+                for label in labels {
+                    write!(f, ":{}", label)?;
+                }
+                Ok(())
+            }
         }
     }
 }

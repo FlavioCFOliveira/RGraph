@@ -61,6 +61,47 @@ pub fn analyse(stmt: &Statement) -> Result<Scope, SemanticError> {
                     });
                 }
             }
+            Clause::Delete(d) => {
+                has_scope = true;
+                for expr in &d.expressions {
+                    check_expression_variables(expr, &scope)?;
+                }
+            }
+            Clause::Set(s) => {
+                has_scope = true;
+                for item in &s.items {
+                    match item {
+                        SetItem::Property { target, value } => {
+                            check_expression_variables(target, &scope)?;
+                            check_expression_variables(value, &scope)?;
+                        }
+                        SetItem::Label { variable, .. } => {
+                            if !scope.variables.contains(variable) {
+                                return Err(SemanticError {
+                                    message: format!("undefined variable '{}'", variable),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Clause::Remove(r) => {
+                has_scope = true;
+                for item in &r.items {
+                    match item {
+                        RemoveItem::Property { target } => {
+                            check_expression_variables(target, &scope)?;
+                        }
+                        RemoveItem::Label { variable, .. } => {
+                            if !scope.variables.contains(variable) {
+                                return Err(SemanticError {
+                                    message: format!("undefined variable '{}'", variable),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             Clause::Return(r) => {
                 // RETURN-only queries (e.g. "RETURN 1+2") are valid in openCypher.
                 // They operate on an empty scope, so any variable references will

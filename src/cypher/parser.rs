@@ -226,6 +226,68 @@ impl Parser {
                     span: Some(TextRange::new(clause_start, clause_end)),
                 }))
             }
+            "DELETE" => {
+                self.skip_whitespace();
+                let mut expressions = Vec::new();
+                loop {
+                    self.skip_whitespace();
+                    let expr = self.parse_expression(0)?;
+                    expressions.push(expr);
+                    self.skip_whitespace();
+                    if self.peek_char() == Some(',') {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                let clause_end = self.offset();
+                Ok(Clause::Delete(DeleteClause {
+                    expressions,
+                    detach: false,
+                    span: Some(TextRange::new(clause_start, clause_end)),
+                }))
+            }
+            "DETACH" => {
+                self.skip_whitespace();
+                self.expect_keyword("DELETE")?;
+                self.skip_whitespace();
+                let mut expressions = Vec::new();
+                loop {
+                    self.skip_whitespace();
+                    let expr = self.parse_expression(0)?;
+                    expressions.push(expr);
+                    self.skip_whitespace();
+                    if self.peek_char() == Some(',') {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                let clause_end = self.offset();
+                Ok(Clause::Delete(DeleteClause {
+                    expressions,
+                    detach: true,
+                    span: Some(TextRange::new(clause_start, clause_end)),
+                }))
+            }
+            "SET" => {
+                self.skip_whitespace();
+                let items = self.parse_set_items()?;
+                let clause_end = self.offset();
+                Ok(Clause::Set(SetClause {
+                    items,
+                    span: Some(TextRange::new(clause_start, clause_end)),
+                }))
+            }
+            "REMOVE" => {
+                self.skip_whitespace();
+                let items = self.parse_remove_items()?;
+                let clause_end = self.offset();
+                Ok(Clause::Remove(RemoveClause {
+                    items,
+                    span: Some(TextRange::new(clause_start, clause_end)),
+                }))
+            }
             _ => {
                 self.pos = clause_start.into();
                 Err(self.error(&format!("unexpected keyword or token: '{}'", keyword)))
@@ -356,6 +418,94 @@ impl Parser {
                 ascending,
                 span: Some(TextRange::new(item_start, item_end)),
             });
+            self.skip_whitespace();
+            if self.peek_char() == Some(',') {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    fn parse_set_items(&mut self) -> Result<Vec<SetItem>, ParseError> {
+        let mut items = Vec::new();
+        loop {
+            self.skip_whitespace();
+            // SET item can be:
+            //   variable.property = expression
+            //   variable:Label1:Label2
+            let expr_start = self.offset();
+            let ident = self.parse_identifier()?;
+            self.skip_whitespace();
+            if self.peek_char() == Some('.') {
+                // Property assignment: variable.prop = expr
+                self.advance(); // consume '.'
+                let prop = self.parse_identifier()?;
+                self.skip_whitespace();
+                if self.peek_char() != Some('=') {
+                    return Err(self.error("expected '=' in SET property assignment"));
+                }
+                self.advance(); // consume '='
+                self.skip_whitespace();
+                let value = self.parse_expression(0)?;
+                items.push(SetItem::Property {
+                    target: Box::new(Expression::PropertyAccess {
+                        base: Box::new(Expression::Variable(ident)),
+                        property: prop,
+                        span: None,
+                    }),
+                    value,
+                });
+            } else if self.peek_char() == Some(':') {
+                // Label assignment: variable:Label1:Label2
+                let mut labels = Vec::new();
+                while self.peek_char() == Some(':') {
+                    self.advance();
+                    labels.push(self.parse_identifier()?);
+                }
+                items.push(SetItem::Label { variable: ident, labels });
+            } else {
+                return Err(self.error("expected '.' or ':' after variable in SET clause"));
+            }
+            self.skip_whitespace();
+            if self.peek_char() == Some(',') {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    fn parse_remove_items(&mut self) -> Result<Vec<RemoveItem>, ParseError> {
+        let mut items = Vec::new();
+        loop {
+            self.skip_whitespace();
+            let ident = self.parse_identifier()?;
+            self.skip_whitespace();
+            if self.peek_char() == Some('.') {
+                // Remove property: variable.prop
+                self.advance(); // consume '.'
+                let prop = self.parse_identifier()?;
+                items.push(RemoveItem::Property {
+                    target: Box::new(Expression::PropertyAccess {
+                        base: Box::new(Expression::Variable(ident)),
+                        property: prop,
+                        span: None,
+                    }),
+                });
+            } else if self.peek_char() == Some(':') {
+                // Remove label: variable:Label1:Label2
+                let mut labels = Vec::new();
+                while self.peek_char() == Some(':') {
+                    self.advance();
+                    labels.push(self.parse_identifier()?);
+                }
+                items.push(RemoveItem::Label { variable: ident, labels });
+            } else {
+                return Err(self.error("expected '.' or ':' after variable in REMOVE clause"));
+            }
             self.skip_whitespace();
             if self.peek_char() == Some(',') {
                 self.advance();
@@ -1393,6 +1543,72 @@ mod tests {
             );
         } else {
             panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_delete_clause() {
+        let stmt = parse("MATCH (n) DELETE n").unwrap();
+        assert_eq!(stmt.clauses.len(), 2);
+        assert!(matches!(stmt.clauses[1], Clause::Delete(_)));
+    }
+
+    #[test]
+    fn parse_detach_delete_clause() {
+        let stmt = parse("MATCH (n) DETACH DELETE n").unwrap();
+        assert_eq!(stmt.clauses.len(), 2);
+        if let Clause::Delete(d) = &stmt.clauses[1] {
+            assert!(d.detach);
+        } else {
+            panic!("expected DELETE clause");
+        }
+    }
+
+    #[test]
+    fn parse_set_property_clause() {
+        let stmt = parse("MATCH (n) SET n.name = 'Alice'").unwrap();
+        assert_eq!(stmt.clauses.len(), 2);
+        if let Clause::Set(s) = &stmt.clauses[1] {
+            assert_eq!(s.items.len(), 1);
+            assert!(matches!(s.items[0], SetItem::Property { .. }));
+        } else {
+            panic!("expected SET clause");
+        }
+    }
+
+    #[test]
+    fn parse_set_label_clause() {
+        let stmt = parse("MATCH (n) SET n:Person:Employee").unwrap();
+        assert_eq!(stmt.clauses.len(), 2);
+        if let Clause::Set(s) = &stmt.clauses[1] {
+            assert_eq!(s.items.len(), 1);
+            assert!(matches!(s.items[0], SetItem::Label { .. }));
+        } else {
+            panic!("expected SET clause");
+        }
+    }
+
+    #[test]
+    fn parse_remove_property_clause() {
+        let stmt = parse("MATCH (n) REMOVE n.age").unwrap();
+        assert_eq!(stmt.clauses.len(), 2);
+        if let Clause::Remove(r) = &stmt.clauses[1] {
+            assert_eq!(r.items.len(), 1);
+            assert!(matches!(r.items[0], RemoveItem::Property { .. }));
+        } else {
+            panic!("expected REMOVE clause");
+        }
+    }
+
+    #[test]
+    fn parse_remove_label_clause() {
+        let stmt = parse("MATCH (n) REMOVE n:OldLabel").unwrap();
+        assert_eq!(stmt.clauses.len(), 2);
+        if let Clause::Remove(r) = &stmt.clauses[1] {
+            assert_eq!(r.items.len(), 1);
+            assert!(matches!(r.items[0], RemoveItem::Label { .. }));
+        } else {
+            panic!("expected REMOVE clause");
         }
     }
 }

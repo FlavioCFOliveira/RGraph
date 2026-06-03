@@ -54,6 +54,21 @@ fn convert_clause(b: &mut CstBuilder, clause: &ast::Clause) {
             emit_span(b, w.span);
             b.finish_node();
         }
+        ast::Clause::Delete(_) => {
+            b.start_node(SyntaxKind::CLAUSE);
+            b.token(SyntaxKind::KEYWORD, "DELETE");
+            b.finish_node();
+        }
+        ast::Clause::Set(_) => {
+            b.start_node(SyntaxKind::CLAUSE);
+            b.token(SyntaxKind::KEYWORD, "SET");
+            b.finish_node();
+        }
+        ast::Clause::Remove(_) => {
+            b.start_node(SyntaxKind::CLAUSE);
+            b.token(SyntaxKind::KEYWORD, "REMOVE");
+            b.finish_node();
+        }
         ast::Clause::Return(r) => {
             b.start_node(SyntaxKind::RETURN_CLAUSE);
             b.token(SyntaxKind::KEYWORD, "RETURN");

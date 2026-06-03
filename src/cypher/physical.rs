@@ -5,7 +5,7 @@
 //! lazily.  Eager operators (e.g. `Sort`) buffer their input in memory but
 //! respect a configurable row budget.
 
-use crate::cypher::ast::{Expression, Projection};
+use crate::cypher::ast::{Expression, Projection, RemoveItem, SetItem};
 use crate::cypher::executor::{ExecError, QueryResult};
 use crate::cypher::interpreter::{evaluate, eval_projections, EvalContext};
 use crate::cypher::plan::{LogicalOperator, LogicalPlan};
@@ -510,6 +510,86 @@ impl PhysicalOperator for CreateOp {
     fn reset(&mut self) {}
 }
 
+/// Delete nodes / relationships.
+pub struct DeleteOp {
+    expressions: Vec<Expression>,
+    detach: bool,
+    input: Box<dyn PhysicalOperator>,
+}
+
+impl DeleteOp {
+    pub fn new(expressions: Vec<Expression>, detach: bool, input: Box<dyn PhysicalOperator>) -> Self {
+        Self { expressions, detach, input }
+    }
+}
+
+impl PhysicalOperator for DeleteOp {
+    fn next_row(
+        &mut self,
+        _ctx: &ExecutionContext,
+    ) -> Result<Option<Row>, ExecError> {
+        // Stub: consume all input rows and return a single summary row.
+        while self.input.next_row(_ctx)?.is_some() {}
+        let mut row = empty_row();
+        row.insert("_deleted".to_string(), Value::Integer(self.expressions.len() as i64));
+        Ok(Some(row))
+    }
+
+    fn reset(&mut self) {
+        self.input.reset();
+    }
+}
+
+/// Set properties or labels on existing entities.
+pub struct SetOp {
+    items: Vec<SetItem>,
+    input: Box<dyn PhysicalOperator>,
+}
+
+impl SetOp {
+    pub fn new(items: Vec<SetItem>, input: Box<dyn PhysicalOperator>) -> Self {
+        Self { items, input }
+    }
+}
+
+impl PhysicalOperator for SetOp {
+    fn next_row(
+        &mut self,
+        _ctx: &ExecutionContext,
+    ) -> Result<Option<Row>, ExecError> {
+        self.input.next_row(_ctx)
+    }
+
+    fn reset(&mut self) {
+        self.input.reset();
+    }
+}
+
+/// Remove properties or labels from existing entities.
+pub struct RemoveOp {
+    items: Vec<RemoveItem>,
+    input: Box<dyn PhysicalOperator>,
+}
+
+impl RemoveOp {
+    pub fn new(items: Vec<RemoveItem>, input: Box<dyn PhysicalOperator>) -> Self {
+        Self { items, input }
+    }
+}
+
+impl PhysicalOperator for RemoveOp {
+    fn next_row(
+        &mut self,
+        _ctx: &ExecutionContext,
+    ) -> Result<Option<Row>, ExecError> {
+        self.input.next_row(_ctx)
+    }
+
+    fn reset(&mut self) {
+        self.input.reset();
+    }
+}
+
 /// Aggregate operator with implicit grouping.
 pub struct AggregateOp {
     grouping_keys: Vec<Expression>,
@@ -782,6 +862,19 @@ fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
             build_physical_operator(input),
         )),
         LogicalOperator::Create { pattern } => Box::new(CreateOp::new(pattern.clone())),
+        LogicalOperator::Delete { input, expressions, detach } => Box::new(DeleteOp::new(
+            expressions.clone(),
+            *detach,
+            build_physical_operator(input),
+        )),
+        LogicalOperator::Set { input, items } => Box::new(SetOp::new(
+            items.clone(),
+            build_physical_operator(input),
+        )),
+        LogicalOperator::Remove { input, items } => Box::new(RemoveOp::new(
+            items.clone(),
+            build_physical_operator(input),
+        )),
         LogicalOperator::Apply { left, right } => {
             // Apply is a nested-loop join.  For Sprint 21 we return the
             // Cartesian product of left and right (simplified stub).

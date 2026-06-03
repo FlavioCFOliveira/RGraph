@@ -86,6 +86,28 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
                     });
                 }
             }
+            Clause::Delete(d) => {
+                let input = current.unwrap_or(LogicalOperator::AllNodesScan);
+                current = Some(LogicalOperator::Delete {
+                    input: Box::new(input),
+                    expressions: d.expressions.clone(),
+                    detach: d.detach,
+                });
+            }
+            Clause::Set(s) => {
+                let input = current.unwrap_or(LogicalOperator::AllNodesScan);
+                current = Some(LogicalOperator::Set {
+                    input: Box::new(input),
+                    items: s.items.clone(),
+                });
+            }
+            Clause::Remove(r) => {
+                let input = current.unwrap_or(LogicalOperator::AllNodesScan);
+                current = Some(LogicalOperator::Remove {
+                    input: Box::new(input),
+                    items: r.items.clone(),
+                });
+            }
             Clause::Return(r) => {
                 current = Some(build_return_plan(r, current)?);
             }

@@ -78,6 +78,25 @@ pub enum LogicalOperator {
     /// Create new nodes and/or relationships.
     Create { pattern: Pattern },
 
+    /// Delete nodes and/or relationships.
+    Delete {
+        input: Box<LogicalOperator>,
+        expressions: Vec<Expression>,
+        detach: bool,
+    },
+
+    /// Set properties or labels on existing entities.
+    Set {
+        input: Box<LogicalOperator>,
+        items: Vec<SetItem>,
+    },
+
+    /// Remove properties or labels from existing entities.
+    Remove {
+        input: Box<LogicalOperator>,
+        items: Vec<RemoveItem>,
+    },
+
     /// Nested-loop apply for sub-queries (stub for Sprint 21).
     Apply {
         left: Box<LogicalOperator>,
@@ -209,6 +228,18 @@ impl LogicalOperator {
             LogicalOperator::Create { pattern } => {
                 out.push_str(&format!("{}Create [{}]\n", indent, pattern));
             }
+            LogicalOperator::Delete { input, .. } => {
+                out.push_str(&format!("{}Delete\n", indent));
+                input.explain_inner(out, depth + 1);
+            }
+            LogicalOperator::Set { input, .. } => {
+                out.push_str(&format!("{}Set\n", indent));
+                input.explain_inner(out, depth + 1);
+            }
+            LogicalOperator::Remove { input, .. } => {
+                out.push_str(&format!("{}Remove\n", indent));
+                input.explain_inner(out, depth + 1);
+            }
             LogicalOperator::Apply { left, right } => {
                 out.push_str(&format!("{}Apply\n", indent));
                 left.explain_inner(out, depth + 1);
@@ -301,6 +332,9 @@ impl LogicalOperator {
                     }
                 }
             }
+            LogicalOperator::Delete { .. } => {}
+            LogicalOperator::Set { .. } => {}
+            LogicalOperator::Remove { .. } => {}
             LogicalOperator::Apply { left, right } => {
                 vars.extend(left.output_variables());
                 vars.extend(right.output_variables());
@@ -350,6 +384,36 @@ impl LogicalOperator {
                 collect_expression_variables(expression, &mut vars);
             }
             LogicalOperator::Create { .. } => {}
+            LogicalOperator::Delete { expressions, .. } => {
+                for expr in expressions {
+                    collect_expression_variables(expr, &mut vars);
+                }
+            }
+            LogicalOperator::Set { items, .. } => {
+                for item in items {
+                    match item {
+                        SetItem::Property { target, value } => {
+                            collect_expression_variables(target, &mut vars);
+                            collect_expression_variables(value, &mut vars);
+                        }
+                        SetItem::Label { variable, .. } => {
+                            vars.push(variable.clone());
+                        }
+                    }
+                }
+            }
+            LogicalOperator::Remove { items, .. } => {
+                for item in items {
+                    match item {
+                        RemoveItem::Property { target } => {
+                            collect_expression_variables(target, &mut vars);
+                        }
+                        RemoveItem::Label { variable, .. } => {
+                            vars.push(variable.clone());
+                        }
+                    }
+                }
+            }
             LogicalOperator::Apply { left, right } => {
                 vars.extend(left.required_variables());
                 vars.extend(right.required_variables());
