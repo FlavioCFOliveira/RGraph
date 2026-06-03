@@ -250,15 +250,26 @@ mod tests {
         Arc<BufferPool>,
         Arc<std::sync::Mutex<WalWriter>>,
     ) {
+        use crate::storage::page::{PageType, SlottedPage};
         let dir = tempfile::tempdir().unwrap();
         let data_path = dir.path().join("rgraph.db");
         let wal_dir = dir.path().join("wal");
         let fs = Arc::new(PosixFileSystem::new(false));
-
-        let mut f = std::fs::File::create(&data_path).unwrap();
-        f.set_len((frames as u64).max(64) * PAGE_SIZE as u64).unwrap();
-        f.flush().unwrap();
-        drop(f);
+        let file_pages = (frames as u64).max(64);
+        {
+            let mut f = std::fs::File::create(&data_path).unwrap();
+            f.set_len(file_pages * PAGE_SIZE as u64).unwrap();
+            f.flush().unwrap();
+        }
+        // Initialize all pages with valid checksums.
+        let handle = fs.open(&data_path, false).unwrap();
+        for pid in 0..file_pages {
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.update_checksum();
+            handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
+        }
+        handle.sync_data().unwrap();
+        drop(handle);
 
         let pool = Arc::new(BufferPool::new(frames, data_path));
         let wal = Arc::new(std::sync::Mutex::new(

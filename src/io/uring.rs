@@ -394,17 +394,28 @@ mod tests {
     #[test]
     fn buffer_pool_compatibility() {
         use crate::buffer::pool::BufferPool;
-        use crate::storage::page::PAGE_SIZE;
+        use crate::storage::page::{PageType, PAGE_SIZE, SlottedPage};
         use std::io::Write;
 
         let fs = IoUringFileSystem::new(32, false).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rgraph.db");
 
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.set_len(64 * PAGE_SIZE as u64).unwrap();
-        f.flush().unwrap();
-        drop(f);
+        let file_pages = 64u64;
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.set_len(file_pages * PAGE_SIZE as u64).unwrap();
+            f.flush().unwrap();
+        }
+        // Initialize all pages with valid checksums.
+        let handle = fs.open(&path, false).unwrap();
+        for pid in 0..file_pages {
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.update_checksum();
+            handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
+        }
+        handle.sync_data().unwrap();
+        drop(handle);
 
         let pool = BufferPool::new(4, path);
 

@@ -936,12 +936,24 @@ mod tests {
         use crate::storage::page::PAGE_SIZE;
         use std::sync::Arc;
 
+        use crate::storage::page::{PageType, SlottedPage};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rgraph.db");
         let fs = Arc::new(PosixFileSystem::new(false)) as Arc<dyn FileSystem>;
-        // Pre-allocate file.
-        let handle = fs.open(&path, true).unwrap();
-        handle.set_len(64 * PAGE_SIZE as u64).unwrap();
+        // Pre-allocate file and initialize pages with valid checksums.
+        let file_pages = 64u64;
+        {
+            let handle = fs.open(&path, true).unwrap();
+            handle.set_len(file_pages * PAGE_SIZE as u64).unwrap();
+            drop(handle);
+        }
+        let handle = fs.open(&path, false).unwrap();
+        for pid in 0..file_pages {
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.update_checksum();
+            handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
+        }
+        handle.sync_data().unwrap();
         drop(handle);
 
         let pool = Arc::new(BufferPool::new(8, path.clone()));

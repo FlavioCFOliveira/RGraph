@@ -189,7 +189,7 @@ impl Flusher {
         fs: &dyn FileSystem,
         extent: &[Pending],
     ) -> std::io::Result<()> {
-        use crate::storage::page::PAGE_SIZE;
+        use crate::storage::page::{PAGE_SIZE, SlottedPage};
 
         if extent.is_empty() {
             return Ok(());
@@ -201,8 +201,9 @@ impl Flusher {
         // Build a list of buffer slices for vectored write.
         let mut slices: Vec<&[u8]> = Vec::with_capacity(extent.len());
         for p in extent {
-            let frame = pool.frame(p.fid);
-            slices.push(&frame.buf[..]);
+            let frame_mut = pool.frame_mut(p.fid);
+            SlottedPage::update_checksum_bytes(&mut frame_mut.buf);
+            slices.push(&frame_mut.buf[..]);
         }
 
         handle.writev_at(&slices, offset)?;
@@ -233,15 +234,26 @@ mod tests {
     use std::io::Write;
 
     fn setup(frames: u32) -> (tempfile::TempDir, Arc<PosixFileSystem>, Arc<BufferPool>) {
+        use crate::storage::page::{PageType, SlottedPage};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rgraph.db");
         let fs = Arc::new(PosixFileSystem::new(false));
-        let mut f = std::fs::File::create(&path).unwrap();
         let file_pages = (frames as u64).max(64);
-        f.set_len(file_pages * crate::storage::page::PAGE_SIZE as u64)
-            .unwrap();
-        f.flush().unwrap();
-        drop(f);
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.set_len(file_pages * crate::storage::page::PAGE_SIZE as u64)
+                .unwrap();
+            f.flush().unwrap();
+        }
+        // Initialize all pages with valid checksums.
+        let handle = fs.open(&path, false).unwrap();
+        for pid in 0..file_pages {
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.update_checksum();
+            handle.write_at(&page.buf, pid * crate::storage::page::PAGE_SIZE as u64).unwrap();
+        }
+        handle.sync_data().unwrap();
+        drop(handle);
         let pool = Arc::new(BufferPool::new(frames, path));
         (dir, fs, pool)
     }

@@ -210,7 +210,7 @@ fn main() {
                     let idx = page.insert(data.as_bytes()).expect("record fits in page");
                     page.update_checksum();
                     db.page_manager
-                        .write_page(&fs, pid, &page.buf)
+                        .write_page(&fs, pid, &mut page.buf)
                         .expect("write page");
 
                     let payload = {

@@ -175,19 +175,7 @@ impl SlottedPage {
 
     /// Compute the CRC32C of the entire page (header with checksum=0 + payload).
     pub fn compute_checksum(&self) -> u32 {
-        let mut copy = *self.header();
-        copy.checksum = 0;
-        let header_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &copy as *const _ as *const u8,
-                size_of::<PageHeader>(),
-            )
-        };
-        let data = &self.buf[Self::HEADER_SIZE..];
-        let mut buf = Vec::with_capacity(header_bytes.len() + data.len());
-        buf.extend_from_slice(header_bytes);
-        buf.extend_from_slice(data);
-        crc32c::crc32c(&buf)
+        Self::compute_checksum_bytes(&self.buf)
     }
 
     /// Verify the stored checksum.
@@ -199,6 +187,31 @@ impl SlottedPage {
     pub fn update_checksum(&mut self) {
         let cksum = self.compute_checksum();
         self.header_mut().checksum = cksum;
+    }
+
+    /// Compute the CRC32C of a page buffer without constructing a [`SlottedPage`].
+    ///
+    /// The checksum field (bytes 28..32) is treated as zero during computation.
+    pub fn compute_checksum_bytes(buf: &[u8]) -> u32 {
+        assert_eq!(buf.len(), PAGE_SIZE, "buffer must be PAGE_SIZE");
+        let mut cksum = crc32c::crc32c(&buf[..28]);
+        cksum = crc32c::crc32c_append(cksum, &[0, 0, 0, 0]); // checksum field as zeros
+        cksum = crc32c::crc32c_append(cksum, &buf[32..]);
+        cksum
+    }
+
+    /// Verify the stored checksum in a page buffer.
+    pub fn verify_checksum_bytes(buf: &[u8]) -> bool {
+        assert_eq!(buf.len(), PAGE_SIZE, "buffer must be PAGE_SIZE");
+        let stored = u32::from_ne_bytes([buf[28], buf[29], buf[30], buf[31]]);
+        stored == Self::compute_checksum_bytes(buf)
+    }
+
+    /// Recalculate and write the checksum into a page buffer.
+    pub fn update_checksum_bytes(buf: &mut [u8]) {
+        assert_eq!(buf.len(), PAGE_SIZE, "buffer must be PAGE_SIZE");
+        let cksum = Self::compute_checksum_bytes(buf);
+        buf[28..32].copy_from_slice(&cksum.to_ne_bytes());
     }
 
     /// Slice of the current slot directory (tail of the page).

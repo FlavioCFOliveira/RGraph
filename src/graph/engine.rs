@@ -159,7 +159,7 @@ pub struct GraphStorageEngine {
 impl GraphStorageEngine {
     /// Initialise a brand-new graph storage engine.
     pub fn init(data_path: PathBuf, fs: &dyn FileSystem) -> io::Result<Self> {
-        let pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32)?;
+        let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32)?;
 
         // Pre-extend the data file to two pages (superblock + bitmap).
         let handle = fs.open(&data_path, true)?;
@@ -339,7 +339,7 @@ impl GraphStorageEngine {
             let mut page = SlottedPage::new(buf);
             if let Some(slot) = page.insert(record) {
                 page.update_checksum();
-                page_manager.write_page(fs, page_id, &page.buf)?;
+                page_manager.write_page(fs, page_id, &mut page.buf)?;
                 return slot_ref(page_id, slot);
             }
         }
@@ -349,7 +349,7 @@ impl GraphStorageEngine {
         let mut page = SlottedPage::init(page_id, page_type);
         let slot = page.insert(record).ok_or(StorageError::PageFull)?;
         page.update_checksum();
-        page_manager.write_page(fs, page_id, &page.buf)?;
+        page_manager.write_page(fs, page_id, &mut page.buf)?;
         page_list.push(page_id);
         slot_ref(page_id, slot)
     }
@@ -393,7 +393,7 @@ impl GraphStorageEngine {
             return Err(StorageError::PageFull);
         }
         page.update_checksum();
-        page_manager.write_page(fs, page_id, &page.buf)?;
+        page_manager.write_page(fs, page_id, &mut page.buf)?;
         Ok(())
     }
 

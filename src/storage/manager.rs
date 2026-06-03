@@ -81,15 +81,23 @@ impl PageManager {
         self.superblock.free_page_count += 1;
     }
 
-    /// Read a page from disk into `buf`.
+    /// Read a page from disk into `buf` and verify its checksum.
     pub fn read_page(&self, fs: &dyn FileSystem, page_id: PageId, buf: &mut AlignedBuffer) -> io::Result<()> {
         let offset = page_id * PAGE_SIZE as u64;
         let handle = fs.open(&self.data_path, false)?;
-        handle.read_at(buf, offset)
+        handle.read_at(buf, offset)?;
+        if !crate::storage::page::SlottedPage::verify_checksum_bytes(buf) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("page {} checksum mismatch", page_id),
+            ));
+        }
+        Ok(())
     }
 
-    /// Write `buf` to disk at `page_id`.
-    pub fn write_page(&self, fs: &dyn FileSystem, page_id: PageId, buf: &AlignedBuffer) -> io::Result<()> {
+    /// Write `buf` to disk at `page_id`, updating the checksum first.
+    pub fn write_page(&self, fs: &dyn FileSystem, page_id: PageId, buf: &mut AlignedBuffer) -> io::Result<()> {
+        crate::storage::page::SlottedPage::update_checksum_bytes(buf);
         let offset = page_id * PAGE_SIZE as u64;
         let handle = fs.open(&self.data_path, false)?;
         // Ensure the file is large enough for this page.
@@ -117,9 +125,20 @@ impl PageManager {
     }
 
     /// Persist the bitmap page to disk.
-    pub fn sync_bitmap(&self, fs: &dyn FileSystem) -> io::Result<()> {
+    pub fn sync_bitmap(&mut self, fs: &dyn FileSystem) -> io::Result<()> {
         let page_id = self.bitmap.page.header().page_id;
-        self.write_page(fs, page_id, &self.bitmap.page.buf)
+        let data_path = self.data_path.clone();
+        let buf = &mut self.bitmap.page.buf;
+        crate::storage::page::SlottedPage::update_checksum_bytes(buf);
+        let offset = page_id * PAGE_SIZE as u64;
+        let handle = fs.open(&data_path, false)?;
+        let required_len = offset + PAGE_SIZE as u64;
+        let current_len = handle.len()?;
+        if current_len < required_len {
+            handle.set_len(required_len)?;
+        }
+        handle.write_at(buf, offset)?;
+        handle.sync_data()
     }
 
     /// Rebuild the free-list cache by scanning the bitmap.
@@ -194,12 +213,37 @@ mod tests {
         pm.sync_bitmap(&fs).unwrap();
 
         let pid = pm.allocate_page();
-        let mut write_buf = AlignedBuffer::zeroed(PAGE_SIZE);
-        write_buf[0] = 0xAB;
-        pm.write_page(&fs, pid, &write_buf).unwrap();
+        let mut page = crate::storage::page::SlottedPage::init(pid, crate::storage::page::PageType::SlottedData);
+        page.buf[crate::storage::page::SlottedPage::HEADER_SIZE] = 0xAB;
+        page.update_checksum();
+        pm.write_page(&fs, pid, &mut page.buf).unwrap();
 
         let mut read_buf = AlignedBuffer::zeroed(PAGE_SIZE);
         pm.read_page(&fs, pid, &mut read_buf).unwrap();
-        assert_eq!(read_buf[0], 0xAB);
+        assert_eq!(read_buf[crate::storage::page::SlottedPage::HEADER_SIZE], 0xAB);
+    }
+
+    #[test]
+    fn read_page_detects_corruption() {
+        use crate::storage::page::{PageType, SlottedPage};
+        let (_dir, fs, path) = temp_fs();
+        let mut pm = PageManager::init(path.clone(), PAGE_SIZE as u32).unwrap();
+        pm.sync_superblock(&fs).unwrap();
+        pm.sync_bitmap(&fs).unwrap();
+
+        let pid = pm.allocate_page();
+        let mut page = SlottedPage::init(pid, PageType::SlottedData);
+        page.update_checksum();
+        pm.write_page(&fs, pid, &mut page.buf).unwrap();
+
+        // Corrupt a byte in the data area on disk.
+        let handle = fs.open(&path, false).unwrap();
+        let corrupt_offset = pid * PAGE_SIZE as u64 + SlottedPage::HEADER_SIZE as u64 + 10;
+        handle.write_at(&[0xFF], corrupt_offset).unwrap();
+        handle.sync_data().unwrap();
+
+        let mut read_buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        let result = pm.read_page(&fs, pid, &mut read_buf);
+        assert!(result.is_err(), "corrupted page should fail checksum verification");
     }
 }

@@ -36,7 +36,7 @@ impl Database {
         }
 
         let data_path = path.join(PageManager::DATA_FILE);
-        let pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32)?;
+        let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32)?;
 
         // Pre-extend the data file to two pages (superblock + bitmap).
         let handle = fs.open(&data_path, true)?;

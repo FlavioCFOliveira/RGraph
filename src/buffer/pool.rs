@@ -4,6 +4,7 @@ use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::page::{PageId, PAGE_SIZE};
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -194,7 +195,7 @@ impl BufferPool {
 
     /// Mutable access to a frame (safe because the caller holds &mut PageGuard).
     #[allow(clippy::mut_from_ref)]
-    fn frame_mut(&self, fid: FrameId) -> &mut Frame {
+    pub(crate) fn frame_mut(&self, fid: FrameId) -> &mut Frame {
         // SAFETY: The caller holds a &mut PageGuard, which means no other
         // reference to this specific frame exists through guards.
         unsafe { (&mut (*self.frames.get())).get_mut(fid as usize).unwrap() }
@@ -237,6 +238,14 @@ impl BufferPool {
         // can access (it is not yet in the page table).
         let buf = unsafe { &mut (&mut (*self.frames.get()))[fid as usize].buf };
         handle.read_at(buf, offset)?;
+
+        // Verify checksum before marking the page valid.
+        if !crate::storage::page::SlottedPage::verify_checksum_bytes(buf) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("page {} checksum mismatch", page_id),
+            ));
+        }
 
         // Update descriptor.
         frame.desc.reset();
@@ -313,7 +322,7 @@ impl BufferPool {
             }
             match self.find_free_frame(fs) {
                 Ok(fid) => {
-                    let frame = self.frame(fid);
+                    let _frame = self.frame(fid);
                     // SAFETY: we have exclusive access to this free frame.
                     let buf = unsafe { &mut (&mut (*self.frames.get()))[fid as usize].buf };
                     bufs.push(&mut buf[..]);
@@ -332,18 +341,28 @@ impl BufferPool {
         let handle = fs.open(&self.data_path, false)?;
         handle.readv_at(&mut bufs, offset)?;
 
-        // Update descriptors and insert into page table.
-        for (fid, page_id) in frames_to_fill {
-            let frame = self.frame(fid);
+        // Verify checksums and update descriptors.
+        for (fid, page_id) in &frames_to_fill {
+            let buf = unsafe { &(&(*self.frames.get()))[*fid as usize].buf[..] };
+            if !crate::storage::page::SlottedPage::verify_checksum_bytes(buf) {
+                // Evict the frame and skip the corrupt page.
+                let frame = self.frame(*fid);
+                frame.desc.reset();
+                let shard_idx = Self::shard_index(*page_id);
+                let mut shard = self.shards[shard_idx].lock().unwrap();
+                shard.remove(page_id);
+                continue;
+            }
+            let frame = self.frame(*fid);
             frame.desc.reset();
-            frame.desc.page_id.store(page_id, Ordering::Relaxed);
+            frame.desc.page_id.store(*page_id, Ordering::Relaxed);
             frame.desc.state.store(FrameState::Clean as u8, Ordering::Relaxed);
             frame.desc.pin_count.store(0, Ordering::Relaxed);
             frame.desc.clock_ref.store(false, Ordering::Relaxed);
 
-            let shard_idx = Self::shard_index(page_id);
+            let shard_idx = Self::shard_index(*page_id);
             let mut shard = self.shards[shard_idx].lock().unwrap();
-            shard.entry(page_id).or_insert(fid);
+            shard.entry(*page_id).or_insert(*fid);
         }
 
         Ok(())
@@ -466,13 +485,17 @@ impl BufferPool {
 
         let offset = page_id * PAGE_SIZE as u64;
         let handle = fs.open(&self.data_path, false)?;
-        handle.write_at(&frame.buf, offset)?;
+
+        // Update checksum on the frame buffer before writing.
+        let frame_mut = self.frame_mut(frame_id);
+        crate::storage::page::SlottedPage::update_checksum_bytes(&mut frame_mut.buf);
+        handle.write_at(&frame_mut.buf, offset)?;
         handle.sync_data()?;
 
-        frame.desc.dirty.store(false, Ordering::Release);
-        frame.desc.state.store(FrameState::Clean as u8, Ordering::Release);
-        frame.desc.io_inflight.store(false, Ordering::Release);
-        frame.desc.rec_lsn.store(u64::MAX, Ordering::Relaxed);
+        frame_mut.desc.dirty.store(false, Ordering::Release);
+        frame_mut.desc.state.store(FrameState::Clean as u8, Ordering::Release);
+        frame_mut.desc.io_inflight.store(false, Ordering::Release);
+        frame_mut.desc.rec_lsn.store(u64::MAX, Ordering::Relaxed);
         Ok(())
     }
 
@@ -537,34 +560,46 @@ mod tests {
     use std::io::Write;
 
     fn temp_pool(frames: u32) -> (tempfile::TempDir, PosixFileSystem, BufferPool) {
+        use crate::storage::page::{PageType, SlottedPage};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rgraph.db");
         let fs = PosixFileSystem::new(false);
-        // Create empty data file so open works.
-        let mut f = std::fs::File::create(&path).unwrap();
         // Pre-allocate enough space for test page ids (up to ~64 pages).
         let file_pages = (frames as u64).max(64);
-        f.set_len(file_pages * PAGE_SIZE as u64).unwrap();
-        f.flush().unwrap();
-        drop(f);
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.set_len(file_pages * PAGE_SIZE as u64).unwrap();
+            f.flush().unwrap();
+        }
+        // Initialize all pages with valid checksums so fix_page does not fail.
+        let handle = fs.open(&path, false).unwrap();
+        for pid in 0..file_pages {
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.update_checksum();
+            handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
+        }
+        handle.sync_data().unwrap();
+        drop(handle);
         let pool = BufferPool::new(frames, path);
         (dir, fs, pool)
     }
 
     #[test]
     fn fix_unreferenced_page_reads_from_disk() {
+        use crate::storage::page::{PageType, SlottedPage};
         let (_dir, fs, pool) = temp_pool(4);
-        // Write known data directly to disk at page 3.
-        let mut write_buf = AlignedBuffer::zeroed(PAGE_SIZE);
-        write_buf[0] = 0xCA;
-        write_buf[1] = 0xFE;
+        // Write a valid page with known data in the data area at page 3.
+        let mut page = SlottedPage::init(3, PageType::SlottedData);
+        page.buf[SlottedPage::HEADER_SIZE] = 0xCA;
+        page.buf[SlottedPage::HEADER_SIZE + 1] = 0xFE;
+        page.update_checksum();
         let handle = fs.open(&pool.data_path, false).unwrap();
-        handle.write_at(&write_buf, 3 * PAGE_SIZE as u64).unwrap();
+        handle.write_at(&page.buf, 3 * PAGE_SIZE as u64).unwrap();
         handle.sync_data().unwrap();
 
         let guard = pool.fix_page(&fs, 3).unwrap();
-        assert_eq!(guard.buf()[0], 0xCA);
-        assert_eq!(guard.buf()[1], 0xFE);
+        assert_eq!(guard.buf()[SlottedPage::HEADER_SIZE], 0xCA);
+        assert_eq!(guard.buf()[SlottedPage::HEADER_SIZE + 1], 0xFE);
     }
 
     #[test]
@@ -686,13 +721,15 @@ mod tests {
 
     #[test]
     fn readahead_prefetches_sequential_pages() {
+        use crate::storage::page::{PageType, SlottedPage};
         let (_dir, fs, pool) = temp_pool(64);
-        // Pre-write pages 10, 11, 12, 13 to disk.
+        // Pre-write valid pages 10, 11, 12, 13 to disk.
         let handle = fs.open(&pool.data_path, false).unwrap();
         for pid in 10..=13 {
-            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
-            buf[0] = pid as u8;
-            handle.write_at(&buf, pid * PAGE_SIZE as u64).unwrap();
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.buf[SlottedPage::HEADER_SIZE] = pid as u8;
+            page.update_checksum();
+            handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
         }
         handle.sync_data().unwrap();
         drop(handle);
@@ -710,13 +747,15 @@ mod tests {
 
     #[test]
     fn random_access_does_not_prefetch() {
+        use crate::storage::page::{PageType, SlottedPage};
         let (_dir, fs, pool) = temp_pool(64);
-        // Pre-write pages 100 and 200.
+        // Pre-write valid pages 100 and 200.
         let handle = fs.open(&pool.data_path, false).unwrap();
         for pid in [100u64, 200] {
-            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
-            buf[0] = pid as u8;
-            handle.write_at(&buf, pid * PAGE_SIZE as u64).unwrap();
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.buf[SlottedPage::HEADER_SIZE] = pid as u8;
+            page.update_checksum();
+            handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
         }
         handle.sync_data().unwrap();
         drop(handle);
@@ -732,13 +771,25 @@ mod tests {
 
     #[test]
     fn numa_pool_partitions_frames() {
+        use crate::storage::page::{PageType, SlottedPage};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rgraph.db");
         let fs = PosixFileSystem::new(false);
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.set_len(64 * PAGE_SIZE as u64).unwrap();
-        f.flush().unwrap();
-        drop(f);
+        let file_pages = 64u64;
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.set_len(file_pages * PAGE_SIZE as u64).unwrap();
+            f.flush().unwrap();
+        }
+        // Initialize all pages with valid checksums.
+        let handle = fs.open(&path, false).unwrap();
+        for pid in 0..file_pages {
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.update_checksum();
+            handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
+        }
+        handle.sync_data().unwrap();
+        drop(handle);
 
         let topo = NumaTopology {
             node_count: 2,
@@ -749,5 +800,29 @@ mod tests {
         // On non-Linux or when mbind fails, it falls back to standard alloc.
         // The test simply ensures no panic and that the pool has 4 frames.
         assert_eq!(pool.frame_count, 4);
+    }
+
+    #[test]
+    fn fix_page_detects_corruption() {
+        use crate::storage::page::{PageType, SlottedPage};
+        let (_dir, fs, pool) = temp_pool(4);
+        // Pre-write a valid page at page 5.
+        let handle = fs.open(&pool.data_path, false).unwrap();
+        let mut page = SlottedPage::init(5, PageType::SlottedData);
+        page.buf[SlottedPage::HEADER_SIZE] = 0xAB;
+        page.update_checksum();
+        handle.write_at(&page.buf, 5 * PAGE_SIZE as u64).unwrap();
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        // Corrupt it on disk.
+        let handle = fs.open(&pool.data_path, false).unwrap();
+        let corrupt_offset = 5 * PAGE_SIZE as u64 + SlottedPage::HEADER_SIZE as u64 + 10;
+        handle.write_at(&[0xFF], corrupt_offset).unwrap();
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        let result = pool.fix_page(&fs, 5);
+        assert!(result.is_err(), "corrupted page should fail checksum verification");
     }
 }

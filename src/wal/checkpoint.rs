@@ -78,16 +78,27 @@ mod tests {
 
     #[test]
     fn checkpoint_flushes_and_marks() {
+        use crate::storage::page::{PageType, SlottedPage};
         let dir = tempfile::tempdir().unwrap();
         let data_path = dir.path().join("rgraph.db");
         let wal_dir = dir.path().join("wal");
         let fs = Arc::new(PosixFileSystem::new(false));
 
-        // Pre-allocate data file.
-        let mut f = std::fs::File::create(&data_path).unwrap();
-        f.set_len(64 * crate::storage::page::PAGE_SIZE as u64).unwrap();
-        f.flush().unwrap();
-        drop(f);
+        // Pre-allocate data file and initialize pages with valid checksums.
+        let file_pages = 64u64;
+        {
+            let mut f = std::fs::File::create(&data_path).unwrap();
+            f.set_len(file_pages * crate::storage::page::PAGE_SIZE as u64).unwrap();
+            f.flush().unwrap();
+        }
+        let handle = fs.open(&data_path, false).unwrap();
+        for pid in 0..file_pages {
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.update_checksum();
+            handle.write_at(&page.buf, pid * crate::storage::page::PAGE_SIZE as u64).unwrap();
+        }
+        handle.sync_data().unwrap();
+        drop(handle);
 
         let pool = BufferPool::new(4, data_path);
         let mut wal = WalWriter::open(wal_dir, fs.as_ref()).unwrap();
