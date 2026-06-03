@@ -129,6 +129,14 @@ pub enum Expression {
     IsNotNull(Box<Expression>),
     List(Vec<Expression>),
     Map(Vec<(String, Expression)>),
+    /// Function call: `name(args...)`.
+    FunctionCall {
+        name: String,
+        args: Vec<Expression>,
+        distinct: bool,
+    },
+    /// Wildcard `*` used inside `count(*)`.
+    Wildcard,
 }
 
 /// Binary arithmetic operators.
@@ -330,6 +338,12 @@ impl std::fmt::Display for Expression {
                     .collect();
                 write!(f, "{{{}}}", elems.join(", "))
             }
+            Expression::FunctionCall { name, args, distinct } => {
+                let prefix = if *distinct { "DISTINCT " } else { "" };
+                let elems: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                write!(f, "{}{}({})", prefix, name, elems.join(", "))
+            }
+            Expression::Wildcard => write!(f, "*"),
         }
     }
 }

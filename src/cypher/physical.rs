@@ -510,6 +510,180 @@ impl PhysicalOperator for CreateOp {
     fn reset(&mut self) {}
 }
 
+/// Aggregate operator with implicit grouping.
+pub struct AggregateOp {
+    grouping_keys: Vec<Expression>,
+    aggregations: Vec<crate::cypher::plan::Aggregation>,
+    input: Box<dyn PhysicalOperator>,
+    /// Buffered after first pull (eager materialisation).
+    buffer: Option<Vec<Row>>,
+    idx: usize,
+}
+
+impl AggregateOp {
+    pub fn new(
+        grouping_keys: Vec<Expression>,
+        aggregations: Vec<crate::cypher::plan::Aggregation>,
+        input: Box<dyn PhysicalOperator>,
+    ) -> Self {
+        Self {
+            grouping_keys,
+            aggregations,
+            input,
+            buffer: None,
+            idx: 0,
+        }
+    }
+}
+
+impl PhysicalOperator for AggregateOp {
+    fn next_row(
+        &mut self,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<Row>, ExecError> {
+        if self.buffer.is_none() {
+            let mut groups: Vec<(Vec<Value>, Vec<Row>)> = Vec::new();
+
+            // Consume all input rows and partition by grouping keys.
+            while let Some(row) = self.input.next_row(ctx)? {
+                let eval_ctx = row_to_eval_context(&row);
+                let key: Vec<Value> = self
+                    .grouping_keys
+                    .iter()
+                    .map(|gk| evaluate(gk, &eval_ctx).unwrap_or(Value::Null))
+                    .collect();
+                if let Some((_k, rows)) = groups.iter_mut().find(|(k, _)| k == &key) {
+                    rows.push(row);
+                } else {
+                    groups.push((key, vec![row]));
+                }
+            }
+
+            // Compute one output row per group.
+            let mut out = Vec::new();
+            for (key_values, rows) in groups {
+                let mut result_row = empty_row();
+                // Bind grouping keys (using their string repr as variable names).
+                for (i, gk) in self.grouping_keys.iter().enumerate() {
+                    result_row.insert(gk.to_string(), key_values[i].clone());
+                }
+                // Compute each aggregate.
+                for agg in &self.aggregations {
+                    let val = compute_aggregate(&agg.function, &agg.argument, &rows, agg.distinct)?;
+                    result_row.insert(agg.alias.clone(), val);
+                }
+                out.push(result_row);
+            }
+            self.buffer = Some(out);
+        }
+        let buf = self.buffer.as_ref().unwrap();
+        if self.idx >= buf.len() {
+            return Ok(None);
+        }
+        let row = buf[self.idx].clone();
+        self.idx += 1;
+        Ok(Some(row))
+    }
+
+    fn reset(&mut self) {
+        self.buffer = None;
+        self.idx = 0;
+        self.input.reset();
+    }
+}
+
+fn compute_aggregate(
+    func: &crate::cypher::plan::AggregateFunction,
+    arg: &Expression,
+    rows: &[Row],
+    distinct: bool,
+) -> Result<Value, ExecError> {
+    use crate::cypher::plan::AggregateFunction;
+
+    // Wildcard `*` means count rows directly without evaluating an expression.
+    let is_wildcard = matches!(arg, Expression::Wildcard);
+
+    let mut values: Vec<Value> = Vec::new();
+    if is_wildcard {
+        // For count(*), each row contributes one value.
+        for _ in rows {
+            values.push(Value::Integer(1));
+        }
+    } else {
+        for row in rows {
+            let eval_ctx = row_to_eval_context(row);
+            match evaluate(arg, &eval_ctx) {
+                Ok(v) => values.push(v),
+                Err(_) => {} // skip rows where argument evaluates to error
+            }
+        }
+    }
+
+    if distinct {
+        values.sort_by(|a, b| compare_values(a, b, true));
+        values.dedup();
+    }
+
+    match func {
+        AggregateFunction::Count => Ok(Value::Integer(values.len() as i64)),
+        AggregateFunction::Collect => {
+            // collect(NULL) returns [NULL], not []
+            if values.is_empty() {
+                return Ok(Value::List(vec![]));
+            }
+            Ok(Value::List(values))
+        }
+        AggregateFunction::Sum => {
+            let mut sum = Value::Integer(0);
+            for v in values {
+                sum = sum.add(&v).ok_or_else(|| ExecError::Eval(
+                    "type mismatch in sum".to_string()
+                ))?;
+            }
+            Ok(sum)
+        }
+        AggregateFunction::Avg => {
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut sum = Value::Integer(0);
+            for v in &values {
+                sum = sum.add(v).ok_or_else(|| ExecError::Eval(
+                    "type mismatch in avg".to_string()
+                ))?;
+            }
+            let count = Value::Integer(values.len() as i64);
+            sum.div(&count).ok_or_else(|| ExecError::Eval(
+                "type mismatch in avg".to_string()
+            ))
+        }
+        AggregateFunction::Min => {
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut min = values[0].clone();
+            for v in values.into_iter().skip(1) {
+                if compare_values(&v, &min, true) == std::cmp::Ordering::Less {
+                    min = v;
+                }
+            }
+            Ok(min)
+        }
+        AggregateFunction::Max => {
+            if values.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut max = values[0].clone();
+            for v in values.into_iter().skip(1) {
+                if compare_values(&v, &max, true) == std::cmp::Ordering::Greater {
+                    max = v;
+                }
+            }
+            Ok(max)
+        }
+    }
+}
+
 // ------------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------------
@@ -615,6 +789,15 @@ fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
             let _r = build_physical_operator(right);
             Box::new(AllNodesScanOp::new()) // stub
         }
+        LogicalOperator::Aggregate {
+            input,
+            grouping_keys,
+            aggregations,
+        } => Box::new(AggregateOp::new(
+            grouping_keys.clone(),
+            aggregations.clone(),
+            build_physical_operator(input),
+        )),
         LogicalOperator::HashJoin { left, right, .. } => {
             let _l = build_physical_operator(left);
             let _r = build_physical_operator(right);
@@ -740,6 +923,56 @@ mod tests {
         assert_eq!(row.get("i"), Some(&Value::Integer(2)));
         assert!(skip.next_row(&ctx).unwrap().is_some());
         assert!(skip.next_row(&ctx).unwrap().is_none());
+    }
+
+    #[test]
+    fn aggregate_op_count_grouped() {
+        let input = Box::new(MockOp::new(vec![
+            vec![("dept".to_string(), Value::String("a".to_string())), ("salary".to_string(), Value::Integer(100))].into_iter().collect(),
+            vec![("dept".to_string(), Value::String("a".to_string())), ("salary".to_string(), Value::Integer(200))].into_iter().collect(),
+            vec![("dept".to_string(), Value::String("b".to_string())), ("salary".to_string(), Value::Integer(300))].into_iter().collect(),
+        ]));
+        let mut agg = AggregateOp::new(
+            vec![Expression::Variable("dept".to_string())],
+            vec![crate::cypher::plan::Aggregation {
+                alias: "c".to_string(),
+                function: crate::cypher::plan::AggregateFunction::Count,
+                argument: Expression::Wildcard,
+                distinct: false,
+            }],
+            input,
+        );
+        let ctx = mock_ctx();
+        let mut results = Vec::new();
+        while let Some(row) = agg.next_row(&ctx).unwrap() {
+            results.push(row);
+        }
+        assert_eq!(results.len(), 2);
+        // Find group 'a'
+        let group_a = results.iter().find(|r| r.get("dept") == Some(&Value::String("a".to_string()))).unwrap();
+        assert_eq!(group_a.get("c"), Some(&Value::Integer(2)));
+        let group_b = results.iter().find(|r| r.get("dept") == Some(&Value::String("b".to_string()))).unwrap();
+        assert_eq!(group_b.get("c"), Some(&Value::Integer(1)));
+    }
+
+    #[test]
+    fn aggregate_op_collect_returns_null_in_list() {
+        let input = Box::new(MockOp::new(vec![
+            vec![("v".to_string(), Value::Null)].into_iter().collect(),
+        ]));
+        let mut agg = AggregateOp::new(
+            vec![],
+            vec![crate::cypher::plan::Aggregation {
+                alias: "items".to_string(),
+                function: crate::cypher::plan::AggregateFunction::Collect,
+                argument: Expression::Variable("v".to_string()),
+                distinct: false,
+            }],
+            input,
+        );
+        let ctx = mock_ctx();
+        let row = agg.next_row(&ctx).unwrap().unwrap();
+        assert_eq!(row.get("items"), Some(&Value::List(vec![Value::Null])));
     }
 
     // ------------------------------------------------------------------

@@ -162,6 +162,12 @@ fn check_expression_variables(
                 check_expression_variables(v, scope)?;
             }
         }
+        Expression::FunctionCall { args, .. } => {
+            for arg in args {
+                check_expression_variables(arg, scope)?;
+            }
+        }
+        Expression::Wildcard => {}
         Expression::Literal(_) => {}
     }
     Ok(())

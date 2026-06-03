@@ -90,6 +90,35 @@ pub enum LogicalOperator {
         right: Box<LogicalOperator>,
         join_keys: Vec<String>,
     },
+
+    /// Aggregate with optional implicit grouping keys.
+    Aggregate {
+        input: Box<LogicalOperator>,
+        /// Expressions that form the grouping keys (implicit or explicit).
+        grouping_keys: Vec<Expression>,
+        /// Aggregate projections: (alias, function_name, argument_expression, distinct).
+        aggregations: Vec<Aggregation>,
+    },
+}
+
+/// One aggregate expression in an `Aggregate` operator.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Aggregation {
+    pub alias: String,
+    pub function: AggregateFunction,
+    pub argument: Expression,
+    pub distinct: bool,
+}
+
+/// Supported aggregate functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunction {
+    Count,
+    Collect,
+    Sum,
+    Avg,
+    Min,
+    Max,
 }
 
 impl LogicalPlan {
@@ -198,6 +227,23 @@ impl LogicalOperator {
                 left.explain_inner(out, depth + 1);
                 right.explain_inner(out, depth + 1);
             }
+            LogicalOperator::Aggregate {
+                input,
+                grouping_keys,
+                aggregations,
+            } => {
+                let funcs: Vec<String> = aggregations
+                    .iter()
+                    .map(|a| format!("{}({})", a.function, a.argument))
+                    .collect();
+                out.push_str(&format!(
+                    "{}Aggregate [group:{}] [agg:{}]\n",
+                    indent,
+                    grouping_keys.len(),
+                    funcs.join(", ")
+                ));
+                input.explain_inner(out, depth + 1);
+            }
         }
     }
 
@@ -228,6 +274,14 @@ impl LogicalOperator {
                         .clone()
                         .unwrap_or_else(|| p.expression.to_string());
                     vars.push(name);
+                }
+            }
+            LogicalOperator::Aggregate { grouping_keys, aggregations, .. } => {
+                for gk in grouping_keys {
+                    collect_expression_variables(gk, &mut vars);
+                }
+                for agg in aggregations {
+                    vars.push(agg.alias.clone());
                 }
             }
             LogicalOperator::Sort { .. } => {}
@@ -274,6 +328,14 @@ impl LogicalOperator {
             LogicalOperator::Project { projections, .. } => {
                 for p in projections {
                     collect_expression_variables(&p.expression, &mut vars);
+                }
+            }
+            LogicalOperator::Aggregate { grouping_keys, aggregations, .. } => {
+                for gk in grouping_keys {
+                    collect_expression_variables(gk, &mut vars);
+                }
+                for agg in aggregations {
+                    collect_expression_variables(&agg.argument, &mut vars);
                 }
             }
             LogicalOperator::Sort { order_by, .. } => {
@@ -339,7 +401,26 @@ fn collect_expression_variables(expr: &Expression, vars: &mut Vec<String>) {
                 collect_expression_variables(v, vars);
             }
         }
+        Expression::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_expression_variables(arg, vars);
+            }
+        }
+        Expression::Wildcard => {}
         Expression::Literal(_) => {}
+    }
+}
+
+impl std::fmt::Display for AggregateFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AggregateFunction::Count => write!(f, "count"),
+            AggregateFunction::Collect => write!(f, "collect"),
+            AggregateFunction::Sum => write!(f, "sum"),
+            AggregateFunction::Avg => write!(f, "avg"),
+            AggregateFunction::Min => write!(f, "min"),
+            AggregateFunction::Max => write!(f, "max"),
+        }
     }
 }
 

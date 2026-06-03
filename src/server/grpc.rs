@@ -127,6 +127,12 @@ impl CypherQueryService {
             Expression::IsNull(_) | Expression::IsNotNull(_) => Err(RGraphError::Semantic(
                 "IS NULL / IS NOT NULL not yet implemented".into(),
             )),
+            Expression::Wildcard => Err(RGraphError::Semantic(
+                "Wildcard * not yet implemented in gRPC evaluator".into(),
+            )),
+            Expression::FunctionCall { .. } => Err(RGraphError::Semantic(
+                "Function calls not yet implemented in gRPC evaluator".into(),
+            )),
         }
     }
 

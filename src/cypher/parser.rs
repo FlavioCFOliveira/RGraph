@@ -641,6 +641,54 @@ impl Parser {
                         base: Box::new(Expression::Variable(ident)),
                         property: prop,
                     })
+                } else if self.peek_char() == Some('(') {
+                    // Function call: ident(args...)
+                    self.advance(); // consume '('
+                    self.skip_whitespace();
+                    let mut args = Vec::new();
+                    if self.peek_char() != Some(')') {
+                        loop {
+                            self.skip_whitespace();
+                            // Support DISTINCT keyword as first argument.
+                            let arg_start = self.pos;
+                            let arg_line = self.line;
+                            let arg_col = self.column;
+                            let kw = self.read_keyword().to_ascii_uppercase();
+                            let distinct = if kw == "DISTINCT" {
+                                self.skip_whitespace();
+                                true
+                            } else {
+                                self.pos = arg_start;
+                                self.line = arg_line;
+                                self.column = arg_col;
+                                false
+                            };
+                            // Handle wildcard `*` as a special argument.
+                            if self.peek_char() == Some('*') {
+                                self.advance();
+                                args.push(Expression::Wildcard);
+                            } else {
+                                let arg = self.parse_expression(0)?;
+                                args.push(arg);
+                            }
+                            self.skip_whitespace();
+                            if self.peek_char() == Some(',') {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.skip_whitespace();
+                    if self.peek_char() != Some(')') {
+                        return Err(self.error("expected ')' to end function call"));
+                    }
+                    self.advance(); // consume ')'
+                    Ok(Expression::FunctionCall {
+                        name: ident,
+                        args,
+                        distinct: false, // TODO: propagate distinct correctly
+                    })
                 } else {
                     match ident.to_ascii_uppercase().as_str() {
                         "TRUE" => Ok(Expression::Literal(Literal::Boolean(true))),
@@ -1015,6 +1063,36 @@ mod tests {
         if let Clause::Return(r) = &stmt.clauses[0] {
             assert_eq!(r.skip, Some(Expression::Literal(Literal::Integer(5))));
             assert_eq!(r.limit, Some(Expression::Literal(Literal::Integer(10))));
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_function_call() {
+        let stmt = parse("RETURN count(*)").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            if let Expression::FunctionCall { name, args, .. } = &r.projections[0].expression {
+                assert_eq!(name, "count");
+                assert_eq!(args.len(), 1);
+            } else {
+                panic!("expected function call");
+            }
+        } else {
+            panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn parse_function_call_with_args() {
+        let stmt = parse("RETURN collect(n.name)").unwrap();
+        if let Clause::Return(r) = &stmt.clauses[0] {
+            if let Expression::FunctionCall { name, args, .. } = &r.projections[0].expression {
+                assert_eq!(name, "collect");
+                assert_eq!(args.len(), 1);
+            } else {
+                panic!("expected function call");
+            }
         } else {
             panic!("expected RETURN clause");
         }

@@ -173,6 +173,19 @@ pub fn evaluate(expr: &Expression, ctx: &EvalContext) -> Result<Value, EvalError
             }
             Ok(Value::Map(map))
         }
+        Expression::Wildcard => {
+            Err(EvalError {
+                message: "wildcard * cannot be evaluated in expression context".to_string(),
+            })
+        }
+        Expression::FunctionCall { name, .. } => {
+            // For Sprint 21, aggregate functions are evaluated in the
+            // AggregateOp physical operator, not here.  Scalar functions
+            // (e.g. toString, size) are not yet supported.
+            Err(EvalError {
+                message: format!("function '{}' not supported in expression evaluator", name),
+            })
+        }
     }
 }
 

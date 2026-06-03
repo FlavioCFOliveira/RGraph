@@ -187,10 +187,11 @@ fn find_next_node_variable<'a>(
 /// The tree is stacked as:
 /// ```text
 /// Project
-///   Sort (optional)
-///     Skip (optional)
-///       Limit (optional)
-///         input
+///   Aggregate (optional, if projections contain aggregate functions)
+///     Sort (optional)
+///       Skip (optional)
+///         Limit (optional)
+///           input
 /// ```
 fn build_return_plan(
     ret: &ReturnClause,
@@ -219,12 +220,95 @@ fn build_return_plan(
         };
     }
 
-    op = LogicalOperator::Project {
-        input: Box::new(op),
-        projections: ret.projections.clone(),
-    };
+    // Detect aggregate functions in projections.
+    let (grouping_projections, aggregate_projections): (Vec<_>, Vec<_>) = ret
+        .projections
+        .iter()
+        .cloned()
+        .partition(|p| !is_aggregate_expression(&p.expression));
+
+    if !aggregate_projections.is_empty() {
+        // Build aggregation operator.
+        let grouping_keys: Vec<Expression> = grouping_projections
+            .iter()
+            .map(|p| p.expression.clone())
+            .collect();
+        let aggregations: Vec<crate::cypher::plan::Aggregation> = aggregate_projections
+            .iter()
+            .map(|p| {
+                let (func, arg, distinct) = extract_aggregate(&p.expression).unwrap_or((
+                    crate::cypher::plan::AggregateFunction::Count,
+                    Expression::Literal(crate::cypher::ast::Literal::Null),
+                    false,
+                ));
+                crate::cypher::plan::Aggregation {
+                    alias: p.alias.clone().unwrap_or_else(|| p.expression.to_string()),
+                    function: func,
+                    argument: arg,
+                    distinct,
+                }
+            })
+            .collect();
+
+        op = LogicalOperator::Aggregate {
+            input: Box::new(op),
+            grouping_keys,
+            aggregations,
+        };
+
+        // Wrap in Project so that aliases and column order are preserved.
+        op = LogicalOperator::Project {
+            input: Box::new(op),
+            projections: ret.projections.clone(),
+        };
+    } else {
+        op = LogicalOperator::Project {
+            input: Box::new(op),
+            projections: ret.projections.clone(),
+        };
+    }
 
     Ok(op)
+}
+
+/// Return `true` if the expression contains an aggregate function call.
+fn is_aggregate_expression(expr: &Expression) -> bool {
+    match expr {
+        Expression::FunctionCall { name, .. } => {
+            matches!(
+                name.to_ascii_uppercase().as_str(),
+                "COUNT" | "COLLECT" | "SUM" | "AVG" | "MIN" | "MAX"
+            )
+        }
+        Expression::BinaryOp { left, right, .. } => {
+            is_aggregate_expression(left) || is_aggregate_expression(right)
+        }
+        _ => false,
+    }
+}
+
+/// Extract aggregate function details from an expression.
+fn extract_aggregate(expr: &Expression) -> Option<(
+    crate::cypher::plan::AggregateFunction,
+    Expression,
+    bool,
+)> {
+    if let Expression::FunctionCall { name, args, distinct } = expr {
+        let func = match name.to_ascii_uppercase().as_str() {
+            "COUNT" => crate::cypher::plan::AggregateFunction::Count,
+            "COLLECT" => crate::cypher::plan::AggregateFunction::Collect,
+            "SUM" => crate::cypher::plan::AggregateFunction::Sum,
+            "AVG" => crate::cypher::plan::AggregateFunction::Avg,
+            "MIN" => crate::cypher::plan::AggregateFunction::Min,
+            "MAX" => crate::cypher::plan::AggregateFunction::Max,
+            _ => return None,
+        };
+        let arg = args.first().cloned().unwrap_or(Expression::Literal(
+            crate::cypher::ast::Literal::Null,
+        ));
+        return Some((func, arg, *distinct));
+    }
+    None
 }
 
 #[cfg(test)]
