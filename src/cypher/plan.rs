@@ -76,7 +76,25 @@ pub enum LogicalOperator {
     },
 
     /// Create new nodes and/or relationships.
-    Create { pattern: Pattern },
+    ///
+    /// A standalone `CREATE` has no `input`.  When the clause is preceded by a
+    /// reading clause (`MATCH ... CREATE ...`) the matched rows flow in through
+    /// `input`, and the `CREATE` runs once per incoming row.
+    Create {
+        input: Option<Box<LogicalOperator>>,
+        pattern: Pattern,
+    },
+
+    /// Eager barrier — fully materialise the input rows before yielding any
+    /// row to the parent operator.
+    ///
+    /// The planner inserts this between a read sub-tree and a write operator
+    /// when the write could produce entities the read would otherwise observe
+    /// while still streaming (the "Halloween problem").  Materialising the read
+    /// set freezes it, so newly created nodes/relationships cannot re-enter the
+    /// scan that is driving the write.  The barrier is transparent: it yields
+    /// exactly the rows it buffered, in order.
+    Eager { input: Box<LogicalOperator> },
 
     /// Delete nodes and/or relationships.
     Delete {
@@ -233,8 +251,15 @@ impl LogicalOperator {
                 out.push_str(&format!("{}Limit [{}]\n", indent, expression));
                 input.explain_inner(out, depth + 1);
             }
-            LogicalOperator::Create { pattern } => {
+            LogicalOperator::Create { input, pattern } => {
                 out.push_str(&format!("{}Create [{}]\n", indent, pattern));
+                if let Some(inp) = input {
+                    inp.explain_inner(out, depth + 1);
+                }
+            }
+            LogicalOperator::Eager { input } => {
+                out.push_str(&format!("{}Eager\n", indent));
+                input.explain_inner(out, depth + 1);
             }
             LogicalOperator::Delete { input, .. } => {
                 out.push_str(&format!("{}Delete\n", indent));
@@ -330,19 +355,29 @@ impl LogicalOperator {
             LogicalOperator::Sort { .. } => {}
             LogicalOperator::Skip { .. } => {}
             LogicalOperator::Limit { .. } => {}
-            LogicalOperator::Create { pattern } => {
+            LogicalOperator::Create { input, pattern } => {
+                if let Some(inp) = input {
+                    vars.extend(inp.output_variables());
+                }
                 for elem in &pattern.elements {
                     if let PatternElement::Node(n) = elem {
                         if let Some(v) = &n.variable {
-                            vars.push(v.clone());
+                            if !vars.contains(v) {
+                                vars.push(v.clone());
+                            }
                         }
                     }
                     if let PatternElement::Relationship(r) = elem {
                         if let Some(v) = &r.variable {
-                            vars.push(v.clone());
+                            if !vars.contains(v) {
+                                vars.push(v.clone());
+                            }
                         }
                     }
                 }
+            }
+            LogicalOperator::Eager { input } => {
+                vars.extend(input.output_variables());
             }
             LogicalOperator::Delete { .. } => {}
             LogicalOperator::Set { .. } => {}
@@ -396,7 +431,14 @@ impl LogicalOperator {
             LogicalOperator::Limit { expression, .. } => {
                 collect_expression_variables(expression, &mut vars);
             }
-            LogicalOperator::Create { .. } => {}
+            LogicalOperator::Create { input, .. } => {
+                if let Some(inp) = input {
+                    vars.extend(inp.required_variables());
+                }
+            }
+            LogicalOperator::Eager { input } => {
+                vars.extend(input.required_variables());
+            }
             LogicalOperator::Delete { expressions, .. } => {
                 for expr in expressions {
                     collect_expression_variables(expr, &mut vars);
@@ -659,8 +701,35 @@ mod tests {
                 properties: HashMap::new(),
             })],
         };
-        let op = LogicalOperator::Create { pattern };
+        let op = LogicalOperator::Create { input: None, pattern };
         let vars = op.output_variables();
         assert!(vars.contains(&"n".to_string()));
+    }
+
+    #[test]
+    fn eager_is_transparent_to_variables() {
+        let inner = LogicalOperator::Project {
+            input: Box::new(LogicalOperator::AllNodesScan),
+            projections: vec![Projection {
+                span: None,
+                expression: Expression::Variable("n".to_string()),
+                alias: Some("node".to_string()),
+            }],
+        };
+        let eager = LogicalOperator::Eager {
+            input: Box::new(inner),
+        };
+        // Eager passes through exactly the variables of its input.
+        assert!(eager.output_variables().contains(&"node".to_string()));
+    }
+
+    #[test]
+    fn eager_explain_shows_barrier() {
+        let plan = LogicalPlan::new(LogicalOperator::Eager {
+            input: Box::new(LogicalOperator::AllNodesScan),
+        });
+        let explain = plan.explain();
+        assert!(explain.contains("Eager"));
+        assert!(explain.contains("AllNodesScan"));
     }
 }

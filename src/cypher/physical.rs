@@ -479,35 +479,133 @@ impl PhysicalOperator for LimitOp {
 }
 
 /// Create new nodes / relationships.
+///
+/// When driven by a read sub-tree (`MATCH ... CREATE ...`) the operator runs
+/// once per incoming row, binding the created variables on top of that row.
+/// A standalone `CREATE` (no `input`) emits exactly one row.
 pub struct CreateOp {
     pattern: crate::cypher::ast::Pattern,
+    input: Option<Box<dyn PhysicalOperator>>,
+    /// For the standalone form: whether the single row has been emitted.
+    emitted: bool,
 }
 
 impl CreateOp {
-    pub fn new(pattern: crate::cypher::ast::Pattern) -> Self {
-        Self { pattern }
+    pub fn new(
+        pattern: crate::cypher::ast::Pattern,
+        input: Option<Box<dyn PhysicalOperator>>,
+    ) -> Self {
+        Self {
+            pattern,
+            input,
+            emitted: false,
+        }
+    }
+
+    /// Bind the variables introduced by the CREATE pattern onto `row`.
+    fn bind_created_variables(&self, row: &mut Row) {
+        for elem in &self.pattern.elements {
+            match elem {
+                crate::cypher::ast::PatternElement::Node(n) => {
+                    if let Some(v) = &n.variable {
+                        // TODO: integrate with GraphStorageEngine to create the
+                        // record and bind the real node value.
+                        row.entry(v.clone()).or_insert(Value::Null);
+                    }
+                }
+                crate::cypher::ast::PatternElement::Relationship(r) => {
+                    if let Some(v) = &r.variable {
+                        row.entry(v.clone()).or_insert(Value::Null);
+                    }
+                }
+            }
+        }
     }
 }
 
 impl PhysicalOperator for CreateOp {
     fn next_row(
         &mut self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Option<Row>, ExecError> {
-        // TODO: integrate with GraphStorageEngine to actually create records.
-        // For Sprint 21 we return a single row with the created variables.
-        let mut row = empty_row();
-        for elem in &self.pattern.elements {
-            if let crate::cypher::ast::PatternElement::Node(n) = elem {
-                if let Some(v) = &n.variable {
-                    row.insert(v.clone(), Value::Null); // placeholder
+        match &mut self.input {
+            Some(input) => match input.next_row(ctx)? {
+                Some(mut row) => {
+                    self.bind_created_variables(&mut row);
+                    Ok(Some(row))
                 }
+                None => Ok(None),
+            },
+            None => {
+                if self.emitted {
+                    return Ok(None);
+                }
+                self.emitted = true;
+                let mut row = empty_row();
+                self.bind_created_variables(&mut row);
+                Ok(Some(row))
             }
         }
+    }
+
+    fn reset(&mut self) {
+        self.emitted = false;
+        if let Some(input) = &mut self.input {
+            input.reset();
+        }
+    }
+}
+
+/// Eager barrier — fully materialise the input before yielding any row.
+///
+/// On the first `next_row`, the operator drains its entire input into an
+/// in-memory buffer; subsequent calls yield the buffered rows one at a time.
+/// This freezes the read set so a downstream write cannot feed newly created
+/// entities back into the scan that drives it (the Halloween problem).
+pub struct EagerOp {
+    input: Box<dyn PhysicalOperator>,
+    /// Buffered rows after the first pull (`None` until materialised).
+    buffer: Option<Vec<Row>>,
+    idx: usize,
+}
+
+impl EagerOp {
+    pub fn new(input: Box<dyn PhysicalOperator>) -> Self {
+        Self {
+            input,
+            buffer: None,
+            idx: 0,
+        }
+    }
+}
+
+impl PhysicalOperator for EagerOp {
+    fn next_row(
+        &mut self,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<Row>, ExecError> {
+        if self.buffer.is_none() {
+            // Fully consume the input before yielding the first row.
+            let mut rows = Vec::new();
+            while let Some(row) = self.input.next_row(ctx)? {
+                rows.push(row);
+            }
+            self.buffer = Some(rows);
+        }
+        let buf = self.buffer.as_ref().unwrap();
+        if self.idx >= buf.len() {
+            return Ok(None);
+        }
+        let row = buf[self.idx].clone();
+        self.idx += 1;
         Ok(Some(row))
     }
 
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        self.buffer = None;
+        self.idx = 0;
+        self.input.reset();
+    }
 }
 
 /// Delete nodes / relationships.
@@ -903,7 +1001,13 @@ fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
             expression.clone(),
             build_physical_operator(input),
         )),
-        LogicalOperator::Create { pattern } => Box::new(CreateOp::new(pattern.clone())),
+        LogicalOperator::Create { input, pattern } => {
+            let input_op = input.as_ref().map(|i| build_physical_operator(i));
+            Box::new(CreateOp::new(pattern.clone(), input_op))
+        }
+        LogicalOperator::Eager { input } => {
+            Box::new(EagerOp::new(build_physical_operator(input)))
+        }
         LogicalOperator::Delete { input, expressions, detach } => Box::new(DeleteOp::new(
             expressions.clone(),
             *detach,
@@ -1116,6 +1220,121 @@ mod tests {
         let ctx = mock_ctx();
         let row = agg.next_row(&ctx).unwrap().unwrap();
         assert_eq!(row.get("items"), Some(&Value::List(vec![Value::Null])));
+    }
+
+    #[test]
+    fn eager_op_fully_consumes_input_before_first_yield() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // A mock operator that records how many times it was polled, so we can
+        // prove the Eager barrier drains it completely before yielding.
+        struct CountingOp {
+            n: usize,
+            idx: usize,
+            polls: Rc<Cell<usize>>,
+        }
+        impl PhysicalOperator for CountingOp {
+            fn next_row(
+                &mut self,
+                _ctx: &ExecutionContext,
+            ) -> Result<Option<Row>, ExecError> {
+                self.polls.set(self.polls.get() + 1);
+                if self.idx >= self.n {
+                    return Ok(None);
+                }
+                let mut row = empty_row();
+                row.insert("i".to_string(), Value::Integer(self.idx as i64));
+                self.idx += 1;
+                Ok(Some(row))
+            }
+            fn reset(&mut self) {
+                self.idx = 0;
+            }
+        }
+
+        let polls = Rc::new(Cell::new(0));
+        let input = Box::new(CountingOp {
+            n: 3,
+            idx: 0,
+            polls: Rc::clone(&polls),
+        });
+        let mut eager = EagerOp::new(input);
+        let ctx = mock_ctx();
+
+        // The very first pull must have drained the entire input: 3 data rows
+        // plus the terminating `None` poll = 4 polls.
+        let first = eager.next_row(&ctx).unwrap();
+        assert!(first.is_some());
+        assert_eq!(
+            polls.get(),
+            4,
+            "EagerOp must fully consume its input before yielding the first row"
+        );
+
+        // The remaining rows are served from the buffer — no further input polls.
+        let mut count = 1;
+        while eager.next_row(&ctx).unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 3, "EagerOp must yield exactly the buffered rows");
+        assert_eq!(
+            polls.get(),
+            4,
+            "EagerOp must not poll its input again after materialisation"
+        );
+    }
+
+    #[test]
+    fn create_op_runs_once_per_input_row() {
+        // CREATE driven by a 2-row input binds the created variable on each row.
+        let input = Box::new(MockOp::new(vec![
+            vec![("n".to_string(), Value::Integer(1))]
+                .into_iter()
+                .collect(),
+            vec![("n".to_string(), Value::Integer(2))]
+                .into_iter()
+                .collect(),
+        ]));
+        let pattern = crate::cypher::ast::Pattern {
+            span: None,
+            elements: vec![crate::cypher::ast::PatternElement::Node(
+                crate::cypher::ast::NodePattern {
+                    span: None,
+                    variable: Some("m".to_string()),
+                    labels: vec![],
+                    properties: std::collections::HashMap::new(),
+                },
+            )],
+        };
+        let mut create = CreateOp::new(pattern, Some(input));
+        let ctx = mock_ctx();
+        let mut rows = 0;
+        while let Some(row) = create.next_row(&ctx).unwrap() {
+            assert!(row.contains_key("m"), "created variable must be bound");
+            assert!(row.contains_key("n"), "input variable must be preserved");
+            rows += 1;
+        }
+        assert_eq!(rows, 2, "CREATE must run once per incoming row");
+    }
+
+    #[test]
+    fn create_op_standalone_emits_single_row() {
+        let pattern = crate::cypher::ast::Pattern {
+            span: None,
+            elements: vec![crate::cypher::ast::PatternElement::Node(
+                crate::cypher::ast::NodePattern {
+                    span: None,
+                    variable: Some("n".to_string()),
+                    labels: vec!["Person".to_string()],
+                    properties: std::collections::HashMap::new(),
+                },
+            )],
+        };
+        let mut create = CreateOp::new(pattern, None);
+        let ctx = mock_ctx();
+        assert!(create.next_row(&ctx).unwrap().is_some());
+        assert!(create.next_row(&ctx).unwrap().is_none());
     }
 
     // ------------------------------------------------------------------

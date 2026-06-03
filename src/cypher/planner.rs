@@ -11,6 +11,7 @@
 use crate::cypher::ast::*;
 use crate::cypher::plan::{LogicalOperator, LogicalPlan};
 use crate::error::RGraphError;
+use std::collections::HashSet;
 
 /// Error produced during query planning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,21 +71,14 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
                 });
             }
             Clause::Create(c) => {
-                // CREATE is a standalone write operator.  If there is already
-                // a match plan, we stack Create on top (rare in openCypher but
-                // supported by the grammar).
-                let input = current;
+                // CREATE either runs standalone or is driven by a preceding
+                // reading clause (`MATCH ... CREATE ...`).  The matched rows, if
+                // any, flow in through `input`; the eager-insertion pass below
+                // decides whether a barrier is required between them.
                 current = Some(LogicalOperator::Create {
+                    input: current.map(Box::new),
                     pattern: c.pattern.clone(),
                 });
-                // Preserve input chain if present by wrapping in Apply
-                // (stub — physical engine will handle this properly).
-                if let Some(inp) = input {
-                    current = Some(LogicalOperator::Apply {
-                        left: Box::new(inp),
-                        right: Box::new(current.unwrap()),
-                    });
-                }
             }
             Clause::Delete(d) => {
                 let input = current.unwrap_or(LogicalOperator::AllNodesScan);
@@ -124,6 +118,9 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
     }
 
     let root = current.unwrap_or(LogicalOperator::AllNodesScan);
+    // Insert Eager barriers wherever a write could feed entities back into the
+    // read that drives it (the Halloween problem).  See [`insert_eager`].
+    let root = insert_eager(root);
     Ok(LogicalPlan::new(root))
 }
 
@@ -342,6 +339,322 @@ fn extract_aggregate(expr: &Expression) -> Option<(
     None
 }
 
+// ------------------------------------------------------------------
+// Eager-barrier insertion (Halloween-problem protection)
+// ------------------------------------------------------------------
+//
+// openCypher write semantics require that a clause does not observe entities
+// produced by a write it logically drives.  In a pull-based pipeline, a lazily
+// streamed read (e.g. `AllNodesScan`) feeding a `CREATE` of new nodes could
+// re-observe those newly created nodes — an unbounded loop known as the
+// Halloween problem.  Neo4j prevents this by inserting an `Eager` operator that
+// fully materialises the read set before the write runs; we do the same.
+//
+// Eager is a *mechanism*, not a spec construct: what the TCK mandates is the
+// observable result (e.g. `MATCH (n) CREATE (n)-[:R]->(m)` over 3 nodes yields
+// exactly 3 new nodes, never 6 or infinite).  The barrier — together with the
+// storage layer's statement-level MVCC snapshot — is how we guarantee it.
+
+/// The footprint of graph entities a read sub-tree may observe.
+///
+/// `any_node` / `any_rel` mark *universal* reads (an unlabelled node scan or an
+/// untyped relationship expand) that match anything of that kind and therefore
+/// conflict with any created entity of that kind.
+#[derive(Debug, Default)]
+struct ReadFootprint {
+    any_node: bool,
+    node_labels: HashSet<String>,
+    any_rel: bool,
+    rel_types: HashSet<String>,
+}
+
+/// The footprint of graph entities a create-style write produces.
+#[derive(Debug, Default)]
+struct CreateFootprint {
+    /// A node with no labels is created — matchable only by an all-nodes scan.
+    creates_unlabelled_node: bool,
+    created_node_labels: HashSet<String>,
+    /// A relationship with no type is created (kept for completeness; `CREATE`
+    /// always types its relationships, but a variable-only form may not).
+    creates_untyped_rel: bool,
+    created_rel_types: HashSet<String>,
+}
+
+impl CreateFootprint {
+    fn is_empty(&self) -> bool {
+        !self.creates_unlabelled_node
+            && self.created_node_labels.is_empty()
+            && !self.creates_untyped_rel
+            && self.created_rel_types.is_empty()
+    }
+}
+
+/// Recursively rewrite the plan, inserting [`LogicalOperator::Eager`] barriers
+/// between a write operator and the read sub-tree that drives it whenever the
+/// write could create entities the read would otherwise observe lazily.
+///
+/// The rule is **sound first, minimal second**: a barrier is inserted iff the
+/// read footprint and the created-entity footprint intersect.  Disjoint label
+/// or relationship-type footprints are proven safe and left to stream
+/// (e.g. `MATCH (n:A) CREATE (:B)` needs no barrier).
+///
+/// Only create-style writes (`CREATE`, `MERGE`) can feed their own driving read
+/// within a single query segment.  `DELETE` / `SET` / `REMOVE` modify entities
+/// the read already produced, so they require a barrier only across a
+/// read-after-write segment boundary (a `WITH` that re-reads), which the current
+/// single-segment planner does not yet produce; the recursion below still
+/// descends through them so nested reads are handled correctly.
+fn insert_eager(op: LogicalOperator) -> LogicalOperator {
+    match op {
+        LogicalOperator::Create { input, pattern } => {
+            let footprint = create_footprint(&pattern);
+            let input =
+                input.map(|inp| Box::new(barrier_if_conflict(insert_eager(*inp), &footprint)));
+            LogicalOperator::Create { input, pattern }
+        }
+        LogicalOperator::Merge {
+            input,
+            pattern,
+            on_create,
+            on_match,
+        } => {
+            let footprint = create_footprint(&pattern);
+            let input = Box::new(barrier_if_conflict(insert_eager(*input), &footprint));
+            LogicalOperator::Merge {
+                input,
+                pattern,
+                on_create,
+                on_match,
+            }
+        }
+        // Structural / read operators: recurse into children, no barrier here.
+        LogicalOperator::Filter { input, predicate } => LogicalOperator::Filter {
+            input: Box::new(insert_eager(*input)),
+            predicate,
+        },
+        LogicalOperator::Project { input, projections } => LogicalOperator::Project {
+            input: Box::new(insert_eager(*input)),
+            projections,
+        },
+        LogicalOperator::Expand {
+            input,
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+        } => LogicalOperator::Expand {
+            input: Box::new(insert_eager(*input)),
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+        },
+        LogicalOperator::Sort { input, order_by } => LogicalOperator::Sort {
+            input: Box::new(insert_eager(*input)),
+            order_by,
+        },
+        LogicalOperator::Skip { input, expression } => LogicalOperator::Skip {
+            input: Box::new(insert_eager(*input)),
+            expression,
+        },
+        LogicalOperator::Limit { input, expression } => LogicalOperator::Limit {
+            input: Box::new(insert_eager(*input)),
+            expression,
+        },
+        LogicalOperator::Aggregate {
+            input,
+            grouping_keys,
+            aggregations,
+        } => LogicalOperator::Aggregate {
+            input: Box::new(insert_eager(*input)),
+            grouping_keys,
+            aggregations,
+        },
+        LogicalOperator::Delete {
+            input,
+            expressions,
+            detach,
+        } => LogicalOperator::Delete {
+            input: Box::new(insert_eager(*input)),
+            expressions,
+            detach,
+        },
+        LogicalOperator::Set { input, items } => LogicalOperator::Set {
+            input: Box::new(insert_eager(*input)),
+            items,
+        },
+        LogicalOperator::Remove { input, items } => LogicalOperator::Remove {
+            input: Box::new(insert_eager(*input)),
+            items,
+        },
+        LogicalOperator::Eager { input } => LogicalOperator::Eager {
+            input: Box::new(insert_eager(*input)),
+        },
+        LogicalOperator::Apply { left, right } => LogicalOperator::Apply {
+            left: Box::new(insert_eager(*left)),
+            right: Box::new(insert_eager(*right)),
+        },
+        LogicalOperator::HashJoin {
+            left,
+            right,
+            join_keys,
+        } => LogicalOperator::HashJoin {
+            left: Box::new(insert_eager(*left)),
+            right: Box::new(insert_eager(*right)),
+            join_keys,
+        },
+        // Leaf scans — nothing to rewrite.
+        LogicalOperator::AllNodesScan => LogicalOperator::AllNodesScan,
+        LogicalOperator::NodeByLabelScan { label } => {
+            LogicalOperator::NodeByLabelScan { label }
+        }
+        LogicalOperator::NodeByIdScan { node_id } => {
+            LogicalOperator::NodeByIdScan { node_id }
+        }
+    }
+}
+
+/// Wrap `read` in an [`Eager`] barrier if its footprint conflicts with the
+/// created-entity `footprint`.  Already-eager inputs (an `Aggregate`, `Sort`,
+/// or `Eager` that has already materialised the read) need no second barrier.
+fn barrier_if_conflict(read: LogicalOperator, footprint: &CreateFootprint) -> LogicalOperator {
+    if footprint.is_empty() || is_pipeline_breaker(&read) {
+        return read;
+    }
+    let rf = read_footprint(&read);
+    if conflicts(&rf, footprint) {
+        LogicalOperator::Eager {
+            input: Box::new(read),
+        }
+    } else {
+        read
+    }
+}
+
+/// `true` if the operator already fully materialises its input (so an
+/// additional Eager barrier above it would be redundant).
+fn is_pipeline_breaker(op: &LogicalOperator) -> bool {
+    matches!(
+        op,
+        LogicalOperator::Aggregate { .. }
+            | LogicalOperator::Sort { .. }
+            | LogicalOperator::Eager { .. }
+    )
+}
+
+/// Decide whether a created-entity footprint can be observed by a read.
+fn conflicts(read: &ReadFootprint, write: &CreateFootprint) -> bool {
+    // Created node observable by the read?  An unlabelled created node is only
+    // matchable by an all-nodes scan; a labelled one also by a matching label
+    // scan.
+    if write.creates_unlabelled_node && read.any_node {
+        return true;
+    }
+    if !write.created_node_labels.is_empty() {
+        if read.any_node {
+            return true;
+        }
+        if !write.created_node_labels.is_disjoint(&read.node_labels) {
+            return true;
+        }
+    }
+    // Created relationship observable by the read?
+    if write.creates_untyped_rel && read.any_rel {
+        return true;
+    }
+    if !write.created_rel_types.is_empty() {
+        if read.any_rel {
+            return true;
+        }
+        if !write.created_rel_types.is_disjoint(&read.rel_types) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Compute the [`ReadFootprint`] of a read sub-tree.
+fn read_footprint(op: &LogicalOperator) -> ReadFootprint {
+    let mut fp = ReadFootprint::default();
+    collect_read_footprint(op, &mut fp);
+    fp
+}
+
+fn collect_read_footprint(op: &LogicalOperator, fp: &mut ReadFootprint) {
+    match op {
+        LogicalOperator::AllNodesScan => fp.any_node = true,
+        LogicalOperator::NodeByLabelScan { label } => {
+            fp.node_labels.insert(label.clone());
+        }
+        // A by-id lookup targets one pre-existing node; a freshly created node
+        // gets a brand-new id, so it can never satisfy this scan.
+        LogicalOperator::NodeByIdScan { .. } => {}
+        LogicalOperator::Expand {
+            input, rel_types, ..
+        } => {
+            if rel_types.is_empty() {
+                fp.any_rel = true;
+            } else {
+                for t in rel_types {
+                    fp.rel_types.insert(t.clone());
+                }
+            }
+            collect_read_footprint(input, fp);
+        }
+        LogicalOperator::Filter { input, .. }
+        | LogicalOperator::Project { input, .. }
+        | LogicalOperator::Sort { input, .. }
+        | LogicalOperator::Skip { input, .. }
+        | LogicalOperator::Limit { input, .. }
+        | LogicalOperator::Aggregate { input, .. }
+        | LogicalOperator::Delete { input, .. }
+        | LogicalOperator::Set { input, .. }
+        | LogicalOperator::Remove { input, .. }
+        | LogicalOperator::Merge { input, .. }
+        | LogicalOperator::Eager { input } => collect_read_footprint(input, fp),
+        LogicalOperator::Create { input, .. } => {
+            if let Some(inp) = input {
+                collect_read_footprint(inp, fp);
+            }
+        }
+        LogicalOperator::Apply { left, right }
+        | LogicalOperator::HashJoin { left, right, .. } => {
+            collect_read_footprint(left, fp);
+            collect_read_footprint(right, fp);
+        }
+    }
+}
+
+/// Compute the [`CreateFootprint`] of a write pattern.
+fn create_footprint(pattern: &Pattern) -> CreateFootprint {
+    let mut fp = CreateFootprint::default();
+    for elem in &pattern.elements {
+        match elem {
+            PatternElement::Node(n) => {
+                if n.labels.is_empty() {
+                    fp.creates_unlabelled_node = true;
+                } else {
+                    for l in &n.labels {
+                        fp.created_node_labels.insert(l.clone());
+                    }
+                }
+            }
+            PatternElement::Relationship(r) => {
+                if r.types.is_empty() {
+                    fp.creates_untyped_rel = true;
+                } else {
+                    for t in &r.types {
+                        fp.created_rel_types.insert(t.clone());
+                    }
+                }
+            }
+        }
+    }
+    fp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +712,138 @@ mod tests {
         let explain = logical.explain();
         assert!(explain.contains("Sort"));
         assert!(explain.contains("Project"));
+    }
+
+    // ------------------------------------------------------------------
+    // Eager-barrier insertion
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn eager_inserted_for_match_create_halloween() {
+        // The canonical Halloween case: an unrestricted scan feeding a CREATE
+        // of new nodes/relationships must be fenced by an Eager barrier so the
+        // created entities never re-enter the scan.
+        let stmt = parse("MATCH (n) CREATE (n)-[:R]->(m)").unwrap();
+        let logical = plan(&stmt).unwrap();
+        match &logical.root {
+            LogicalOperator::Create {
+                input: Some(inp), ..
+            } => {
+                assert!(
+                    matches!(**inp, LogicalOperator::Eager { .. }),
+                    "expected an Eager barrier directly under CREATE, got {:?}",
+                    inp
+                );
+            }
+            other => panic!("expected a Create root, got {:?}", other),
+        }
+        let explain = logical.explain();
+        assert!(explain.contains("Eager"));
+        assert!(explain.contains("Create"));
+        assert!(explain.contains("AllNodesScan"));
+    }
+
+    #[test]
+    fn no_eager_for_disjoint_labels() {
+        // The scan reads `:A` and the create makes `:B`; the footprints are
+        // provably disjoint, so no barrier is required (minimality).
+        let stmt = parse("MATCH (n:A) CREATE (m:B)").unwrap();
+        let logical = plan(&stmt).unwrap();
+        assert!(
+            !logical.explain().contains("Eager"),
+            "no Eager expected for disjoint label footprints:\n{}",
+            logical.explain()
+        );
+    }
+
+    #[test]
+    fn eager_for_overlapping_labels() {
+        // The scan reads `:Person` and the create makes `:Person`; the created
+        // node could re-enter the scan, so a barrier is required.
+        let stmt = parse("MATCH (n:Person) CREATE (m:Person)").unwrap();
+        let logical = plan(&stmt).unwrap();
+        assert!(
+            logical.explain().contains("Eager"),
+            "Eager expected for overlapping label footprints:\n{}",
+            logical.explain()
+        );
+    }
+
+    #[test]
+    fn no_eager_for_label_scan_creating_unlabelled_node() {
+        // A label-restricted scan cannot match a newly created unlabelled node,
+        // and there is no relationship read, so no barrier is required.
+        let stmt = parse("MATCH (n:Person) CREATE (n)-[:R]->(m)").unwrap();
+        let logical = plan(&stmt).unwrap();
+        assert!(
+            !logical.explain().contains("Eager"),
+            "no Eager expected when the scan is label-restricted and the created \
+             node is unlabelled:\n{}",
+            logical.explain()
+        );
+    }
+
+    #[test]
+    fn no_eager_for_standalone_create() {
+        let stmt = parse("CREATE (n:Person {name: 'Alice'})").unwrap();
+        let logical = plan(&stmt).unwrap();
+        assert!(!logical.explain().contains("Eager"));
+        assert!(matches!(
+            logical.root,
+            LogicalOperator::Create { input: None, .. }
+        ));
+    }
+
+    #[test]
+    fn eager_for_merge_overlapping_outer_scan() {
+        // The outer all-nodes scan could observe the node MERGE may create.
+        let stmt = parse("MATCH (n) MERGE (m:City)").unwrap();
+        let logical = plan(&stmt).unwrap();
+        assert!(
+            logical.explain().contains("Eager"),
+            "Eager expected when MERGE creates an entity the outer scan can \
+             observe:\n{}",
+            logical.explain()
+        );
+    }
+
+    #[test]
+    fn conflicts_respects_label_disjointness() {
+        let read = ReadFootprint {
+            any_node: false,
+            node_labels: HashSet::from(["A".to_string()]),
+            any_rel: false,
+            rel_types: HashSet::new(),
+        };
+        let disjoint = CreateFootprint {
+            created_node_labels: HashSet::from(["B".to_string()]),
+            ..Default::default()
+        };
+        assert!(!conflicts(&read, &disjoint));
+
+        let overlapping = CreateFootprint {
+            created_node_labels: HashSet::from(["A".to_string()]),
+            ..Default::default()
+        };
+        assert!(conflicts(&read, &overlapping));
+    }
+
+    #[test]
+    fn conflicts_universal_read_matches_any_create() {
+        let read = ReadFootprint {
+            any_node: true,
+            ..Default::default()
+        };
+        let create_unlabelled = CreateFootprint {
+            creates_unlabelled_node: true,
+            ..Default::default()
+        };
+        assert!(conflicts(&read, &create_unlabelled));
+
+        let create_labelled = CreateFootprint {
+            created_node_labels: HashSet::from(["Anything".to_string()]),
+            ..Default::default()
+        };
+        assert!(conflicts(&read, &create_labelled));
     }
 }
