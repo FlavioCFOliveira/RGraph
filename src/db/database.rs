@@ -93,14 +93,25 @@ impl Database {
         handle.read_at(&mut primary, 0)?;
         handle.read_at(&mut mirror, PAGE_SIZE as u64)?;
 
-        let sb_primary = decode_superblock(&primary).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid primary superblock")
-        })?;
+        let sb_primary = decode_superblock(&primary);
         let sb_mirror = decode_superblock(&mirror);
 
-        let sb = match sb_mirror {
-            Some(m) if m.generation > sb_primary.generation => m,
-            _ => sb_primary,
+        let sb = match (sb_primary, sb_mirror) {
+            (Some(p), Some(m)) => {
+                if m.generation > p.generation {
+                    m
+                } else {
+                    p
+                }
+            }
+            (Some(p), None) => p,
+            (None, Some(m)) => m,
+            (None, None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "both superblock copies invalid",
+                ));
+            }
         };
 
         // Read bitmap page.

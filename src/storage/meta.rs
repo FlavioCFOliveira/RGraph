@@ -1,3 +1,4 @@
+use crate::io::AlignedBuffer;
 use crate::storage::page::{PageId, PAGE_SIZE};
 use std::mem::size_of;
 
@@ -89,8 +90,8 @@ impl Superblock {
 }
 
 /// Write a superblock into a page-aligned buffer suitable for I/O.
-pub fn encode_superblock(sb: &Superblock) -> Vec<u8> {
-    let mut buf = vec![0u8; PAGE_SIZE];
+pub fn encode_superblock(sb: &Superblock) -> AlignedBuffer {
+    let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
     let bytes = unsafe {
         std::slice::from_raw_parts(
             sb as *const _ as *const u8,

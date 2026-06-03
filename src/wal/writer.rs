@@ -98,7 +98,6 @@ impl SegmentDescriptor {
 ///
 /// Call [`WalWriter::needs_rotation`] after each flush and
 /// [`WalWriter::rotate`] when it returns `true`.
-#[derive(Debug)]
 pub struct WalWriter {
     /// Directory that holds WAL segment files.
     pub wal_dir: PathBuf,
@@ -120,6 +119,25 @@ pub struct WalWriter {
     segment_record_count: u64,
     /// Total number of segments written since open (including the current one).
     total_segment_count: u64,
+    /// Persistent handle to the current segment file.
+    segment_handle: Option<Box<dyn crate::io::FileHandle>>,
+}
+
+impl std::fmt::Debug for WalWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalWriter")
+            .field("wal_dir", &self.wal_dir)
+            .field("current_lsn", &self.current_lsn)
+            .field("segment_path", &self.segment_path)
+            .field("buffer", &self.buffer)
+            .field("buffered", &self.buffered)
+            .field("unsynced", &self.unsynced)
+            .field("segment_id", &self.segment_id)
+            .field("segment_start_lsn", &self.segment_start_lsn)
+            .field("segment_record_count", &self.segment_record_count)
+            .field("total_segment_count", &self.total_segment_count)
+            .finish()
+    }
 }
 
 impl WalWriter {
@@ -136,13 +154,14 @@ impl WalWriter {
     pub fn open(wal_dir: PathBuf, fs: &dyn FileSystem) -> io::Result<Self> {
         fs.create_dir_all(&wal_dir)?;
         let segment_path = wal_dir.join("wal-000000000");
-        let (current_lsn, segment_id) = if fs.exists(&segment_path) {
+        let (current_lsn, segment_id, segment_handle) = if fs.exists(&segment_path) {
             let handle = fs.open(&segment_path, false)?;
-            (handle.len()?, 0u64)
+            let len = handle.len()?;
+            (len, 0u64, Some(handle))
         } else {
             let handle = fs.open(&segment_path, true)?;
             handle.sync_data()?;
-            (1, 0u64) // LSN 0 is reserved for "never written".
+            (1, 0u64, Some(handle))
         };
         Ok(Self {
             wal_dir,
@@ -155,15 +174,16 @@ impl WalWriter {
             segment_start_lsn: 0,
             segment_record_count: 0,
             total_segment_count: 1,
+            segment_handle,
         })
     }
 
     /// Append a record and return its LSN.
-    pub fn append(&mut self, fs: &dyn FileSystem, mut record: WalRecord) -> io::Result<u64> {
+    pub fn append(&mut self, _fs: &dyn FileSystem, mut record: WalRecord) -> io::Result<u64> {
         record.set_lsn(self.current_lsn);
         let bytes = record.encode();
         if self.buffered + bytes.len() > Self::BUFFER_SIZE {
-            self.flush(fs)?;
+            self.flush(_fs)?;
             if bytes.len() > Self::BUFFER_SIZE {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -180,11 +200,11 @@ impl WalWriter {
     }
 
     /// Flush buffered data to disk and sync.
-    pub fn flush(&mut self, fs: &dyn FileSystem) -> io::Result<()> {
+    pub fn flush(&mut self, _fs: &dyn FileSystem) -> io::Result<()> {
         if self.buffered == 0 {
             return Ok(());
         }
-        let handle = fs.open(&self.segment_path, true)?;
+        let handle = self.segment_handle.as_ref().expect("segment file not open");
         let offset = handle.len()?;
         handle.write_at(&self.buffer[..self.buffered], offset)?;
         handle.sync_data()?;
@@ -194,8 +214,8 @@ impl WalWriter {
     }
 
     /// Sync any pending data to durable storage.
-    pub fn sync(&mut self, fs: &dyn FileSystem) -> io::Result<()> {
-        self.flush(fs)
+    pub fn sync(&mut self, _fs: &dyn FileSystem) -> io::Result<()> {
+        self.flush(_fs)
     }
 
     // ── Segment rotation (Task 110) ────────────────────────────────────────────
@@ -222,7 +242,7 @@ impl WalWriter {
         self.flush(fs)?;
 
         // 2. Compute hash of the segment content written so far.
-        let integrity_hash = self.compute_segment_hash(fs)?;
+        let integrity_hash = self.compute_segment_hash()?;
 
         // 3. Write descriptor block.
         let descriptor = SegmentDescriptor {
@@ -234,7 +254,7 @@ impl WalWriter {
         };
         let desc_block = descriptor.encode();
         {
-            let handle = fs.open(&self.segment_path, true)?;
+            let handle = self.segment_handle.as_ref().expect("segment file not open");
             let offset = handle.len()?;
             handle.write_at(&desc_block, offset)?;
             handle.sync_data()?;
@@ -253,7 +273,7 @@ impl WalWriter {
         // we just flushed and may be about to switch).
         let desc_bytes = desc_rec.encode();
         {
-            let handle = fs.open(&self.segment_path, true)?;
+            let handle = self.segment_handle.as_ref().expect("segment file not open");
             let offset = handle.len()?;
             handle.write_at(&desc_bytes, offset)?;
             handle.sync_data()?;
@@ -268,6 +288,7 @@ impl WalWriter {
         {
             let handle = fs.open(&next_path, true)?;
             handle.sync_data()?;
+            self.segment_handle = Some(handle);
         }
 
         // 5. Atomically update symlink.
@@ -320,8 +341,8 @@ impl WalWriter {
 
     /// Compute the XxHash64 of the bytes currently written to the segment file
     /// (not including any still-buffered data).
-    fn compute_segment_hash(&self, fs: &dyn FileSystem) -> io::Result<u64> {
-        let handle = fs.open(&self.segment_path, false)?;
+    fn compute_segment_hash(&self) -> io::Result<u64> {
+        let handle = self.segment_handle.as_ref().expect("segment file not open");
         let len = handle.len()? as usize;
         if len == 0 {
             return Ok(0);
@@ -333,9 +354,9 @@ impl WalWriter {
         while (offset as usize) < len {
             let remaining = len - offset as usize;
             let to_read = remaining.min(CHUNK);
-            let mut buf = vec![0u8; to_read];
+            let mut buf = AlignedBuffer::zeroed(to_read);
             handle.read_at(&mut buf, offset)?;
-            hasher.write(&buf);
+            hasher.write(&buf[..to_read]);
             offset += to_read as u64;
         }
         Ok(hasher.finish())
@@ -402,6 +423,27 @@ mod tests {
         let writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
         assert_eq!(writer.buffer.len(), WalWriter::BUFFER_SIZE);
         assert_eq!(writer.buffer.as_ptr() as usize % AlignedBuffer::ALIGNMENT, 0);
+    }
+
+    #[test]
+    fn persistent_handle_is_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
+        assert!(writer.segment_handle.is_some(), "segment_handle must be set after open");
+    }
+
+    #[test]
+    fn flush_reuses_persistent_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let mut writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
+
+        let rec = WalRecord::new(RecordType::Begin, 1, 0, 0, vec![]);
+        writer.append(&fs, rec).unwrap();
+        writer.flush(&fs).unwrap();
+
+        assert!(writer.segment_handle.is_some(), "segment_handle must remain set after flush");
     }
 
     // ── Segment descriptor tests ───────────────────────────────────────────────
