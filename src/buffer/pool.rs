@@ -53,6 +53,27 @@ impl<'a> PageGuard<'a> {
         }
         desc.state.store(FrameState::Dirty as u8, Ordering::Release);
     }
+
+    /// Zero-copy read-only slice of the frame buffer.
+    ///
+    /// The returned `&[u8]` points directly into the pinned frame — no
+    /// intermediate copy is performed.  The underlying frame cannot be
+    /// evicted while this guard (and therefore the slice) is alive.
+    pub fn as_slice(&self) -> &[u8] {
+        let frame = self.pool.frame(self.frame_id);
+        &frame.buf[..]
+    }
+
+    /// Zero-copy mutable slice of the frame buffer.
+    ///
+    /// # Safety
+    /// The caller must ensure no other reference to this frame's buffer
+    /// exists concurrently.  The buffer pool guarantees this via the pin
+    /// count (writers should hold an exclusive pin).
+    pub fn as_slice_mut(&mut self) -> &mut [u8] {
+        let frame = self.pool.frame_mut(self.frame_id);
+        &mut frame.buf[..]
+    }
 }
 
 impl<'a> Drop for PageGuard<'a> {
@@ -60,6 +81,12 @@ impl<'a> Drop for PageGuard<'a> {
         self.pool.unfix_page(self.frame_id);
     }
 }
+
+/// Alias for [`PageGuard`] used by the query engine and storage layers.
+///
+/// The name `PageHandle` emphasises that the guard is a *handle* to a
+/// pinned frame that prevents eviction and exposes zero-copy slices.
+pub type PageHandle<'a> = PageGuard<'a>;
 
 /// A production-grade buffer pool with CLOCK-Pro replacement.
 ///
@@ -529,5 +556,35 @@ mod tests {
         let candidates = pool.dirty_candidates();
         // Pinned frame should not appear.
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn as_slice_points_into_frame_without_copy() {
+        let (_dir, fs, pool) = temp_pool(4);
+        let mut guard = pool.fix_page(&fs, 3).unwrap();
+        guard.as_slice_mut()[0] = 0xBE;
+        guard.as_slice_mut()[1] = 0xEF;
+
+        let slice = guard.as_slice();
+        assert_eq!(slice[0], 0xBE);
+        assert_eq!(slice[1], 0xEF);
+
+        // Verify the slice pointer sits inside the frame buffer.
+        let frame = pool.frame(guard.frame_id);
+        let frame_ptr = frame.buf.as_ptr();
+        let slice_ptr = slice.as_ptr();
+        assert!(
+            slice_ptr >= frame_ptr && slice_ptr < unsafe { frame_ptr.add(frame.buf.len()) },
+            "slice must point into the pinned frame buffer"
+        );
+    }
+
+    #[test]
+    fn page_handle_alias_works() {
+        let (_dir, fs, pool) = temp_pool(4);
+        let mut handle: PageHandle<'_> = pool.fix_page(&fs, 4).unwrap();
+        handle.as_slice_mut()[0] = 0x01;
+        assert_eq!(handle.as_slice()[0], 0x01);
+        assert_eq!(handle.desc().pin_count.load(Ordering::Relaxed), 1);
     }
 }
