@@ -10,7 +10,8 @@ use crate::index::property::PropertyIndex;
 use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::manager::PageManager;
 use crate::storage::page::{PageId, PageType, SlottedPage, PAGE_SIZE};
-use crate::storage::meta::decode_superblock;
+use crate::storage::manager::num_bitmap_pages;
+use crate::storage::meta::{decode_superblock, load_superblock};
 use crate::wal::record::{RecordType, WalRecord};
 use crate::wal::writer::WalWriter;
 use crate::wal::recovery::{recover, simple_page_replay};
@@ -262,6 +263,8 @@ impl GraphStorageEngine {
 
     /// Open an existing engine, recovering WAL if necessary.
     pub fn open(data_path: PathBuf, fs: &dyn FileSystem) -> io::Result<Self> {
+        use crate::storage::manager::FIRST_BITMAP_PAGE_ID;
+
         if !data_path.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -269,39 +272,27 @@ impl GraphStorageEngine {
             ));
         }
 
-        // Read both superblock copies.
+        // Read best-available superblock using mirror-recovery logic.
+        let sb = load_superblock(fs, &data_path)?;
+
+        // Determine how many bitmap pages to read based on next_free_page_id.
+        let bitmap_count = num_bitmap_pages(sb.next_free_page_id).max(1);
         let handle = fs.open(&data_path, false)?;
-        let mut primary = AlignedBuffer::zeroed(PAGE_SIZE);
-        let mut mirror = AlignedBuffer::zeroed(PAGE_SIZE);
-        handle.read_at(&mut primary, 0)?;
-        handle.read_at(&mut mirror, PAGE_SIZE as u64)?;
-
-        let sb_primary = decode_superblock(&primary);
-        let sb_mirror = decode_superblock(&mirror);
-
-        let sb = match (sb_primary, sb_mirror) {
-            (Some(p), Some(m)) => {
-                if m.generation > p.generation {
-                    m
-                } else {
-                    p
-                }
+        let mut bitmap_bufs: Vec<AlignedBuffer> = Vec::with_capacity(bitmap_count);
+        for i in 0..bitmap_count {
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            let file_page_id = FIRST_BITMAP_PAGE_ID + i as u64;
+            let offset = file_page_id * PAGE_SIZE as u64;
+            // If the file is too short for this bitmap page, use a zeroed buffer.
+            let file_len = handle.len()?;
+            if offset + PAGE_SIZE as u64 <= file_len {
+                handle.read_at(&mut buf, offset)?;
             }
-            (Some(p), None) => p,
-            (None, Some(m)) => m,
-            (None, None) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "both superblock copies invalid",
-                ));
-            }
-        };
+            bitmap_bufs.push(buf);
+        }
+        drop(handle);
 
-        // Read bitmap page.
-        let mut bitmap_buf = AlignedBuffer::zeroed(PAGE_SIZE);
-        handle.read_at(&mut bitmap_buf, (2 * PAGE_SIZE) as u64)?;
-
-        let mut pm = PageManager::open(data_path.clone(), sb, bitmap_buf, fs)?;
+        let mut pm = PageManager::open_multi(data_path.clone(), sb, bitmap_bufs, fs)?;
 
         // Recover WAL using a buffered filesystem (WAL does not use O_DIRECT).
         let wal_dir = data_path.parent().unwrap().join("wal");

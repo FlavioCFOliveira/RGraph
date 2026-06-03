@@ -3,25 +3,44 @@ use crate::storage::page::SlottedPage;
 
 /// Number of pages tracked by one bitmap page.
 /// Data area = PAGE_SIZE - header = 8192 - 64 = 8128 bytes.
-/// 8128 bytes * 8 bits/byte = 65024 pages ≈ 508 MiB.
+/// 8128 bytes * 8 bits/byte = 65024 pages ≈ 508 MiB per bitmap slot.
 pub const PAGES_PER_BITMAP: usize = (PAGE_SIZE - SlottedPage::HEADER_SIZE) * 8;
 
 /// In-memory view of a bitmap page backed by a [`SlottedPage`].
+///
+/// Each `BitmapPage` tracks [`PAGES_PER_BITMAP`] logical page ids starting
+/// at `base_page_id()`.  Multiple `BitmapPage` instances form a chain:
+/// slot 0 covers ids `[0, PAGES_PER_BITMAP)`, slot 1 covers
+/// `[PAGES_PER_BITMAP, 2 * PAGES_PER_BITMAP)`, and so on.
+///
+/// The `bitmap_slot` field (0-based) determines which range of page ids
+/// this instance is responsible for.
 #[derive(Debug)]
 pub struct BitmapPage {
     pub page: SlottedPage,
+    /// 0-based index in the bitmap chain.
+    pub bitmap_slot: u64,
 }
 
 impl BitmapPage {
-    pub fn new(page_id: PageId) -> Self {
+    /// Create a new, empty bitmap page.
+    ///
+    /// `file_page_id` is the physical page id of this bitmap on disk.
+    /// `bitmap_slot` is the 0-based position in the bitmap chain.
+    pub fn new(file_page_id: PageId, bitmap_slot: u64) -> Self {
         Self {
-            page: SlottedPage::init(page_id, PageType::Bitmap),
+            page: SlottedPage::init(file_page_id, PageType::Bitmap),
+            bitmap_slot,
         }
     }
 
-    pub fn from_buf(buf: crate::io::AlignedBuffer) -> Self {
+    /// Reconstruct a bitmap page from a raw buffer read from disk.
+    ///
+    /// `bitmap_slot` is the 0-based position in the bitmap chain.
+    pub fn from_buf(buf: crate::io::AlignedBuffer, bitmap_slot: u64) -> Self {
         Self {
             page: SlottedPage::new(buf),
+            bitmap_slot,
         }
     }
 
@@ -52,8 +71,8 @@ impl BitmapPage {
         data[byte] &= !(1 << bit);
     }
 
-    /// Scan for the first free page starting from `start_local` and
-    /// return its global id, or `None`.
+    /// Scan for the first free page starting from `start_local` (local index)
+    /// and return its global id, or `None`.
     pub fn find_first_free(&self, start_local: usize) -> Option<PageId> {
         let data = &self.page.buf[SlottedPage::HEADER_SIZE..];
         let base = self.base_page_id();
@@ -67,11 +86,9 @@ impl BitmapPage {
         None
     }
 
+    /// First global page id managed by this bitmap.
     pub fn base_page_id(&self) -> PageId {
-        // For Sprint 1 we keep a single bitmap page (page 1) that tracks
-        // pages starting from 0.  This will be generalised in later
-        // sprints to support multiple bitmap pages.
-        0
+        self.bitmap_slot * PAGES_PER_BITMAP as PageId
     }
 
     /// Return every allocated page id tracked by this bitmap.
@@ -89,8 +106,23 @@ impl BitmapPage {
         ids
     }
 
+    /// Convert a global page id to the local (0-based) index within this bitmap.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Panics in debug builds if `global_id` is outside the range managed by
+    /// this bitmap, catching programming errors early.
     fn local_index(&self, global_id: PageId) -> usize {
-        (global_id - self.base_page_id()) as usize
+        let base = self.base_page_id();
+        debug_assert!(
+            global_id >= base && (global_id - base) < PAGES_PER_BITMAP as PageId,
+            "global_id {} is out of range for bitmap_slot {} (base={}, limit={})",
+            global_id,
+            self.bitmap_slot,
+            base,
+            base + PAGES_PER_BITMAP as PageId,
+        );
+        (global_id - base) as usize
     }
 }
 
@@ -126,7 +158,7 @@ mod tests {
 
     #[test]
     fn allocate_and_free() {
-        let mut bmp = BitmapPage::new(1);
+        let mut bmp = BitmapPage::new(1, 0);
         let pid = 5;
         assert!(!bmp.is_set(pid));
         bmp.allocate(pid);
@@ -137,10 +169,39 @@ mod tests {
 
     #[test]
     fn find_first_free() {
-        let mut bmp = BitmapPage::new(2);
+        let mut bmp = BitmapPage::new(2, 0);
         bmp.allocate(3);
         bmp.allocate(5);
         assert_eq!(bmp.find_first_free(0), Some(0));
         assert_eq!(bmp.find_first_free(4), Some(4));
+    }
+
+    #[test]
+    fn base_page_id_slot_zero() {
+        let bmp = BitmapPage::new(2, 0);
+        assert_eq!(bmp.base_page_id(), 0);
+    }
+
+    #[test]
+    fn base_page_id_slot_one() {
+        let bmp = BitmapPage::new(3, 1);
+        assert_eq!(bmp.base_page_id(), PAGES_PER_BITMAP as PageId);
+    }
+
+    #[test]
+    fn base_page_id_slot_two() {
+        let bmp = BitmapPage::new(4, 2);
+        assert_eq!(bmp.base_page_id(), 2 * PAGES_PER_BITMAP as PageId);
+    }
+
+    #[test]
+    fn allocate_in_second_slot() {
+        let mut bmp = BitmapPage::new(3, 1);
+        let global_id = PAGES_PER_BITMAP as PageId + 7;
+        assert!(!bmp.is_set(global_id));
+        bmp.allocate(global_id);
+        assert!(bmp.is_set(global_id));
+        bmp.free(global_id);
+        assert!(!bmp.is_set(global_id));
     }
 }

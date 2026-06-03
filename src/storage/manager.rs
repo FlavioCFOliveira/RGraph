@@ -1,9 +1,36 @@
+use crate::buffer::pool::BufferPool;
 use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::bitmap::{BitmapPage, FreeListCache, PAGES_PER_BITMAP};
 use crate::storage::meta::{encode_superblock, Superblock};
 use crate::storage::page::{PageId, PAGE_SIZE};
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, Weak};
+
+// ── Layout constants ──────────────────────────────────────────────────────────
+
+/// Physical page id of the primary superblock copy.
+pub const PRIMARY_SB_PAGE_ID: PageId = 0;
+/// Physical page id of the mirror superblock copy.
+pub const MIRROR_SB_PAGE_ID: PageId = 1;
+/// Physical page id of the first bitmap page.
+pub const FIRST_BITMAP_PAGE_ID: PageId = 2;
+/// Physical page id of the first data page.
+pub const FIRST_DATA_PAGE_ID: PageId = 3;
+/// Minimum file size: must contain primary SB, mirror SB, and one bitmap page.
+pub const MIN_FILE_SIZE: u64 = FIRST_DATA_PAGE_ID * PAGE_SIZE as u64;
+
+// ── Helper ────────────────────────────────────────────────────────────────────
+
+/// Compute how many bitmap pages are needed to cover `next_free_page_id`.
+pub fn num_bitmap_pages(next_free_page_id: u64) -> usize {
+    if next_free_page_id == 0 {
+        return 1;
+    }
+    ((next_free_page_id as usize) + PAGES_PER_BITMAP - 1) / PAGES_PER_BITMAP
+}
+
+// ── PageManager ───────────────────────────────────────────────────────────────
 
 /// Simple page manager that owns the meta page, bitmap pages, and an
 /// in-memory free-list cache.
@@ -12,12 +39,19 @@ pub struct PageManager {
     pub data_path: PathBuf,
     /// In-memory copy of the superblock.
     pub superblock: Superblock,
-    /// Bitmap page currently loaded in memory (page 1 for small DBs).
-    pub bitmap: BitmapPage,
+    /// Chain of bitmap pages; `bitmaps[i]` covers slot `i`.
+    pub bitmaps: Vec<BitmapPage>,
     /// Cached free pages ready to allocate.
     pub free_cache: FreeListCache,
     /// Long-lived handle to the data file.
     data_handle: Option<Box<dyn crate::io::FileHandle>>,
+    /// Weak reference to the buffer pool.
+    ///
+    /// When set, `read_page`/`write_page` route through the pool for cache
+    /// coherence, and `free_page` invalidates any resident frame.  The weak
+    /// reference avoids a reference cycle between `PageManager` and `BufferPool`
+    /// (the pool is owned by the engine, which also owns the page manager).
+    pool: Weak<BufferPool>,
 }
 
 impl std::fmt::Debug for PageManager {
@@ -25,8 +59,9 @@ impl std::fmt::Debug for PageManager {
         f.debug_struct("PageManager")
             .field("data_path", &self.data_path)
             .field("superblock", &self.superblock)
-            .field("bitmap", &self.bitmap)
+            .field("bitmaps", &self.bitmaps)
             .field("free_cache", &self.free_cache)
+            .field("pool", &self.pool.strong_count())
             .finish()
     }
 }
@@ -35,23 +70,28 @@ impl PageManager {
     pub const DATA_FILE: &str = "rgraph.db";
     pub const CACHE_BATCH: usize = 64;
 
-    /// Initialise a brand-new page manager and open the data file.
-    /// The file is pre-extended to three pages and `sync_all` is issued.
+    /// Initialise a brand-new page manager.
+    ///
+    /// Creates the data file, pre-allocates space for the three fixed
+    /// metadata pages (primary SB, mirror SB, bitmap), and issues
+    /// `sync_all`.
     pub fn init(data_path: PathBuf, page_size: u32, fs: &dyn FileSystem) -> io::Result<Self> {
         let mut sb = Superblock::new(page_size);
-        sb.total_page_count = 3; // page 0 = superblock primary, page 1 = superblock mirror, page 2 = bitmap
+        // 3 fixed pages: primary SB (0), mirror SB (1), bitmap (2).
+        sb.total_page_count = FIRST_DATA_PAGE_ID;
         sb.free_page_count = 0;
-        sb.next_free_page_id = 3;
+        sb.next_free_page_id = FIRST_DATA_PAGE_ID;
         sb.update_checksum();
 
-        let mut bitmap = BitmapPage::new(2);
-        bitmap.allocate(0); // superblock primary
-        bitmap.allocate(1); // superblock mirror
-        bitmap.allocate(2); // bitmap page
+        // Slot 0 bitmap lives at page FIRST_BITMAP_PAGE_ID.
+        let mut bitmap = BitmapPage::new(FIRST_BITMAP_PAGE_ID, 0);
+        bitmap.allocate(PRIMARY_SB_PAGE_ID);  // superblock primary
+        bitmap.allocate(MIRROR_SB_PAGE_ID);   // superblock mirror
+        bitmap.allocate(FIRST_BITMAP_PAGE_ID); // bitmap page itself
         bitmap.page.update_checksum();
 
         let handle = fs.open(&data_path, true)?;
-        let required_len = (3 * PAGE_SIZE) as u64;
+        let required_len = MIN_FILE_SIZE;
         let current_len = handle.len().unwrap_or(0);
         if current_len < required_len {
             handle.set_len(required_len)?;
@@ -61,52 +101,138 @@ impl PageManager {
         Ok(Self {
             data_path,
             superblock: sb,
-            bitmap,
+            bitmaps: vec![bitmap],
             free_cache: FreeListCache::new(Self::CACHE_BATCH),
             data_handle: Some(handle),
+            pool: Weak::new(),
         })
     }
 
-    /// Open an existing page manager from disk.  The caller must have
-    /// already read and validated the superblock.
-    pub fn open(data_path: PathBuf, sb: Superblock, bitmap_buf: AlignedBuffer, fs: &dyn FileSystem) -> io::Result<Self> {
-        let bitmap = BitmapPage::from_buf(bitmap_buf);
+    /// Open an existing page manager from a single bitmap buffer.
+    ///
+    /// This is a convenience wrapper around [`open_multi`] for databases
+    /// that fit within one bitmap page (≤ ~508 MiB).
+    pub fn open(
+        data_path: PathBuf,
+        sb: Superblock,
+        bitmap_buf: AlignedBuffer,
+        fs: &dyn FileSystem,
+    ) -> io::Result<Self> {
+        Self::open_multi(data_path, sb, vec![bitmap_buf], fs)
+    }
+
+    /// Open an existing page manager from multiple bitmap buffers.
+    ///
+    /// Each buffer in `bitmap_bufs` corresponds to one bitmap slot (slot 0
+    /// at index 0, slot 1 at index 1, …).  The caller is responsible for
+    /// reading the right number of pages from disk before calling this.
+    ///
+    /// Use [`num_bitmap_pages`] to compute how many buffers are needed.
+    pub fn open_multi(
+        data_path: PathBuf,
+        sb: Superblock,
+        bitmap_bufs: Vec<AlignedBuffer>,
+        fs: &dyn FileSystem,
+    ) -> io::Result<Self> {
+        let bitmaps: Vec<BitmapPage> = bitmap_bufs
+            .into_iter()
+            .enumerate()
+            .map(|(idx, buf)| BitmapPage::from_buf(buf, idx as u64))
+            .collect();
+
         let handle = fs.open(&data_path, false)?;
         let mut pm = Self {
             data_path,
             superblock: sb,
-            bitmap,
+            bitmaps,
             free_cache: FreeListCache::new(Self::CACHE_BATCH),
             data_handle: Some(handle),
+            pool: Weak::new(),
         };
         pm.rebuild_cache();
         Ok(pm)
     }
 
-    /// Allocate a new page id.  Prioritises the free list, then extends
-    /// the file.
+    /// Attach a buffer pool so that subsequent `read_page`/`write_page`
+    /// calls are routed through the pool's cache, and `free_page` invalidates
+    /// resident frames.
+    ///
+    /// The page manager stores only a [`Weak`] reference to avoid a reference
+    /// cycle with the engine that owns both objects.
+    pub fn set_pool(&mut self, pool: &Arc<BufferPool>) {
+        self.pool = Arc::downgrade(pool);
+    }
+
+    /// Allocate a new page id.
+    ///
+    /// Prioritises the free-list cache, then extends the bitmap chain if
+    /// `next_free_page_id` would overflow the last bitmap's range.
     pub fn allocate_page(&mut self) -> PageId {
         if let Some(pid) = self.free_cache.pop() {
-            self.bitmap.allocate(pid);
-            self.superblock.free_page_count -= 1;
+            let bitmap_idx = (pid as usize) / PAGES_PER_BITMAP;
+            if bitmap_idx < self.bitmaps.len() {
+                self.bitmaps[bitmap_idx].allocate(pid);
+            }
+            self.superblock.free_page_count =
+                self.superblock.free_page_count.saturating_sub(1);
             return pid;
         }
+
         let pid = self.superblock.next_free_page_id;
         self.superblock.next_free_page_id += 1;
         self.superblock.total_page_count += 1;
-        self.bitmap.allocate(pid);
+
+        // Determine which bitmap slot owns this page.
+        let bitmap_idx = (pid as usize) / PAGES_PER_BITMAP;
+
+        // Extend the bitmap chain if needed.
+        while self.bitmaps.len() <= bitmap_idx {
+            let new_slot = self.bitmaps.len() as u64;
+            // The bitmap page for the next slot lives at:
+            //   FIRST_BITMAP_PAGE_ID + new_slot
+            // (bitmaps are stored sequentially after the first).
+            let file_page_id = FIRST_BITMAP_PAGE_ID + new_slot;
+            self.bitmaps.push(BitmapPage::new(file_page_id, new_slot));
+        }
+
+        self.bitmaps[bitmap_idx].allocate(pid);
         pid
     }
 
     /// Return a page to the free list.
+    ///
+    /// If a buffer pool has been attached via [`set_pool`], any frame
+    /// currently caching `page_id` is invalidated so that a subsequent
+    /// reallocation of the same id never serves stale bytes.
     pub fn free_page(&mut self, page_id: PageId) {
-        self.bitmap.free(page_id);
+        let bitmap_idx = (page_id as usize) / PAGES_PER_BITMAP;
+        if bitmap_idx < self.bitmaps.len() {
+            self.bitmaps[bitmap_idx].free(page_id);
+        }
         self.free_cache.push(page_id);
         self.superblock.free_page_count += 1;
+
+        // Invalidate any resident pool frame so a reallocation gets a clean page.
+        if let Some(pool) = self.pool.upgrade() {
+            pool.invalidate(page_id);
+        }
     }
 
-    /// Read a page from disk into `buf` and verify its checksum.
-    pub fn read_page(&self, _fs: &dyn FileSystem, page_id: PageId, buf: &mut AlignedBuffer) -> io::Result<()> {
+    /// Read a page into `buf`, routing through the buffer pool when available.
+    ///
+    /// When a pool is attached, the page is fetched via `fix_page` (potentially
+    /// a cache hit), its bytes are copied into `buf`, and the guard is dropped
+    /// immediately.  When no pool is attached, the page is read directly from
+    /// the file handle and its checksum is verified.
+    pub fn read_page(&self, fs: &dyn FileSystem, page_id: PageId, buf: &mut AlignedBuffer) -> io::Result<()> {
+        if let Some(pool) = self.pool.upgrade() {
+            let guard = pool.fix_page(fs, page_id)?;
+            buf.copy_from_slice(guard.buf());
+            // Guard drop unpins the frame.
+            return Ok(());
+        }
+
+        // Direct path (no pool).
         let handle = self.data_handle.as_ref().expect("data file not open");
         let offset = page_id * PAGE_SIZE as u64;
         handle.read_at(buf, offset)?;
@@ -119,12 +245,47 @@ impl PageManager {
         Ok(())
     }
 
-    /// Write `buf` to disk at `page_id`, updating the checksum first.
-    pub fn write_page(&self, _fs: &dyn FileSystem, page_id: PageId, buf: &mut AlignedBuffer) -> io::Result<()> {
+    /// Write `buf` to `page_id`, routing through the buffer pool when available.
+    ///
+    /// When a pool is attached, the frame is fixed in the pool, the caller's
+    /// data is copied in, and the frame is marked dirty (the background flusher
+    /// handles durability in batches — no per-write `fsync`).  When no pool is
+    /// attached, the write goes directly to disk with a `sync_data()` call.
+    pub fn write_page(&self, fs: &dyn FileSystem, page_id: PageId, buf: &mut AlignedBuffer) -> io::Result<()> {
+        if let Some(pool) = self.pool.upgrade() {
+            // Ensure the file is large enough for this page before the pool
+            // tries to read it (fix_page reads on miss).
+            let handle = self.data_handle.as_ref().expect("data file not open");
+            let required_len = page_id * PAGE_SIZE as u64 + PAGE_SIZE as u64;
+            let current_len = handle.len()?;
+            if current_len < required_len {
+                // Write a zeroed placeholder so fix_page can verify its checksum.
+                let mut placeholder = crate::storage::page::SlottedPage::init(
+                    page_id,
+                    crate::storage::page::PageType::SlottedData,
+                );
+                placeholder.update_checksum();
+                handle.set_len(required_len)?;
+                handle.sync_all()?;
+                handle.write_at(&placeholder.buf, page_id * PAGE_SIZE as u64)?;
+                handle.sync_data()?;
+            }
+
+            let mut guard = pool.fix_page(fs, page_id)?;
+            // Copy caller's data into the pool frame.
+            crate::storage::page::SlottedPage::update_checksum_bytes(buf);
+            guard.buf_mut().copy_from_slice(buf);
+            // Mark dirty — the flusher will persist this in a batched write.
+            // LSN u64::MAX means "no WAL record" (WAL-before-data: always flushable).
+            guard.set_dirty(u64::MAX);
+            // Guard drop unpins the frame.
+            return Ok(());
+        }
+
+        // Direct path (no pool): update checksum and write synchronously.
         crate::storage::page::SlottedPage::update_checksum_bytes(buf);
         let handle = self.data_handle.as_ref().expect("data file not open");
         let offset = page_id * PAGE_SIZE as u64;
-        // Ensure the file is large enough for this page.
         let required_len = offset + PAGE_SIZE as u64;
         let current_len = handle.len()?;
         if current_len < required_len {
@@ -135,27 +296,52 @@ impl PageManager {
         handle.sync_data()
     }
 
-    /// Persist the current superblock to disk (both copies).
+    /// Persist the current superblock to both copies atomically.
+    ///
+    /// Increments `generation` before writing so that the mirror-recovery
+    /// path can always identify the newest copy.  Uses `sync_all()` (not
+    /// just `sync_data()`) to ensure the directory entry is also durable.
     pub fn sync_superblock(&self, _fs: &dyn FileSystem) -> io::Result<()> {
         let mut sb = self.superblock;
         sb.generation += 1;
         sb.update_checksum();
-        let mut aligned = AlignedBuffer::zeroed(PAGE_SIZE);
         let encoded = encode_superblock(&sb);
-        aligned[..encoded.len()].copy_from_slice(&encoded);
         let handle = self.data_handle.as_ref().expect("data file not open");
-        // Primary copy at offset 0.
-        handle.write_at(&aligned, 0)?;
-        // Mirror copy at offset PAGE_SIZE.
-        handle.write_at(&aligned, PAGE_SIZE as u64)?;
+        // Primary copy at page 0.
+        handle.write_at(&encoded, 0)?;
+        // Mirror copy at page 1.
+        handle.write_at(&encoded, PAGE_SIZE as u64)?;
         handle.sync_all()
     }
 
-    /// Persist the bitmap page to disk.
-    pub fn sync_bitmap(&mut self, _fs: &dyn FileSystem) -> io::Result<()> {
-        let page_id = self.bitmap.page.header().page_id;
+    /// Persist ALL bitmap pages to disk.
+    pub fn sync_bitmaps(&mut self, _fs: &dyn FileSystem) -> io::Result<()> {
         let handle = self.data_handle.as_ref().expect("data file not open");
-        let buf = &mut self.bitmap.page.buf;
+        for bitmap in &mut self.bitmaps {
+            let page_id = bitmap.page.header().page_id;
+            let buf = &mut bitmap.page.buf;
+            crate::storage::page::SlottedPage::update_checksum_bytes(buf);
+            let offset = page_id * PAGE_SIZE as u64;
+            let required_len = offset + PAGE_SIZE as u64;
+            let current_len = handle.len()?;
+            if current_len < required_len {
+                handle.set_len(required_len)?;
+                handle.sync_all()?;
+            }
+            handle.write_at(buf, offset)?;
+        }
+        handle.sync_data()
+    }
+
+    /// Persist the first bitmap page to disk.
+    ///
+    /// This is a backward-compatibility alias for [`sync_bitmaps`] that
+    /// writes only bitmap slot 0 (the common case for small databases).
+    pub fn sync_bitmap(&mut self, _fs: &dyn FileSystem) -> io::Result<()> {
+        let handle = self.data_handle.as_ref().expect("data file not open");
+        let bitmap = &mut self.bitmaps[0];
+        let page_id = bitmap.page.header().page_id;
+        let buf = &mut bitmap.page.buf;
         crate::storage::page::SlottedPage::update_checksum_bytes(buf);
         let offset = page_id * PAGE_SIZE as u64;
         let required_len = offset + PAGE_SIZE as u64;
@@ -168,24 +354,34 @@ impl PageManager {
         handle.sync_data()
     }
 
-    /// Rebuild the free-list cache by scanning the bitmap.
+    /// Rebuild the free-list cache by scanning all bitmap pages.
     fn rebuild_cache(&mut self) {
         self.free_cache.pages.clear();
-        let base = self.bitmap.base_page_id();
-        for i in 0..PAGES_PER_BITMAP {
-            if self.free_cache.pages.len() >= self.free_cache.batch_size {
-                break;
-            }
-            let pid = base + i as PageId;
-            if pid >= 2 && !self.bitmap.is_set(pid) {
-                self.free_cache.pages.push(pid);
+        for bitmap in &self.bitmaps {
+            let base = bitmap.base_page_id();
+            for i in 0..PAGES_PER_BITMAP {
+                if self.free_cache.pages.len() >= self.free_cache.batch_size {
+                    return;
+                }
+                let pid = base + i as PageId;
+                // Skip the fixed metadata pages.
+                if pid < FIRST_DATA_PAGE_ID && !bitmap.is_set(pid) {
+                    continue;
+                }
+                if !bitmap.is_set(pid) {
+                    self.free_cache.pages.push(pid);
+                }
             }
         }
     }
 
     /// Return every allocated page id (including metadata pages).
     pub fn allocated_pages(&self) -> Vec<PageId> {
-        self.bitmap.allocated_pages()
+        let mut ids = Vec::new();
+        for bitmap in &self.bitmaps {
+            ids.extend(bitmap.allocated_pages());
+        }
+        ids
     }
 }
 
@@ -211,9 +407,9 @@ mod tests {
         pm.sync_bitmap(&fs).unwrap();
 
         let pid = pm.allocate_page();
-        assert_eq!(pid, 3);
+        assert_eq!(pid, FIRST_DATA_PAGE_ID);
         let pid2 = pm.allocate_page();
-        assert_eq!(pid2, 4);
+        assert_eq!(pid2, FIRST_DATA_PAGE_ID + 1);
     }
 
     #[test]
@@ -294,5 +490,57 @@ mod tests {
         let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
         let result = pm.write_page(&fs, pid, &mut buf);
         assert!(result.is_err(), "write_page must call sync_all after set_len when growing");
+    }
+
+    #[test]
+    fn num_bitmap_pages_calculation() {
+        assert_eq!(num_bitmap_pages(0), 1);
+        assert_eq!(num_bitmap_pages(1), 1);
+        assert_eq!(num_bitmap_pages(PAGES_PER_BITMAP as u64), 1);
+        assert_eq!(num_bitmap_pages(PAGES_PER_BITMAP as u64 + 1), 2);
+        assert_eq!(num_bitmap_pages(2 * PAGES_PER_BITMAP as u64), 2);
+        assert_eq!(num_bitmap_pages(2 * PAGES_PER_BITMAP as u64 + 1), 3);
+    }
+
+    #[test]
+    fn sync_bitmaps_writes_all_slots() {
+        let (_dir, fs, path) = temp_fs();
+        let mut pm = PageManager::init(path.clone(), PAGE_SIZE as u32, &fs).unwrap();
+        pm.sync_superblock(&fs).unwrap();
+        pm.sync_bitmaps(&fs).unwrap();
+
+        // Allocate a page and persist.
+        let pid = pm.allocate_page();
+        assert!(pm.bitmaps[0].is_set(pid));
+        pm.sync_bitmaps(&fs).unwrap();
+    }
+
+    #[test]
+    fn open_multi_restores_bitmap_chain() {
+        let (_dir, fs, path) = temp_fs();
+
+        // Init, allocate some pages, sync.
+        let allocated_pid = {
+            let mut pm = PageManager::init(path.clone(), PAGE_SIZE as u32, &fs).unwrap();
+            pm.sync_superblock(&fs).unwrap();
+            pm.sync_bitmap(&fs).unwrap();
+            let pid = pm.allocate_page();
+            pm.sync_superblock(&fs).unwrap();
+            pm.sync_bitmap(&fs).unwrap();
+            pid
+        };
+
+        // Reopen using open_multi with one bitmap buffer.
+        use crate::storage::meta::decode_superblock;
+        let handle = fs.open(&path, false).unwrap();
+        let mut sb_buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut sb_buf, 0).unwrap();
+        let sb = decode_superblock(&sb_buf).unwrap();
+        let mut bitmap_buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut bitmap_buf, FIRST_BITMAP_PAGE_ID as u64 * PAGE_SIZE as u64).unwrap();
+        drop(handle);
+
+        let pm = PageManager::open_multi(path, sb, vec![bitmap_buf], &fs).unwrap();
+        assert!(pm.bitmaps[0].is_set(allocated_pid), "previously allocated page must be set in restored bitmap");
     }
 }

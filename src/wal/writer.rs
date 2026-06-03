@@ -24,6 +24,8 @@ use crate::wal::record::{RecordType, WalRecord};
 use std::hash::Hasher as _;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use twox_hash::XxHash64;
 
 /// Descriptor block written at the end of every sealed WAL segment.
@@ -121,6 +123,12 @@ pub struct WalWriter {
     total_segment_count: u64,
     /// Persistent handle to the current segment file.
     segment_handle: Option<Box<dyn crate::io::FileHandle>>,
+    /// Highest LSN that has been durably flushed to disk (post-fsync).
+    ///
+    /// Shared with the buffer-pool flusher so that dirty frames are only
+    /// written after their WAL record is on durable storage
+    /// (WAL-before-data ordering).
+    durable_lsn: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for WalWriter {
@@ -136,6 +144,7 @@ impl std::fmt::Debug for WalWriter {
             .field("segment_start_lsn", &self.segment_start_lsn)
             .field("segment_record_count", &self.segment_record_count)
             .field("total_segment_count", &self.total_segment_count)
+            .field("durable_lsn", &self.durable_lsn.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -163,6 +172,9 @@ impl WalWriter {
             handle.sync_data()?;
             (1, 0u64, Some(handle))
         };
+        // Initialise durable_lsn to current_lsn so that records already on
+        // disk (from a previous open) are not considered unflushable.
+        let durable_lsn = Arc::new(AtomicU64::new(current_lsn));
         Ok(Self {
             wal_dir,
             current_lsn,
@@ -175,7 +187,17 @@ impl WalWriter {
             segment_record_count: 0,
             total_segment_count: 1,
             segment_handle,
+            durable_lsn,
         })
+    }
+
+    /// Return a shared handle to the durable LSN watermark.
+    ///
+    /// The buffer-pool flusher uses this to gate WAL-before-data ordering:
+    /// a dirty frame is not written to disk until its `rec_lsn` is ≤ the
+    /// durable LSN, guaranteeing the WAL record is already durable.
+    pub fn durable_lsn(&self) -> Arc<AtomicU64> {
+        self.durable_lsn.clone()
     }
 
     /// Append a record and return its LSN.
@@ -200,6 +222,10 @@ impl WalWriter {
     }
 
     /// Flush buffered data to disk and sync.
+    ///
+    /// After `sync_data()` succeeds, advances the shared `durable_lsn`
+    /// watermark to `current_lsn`.  The buffer-pool flusher reads this
+    /// watermark to enforce WAL-before-data ordering.
     pub fn flush(&mut self, _fs: &dyn FileSystem) -> io::Result<()> {
         if self.buffered == 0 {
             return Ok(());
@@ -210,6 +236,8 @@ impl WalWriter {
         handle.sync_data()?;
         self.buffered = 0;
         self.unsynced = 0;
+        // Advance the durable watermark now that these bytes are on disk.
+        self.durable_lsn.fetch_max(self.current_lsn, Ordering::Release);
         Ok(())
     }
 

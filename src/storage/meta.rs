@@ -1,6 +1,8 @@
-use crate::io::AlignedBuffer;
+use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::page::{PageId, PAGE_SIZE};
+use std::io;
 use std::mem::size_of;
+use std::path::Path;
 
 /// Current on-disk format version.
 pub const FORMAT_VERSION: u32 = 1;
@@ -90,6 +92,8 @@ impl Superblock {
 }
 
 /// Write a superblock into a page-aligned buffer suitable for I/O.
+///
+/// Returns an [`AlignedBuffer`] padded to [`PAGE_SIZE`] for direct I/O.
 pub fn encode_superblock(sb: &Superblock) -> AlignedBuffer {
     let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
     let bytes = unsafe {
@@ -117,9 +121,65 @@ pub fn decode_superblock(buf: &[u8]) -> Option<Superblock> {
     }
 }
 
+/// Open the database file at `path` and recover the best-available superblock.
+///
+/// The format stores two copies of the superblock:
+/// - Primary copy at byte offset 0 (page 0).
+/// - Mirror copy at byte offset `PAGE_SIZE` (page 1).
+///
+/// This function reads both copies, validates their checksums, and returns
+/// the valid copy with the higher `generation` field.  If both copies are
+/// invalid, it returns an [`io::Error`] of kind [`io::ErrorKind::InvalidData`].
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened, if the file is too short
+/// (must be at least `2 * PAGE_SIZE` bytes), or if both superblock copies
+/// fail checksum validation.
+pub fn load_superblock(fs: &dyn FileSystem, path: &Path) -> io::Result<Superblock> {
+    let handle = fs.open(path, false)?;
+    let file_len = handle.len()?;
+    let min_len = 2 * PAGE_SIZE as u64;
+    if file_len < min_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "database file too short: expected at least {} bytes, found {}",
+                min_len, file_len
+            ),
+        ));
+    }
+
+    let mut primary_buf = AlignedBuffer::zeroed(PAGE_SIZE);
+    let mut mirror_buf = AlignedBuffer::zeroed(PAGE_SIZE);
+    handle.read_at(&mut primary_buf, 0)?;
+    handle.read_at(&mut mirror_buf, PAGE_SIZE as u64)?;
+
+    let primary = decode_superblock(&primary_buf);
+    let mirror = decode_superblock(&mirror_buf);
+
+    match (primary, mirror) {
+        (Some(p), Some(m)) => {
+            // Both are valid: prefer the higher generation.
+            if m.generation > p.generation {
+                Ok(m)
+            } else {
+                Ok(p)
+            }
+        }
+        (Some(p), None) => Ok(p),
+        (None, Some(m)) => Ok(m),
+        (None, None) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "both superblock copies failed checksum validation",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::posix::PosixFileSystem;
 
     #[test]
     fn superblock_size_is_128() {
@@ -144,5 +204,128 @@ mod tests {
         let mut buf = encode_superblock(&sb);
         buf[20] ^= 0xFF;
         assert!(decode_superblock(&buf).is_none());
+    }
+
+    /// Helper: write two valid superblock copies to a temp file.
+    fn write_two_copies(
+        fs: &PosixFileSystem,
+        path: &std::path::Path,
+        primary: &Superblock,
+        mirror: &Superblock,
+    ) {
+        use std::io::Write;
+        {
+            let mut f = std::fs::File::create(path).unwrap();
+            f.set_len(2 * PAGE_SIZE as u64).unwrap();
+            f.flush().unwrap();
+        }
+        let handle = fs.open(path, false).unwrap();
+        let enc_primary = encode_superblock(primary);
+        let enc_mirror = encode_superblock(mirror);
+        handle.write_at(&enc_primary, 0).unwrap();
+        handle.write_at(&enc_mirror, PAGE_SIZE as u64).unwrap();
+        handle.sync_data().unwrap();
+    }
+
+    #[test]
+    fn load_superblock_primary_corrupted_returns_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let fs = PosixFileSystem::new(false);
+
+        let mut sb = Superblock::new(PAGE_SIZE as u32);
+        sb.generation = 1;
+        sb.update_checksum();
+
+        write_two_copies(&fs, &path, &sb, &sb);
+
+        // Corrupt the primary copy.
+        let handle = fs.open(&path, false).unwrap();
+        let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut buf, 0).unwrap();
+        buf[20] ^= 0xFF;
+        handle.write_at(&buf, 0).unwrap();
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        let recovered = load_superblock(&fs, &path).unwrap();
+        assert_eq!(recovered.generation, 1);
+    }
+
+    #[test]
+    fn load_superblock_mirror_corrupted_returns_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let fs = PosixFileSystem::new(false);
+
+        let mut sb = Superblock::new(PAGE_SIZE as u32);
+        sb.generation = 2;
+        sb.update_checksum();
+
+        write_two_copies(&fs, &path, &sb, &sb);
+
+        // Corrupt the mirror copy.
+        let handle = fs.open(&path, false).unwrap();
+        let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut buf, PAGE_SIZE as u64).unwrap();
+        buf[20] ^= 0xFF;
+        handle.write_at(&buf, PAGE_SIZE as u64).unwrap();
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        let recovered = load_superblock(&fs, &path).unwrap();
+        assert_eq!(recovered.generation, 2);
+    }
+
+    #[test]
+    fn load_superblock_prefers_higher_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let fs = PosixFileSystem::new(false);
+
+        let mut sb_old = Superblock::new(PAGE_SIZE as u32);
+        sb_old.generation = 3;
+        sb_old.update_checksum();
+
+        let mut sb_new = Superblock::new(PAGE_SIZE as u32);
+        sb_new.generation = 7;
+        sb_new.total_page_count = 42;
+        sb_new.update_checksum();
+
+        // Primary has generation 3, mirror has generation 7.
+        write_two_copies(&fs, &path, &sb_old, &sb_new);
+
+        let recovered = load_superblock(&fs, &path).unwrap();
+        assert_eq!(recovered.generation, 7);
+        assert_eq!(recovered.total_page_count, 42);
+    }
+
+    #[test]
+    fn load_superblock_both_corrupted_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let fs = PosixFileSystem::new(false);
+
+        let mut sb = Superblock::new(PAGE_SIZE as u32);
+        sb.generation = 1;
+        sb.update_checksum();
+
+        write_two_copies(&fs, &path, &sb, &sb);
+
+        // Corrupt both copies.
+        let handle = fs.open(&path, false).unwrap();
+        let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut buf, 0).unwrap();
+        buf[20] ^= 0xFF;
+        handle.write_at(&buf, 0).unwrap();
+        handle.read_at(&mut buf, PAGE_SIZE as u64).unwrap();
+        buf[20] ^= 0xFF;
+        handle.write_at(&buf, PAGE_SIZE as u64).unwrap();
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        let result = load_superblock(&fs, &path);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 }

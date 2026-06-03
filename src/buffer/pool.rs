@@ -551,6 +551,40 @@ impl BufferPool {
         }
         Ok(())
     }
+
+    /// Evict any frame currently holding `page_id`.
+    ///
+    /// The frame is marked clean and empty so it can be reclaimed by the
+    /// CLOCK-Pro sweeper.  This must be called after freeing a page so that
+    /// a subsequent reallocation of the same page id never serves stale bytes
+    /// from the cache.
+    ///
+    /// If the page is not resident the call is a no-op.
+    pub fn invalidate(&self, page_id: PageId) {
+        let shard_idx = Self::shard_index(page_id);
+        let fid = {
+            let mut shard = self.shards[shard_idx].lock().unwrap();
+            match shard.remove(&page_id) {
+                Some(fid) => fid,
+                None => return, // page not resident
+            }
+        };
+
+        let frame = self.frame(fid);
+        // Wait until any in-flight I/O on this frame completes.
+        // A simple spin is sufficient: the flusher holds the flag for only a
+        // few microseconds and we only arrive here after explicit free_page().
+        while frame.desc.io_inflight.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+
+        // Zeroize the buffer so a subsequent fix_page never serves stale data.
+        let frame_mut = self.frame_mut(fid);
+        frame_mut.buf.iter_mut().for_each(|b| *b = 0);
+
+        // Reset the descriptor: the frame is now empty.
+        frame_mut.desc.reset();
+    }
 }
 
 #[cfg(test)]
@@ -800,6 +834,104 @@ mod tests {
         // On non-Linux or when mbind fails, it falls back to standard alloc.
         // The test simply ensures no panic and that the pool has 4 frames.
         assert_eq!(pool.frame_count, 4);
+    }
+
+    #[test]
+    fn invalidate_evicts_resident_frame() {
+        use crate::storage::page::{PageType, SlottedPage};
+        let (_dir, fs, pool) = temp_pool(4);
+
+        // Fix page 4, write known data, mark dirty, unpin.
+        {
+            let mut guard = pool.fix_page(&fs, 4).unwrap();
+            guard.as_slice_mut()[SlottedPage::HEADER_SIZE] = 0xAB;
+            guard.set_dirty(99);
+        }
+
+        // Page should be resident.
+        let shard_idx = BufferPool::shard_index(4);
+        assert!(pool.shards[shard_idx].lock().unwrap().contains_key(&4));
+
+        // Invalidate: frame must be evicted.
+        pool.invalidate(4);
+        assert!(!pool.shards[shard_idx].lock().unwrap().contains_key(&4));
+    }
+
+    #[test]
+    fn freed_then_reallocated_page_is_clean() {
+        use crate::storage::page::{PageType, SlottedPage};
+        use crate::storage::manager::{PageManager, FIRST_DATA_PAGE_ID};
+        use std::sync::Arc;
+
+        let (_dir, fs, path) = {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rgraph.db");
+            let fs = PosixFileSystem::new(false);
+            {
+                let mut f = std::fs::File::create(&path).unwrap();
+                f.set_len(64 * PAGE_SIZE as u64).unwrap();
+                use std::io::Write;
+                f.flush().unwrap();
+            }
+            let handle = fs.open(&path, false).unwrap();
+            for pid in 0..64u64 {
+                let mut page = SlottedPage::init(pid, PageType::SlottedData);
+                page.update_checksum();
+                handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
+            }
+            handle.sync_data().unwrap();
+            drop(handle);
+            (dir, fs, path)
+        };
+
+        // Build a pool and attach it to a page manager.
+        let pool = Arc::new(BufferPool::new(16, path.clone()));
+        let mut pm = PageManager::init(path.clone(), PAGE_SIZE as u32, &fs).unwrap();
+        pm.set_pool(&pool);
+        pm.sync_superblock(&fs).unwrap();
+        pm.sync_bitmap(&fs).unwrap();
+
+        // Allocate a page and write known sentinel data via the pool.
+        let pid = pm.allocate_page();
+        let mut buf = SlottedPage::init(pid, PageType::SlottedData);
+        buf.buf[SlottedPage::HEADER_SIZE] = 0xDE;
+        buf.buf[SlottedPage::HEADER_SIZE + 1] = 0xAD;
+        buf.update_checksum();
+        pm.write_page(&fs, pid, &mut buf.buf).unwrap();
+
+        // Verify the sentinel is in the pool frame.
+        {
+            let guard = pool.fix_page(&fs, pid).unwrap();
+            assert_eq!(guard.as_slice()[SlottedPage::HEADER_SIZE], 0xDE);
+        }
+
+        // Free the page: pool frame must be invalidated.
+        pm.free_page(pid);
+        let shard_idx = BufferPool::shard_index(pid);
+        assert!(
+            !pool.shards[shard_idx].lock().unwrap().contains_key(&pid),
+            "pool must evict frame after free_page"
+        );
+
+        // Reallocate the same page id via the free list.
+        let pid2 = pm.allocate_page();
+        assert_eq!(pid, pid2, "same page id should be reused from free list");
+
+        // Write a clean page to disk so the pool can verify its checksum on load.
+        let mut clean = SlottedPage::init(pid2, PageType::SlottedData);
+        clean.update_checksum();
+        let handle = fs.open(&path, false).unwrap();
+        handle.write_at(&clean.buf, pid2 * PAGE_SIZE as u64).unwrap();
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        // Fix the reallocated page through the pool: must NOT see 0xDE/0xAD.
+        let guard = pool.fix_page(&fs, pid2).unwrap();
+        assert_ne!(
+            guard.as_slice()[SlottedPage::HEADER_SIZE],
+            0xDE,
+            "reallocated page must not serve stale data from evicted frame"
+        );
     }
 
     #[test]

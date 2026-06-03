@@ -39,26 +39,25 @@ pub struct Flusher {
     handle: Option<JoinHandle<()>>,
     /// Signal to stop.
     shutdown: Arc<AtomicBool>,
-    /// Monotonically increasing watermark of flushed LSN.
-    pub flushed_lsn: Arc<AtomicU64>,
 }
 
 impl Flusher {
     /// Start a background flusher thread.
     ///
     /// `pool` and `fs` are captured via `Arc` so the thread can reference
-    /// them safely.  For simplicity we accept `Arc<BufferPool>` and a
-    /// boxed filesystem trait object.
+    /// them safely.  `wal_durable_lsn` is the shared atomic updated by
+    /// [`WalWriter::flush`] after each successful `sync_data()`: dirty frames
+    /// whose `rec_lsn` exceeds this watermark are deferred until the WAL
+    /// catches up, enforcing WAL-before-data ordering.
     pub fn new(
         pool: Arc<BufferPool>,
         fs: Arc<dyn FileSystem>,
         dirty_ratio: f64,
         interval_ms: u64,
+        wal_durable_lsn: Arc<AtomicU64>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
-        let flushed_lsn = Arc::new(AtomicU64::new(0));
-        let flushed_lsn_clone = flushed_lsn.clone();
 
         let handle = spawn(move || {
             let interval = Duration::from_millis(interval_ms);
@@ -75,11 +74,14 @@ impl Flusher {
                 if dirty_pct > dirty_ratio {
                     let candidates = pool.dirty_candidates();
                     if !candidates.is_empty() {
+                        // Snapshot the durable LSN once per sweep to give a
+                        // consistent ordering boundary for this batch.
+                        let durable = wal_durable_lsn.load(Ordering::Acquire);
                         Self::flush_batch(
                             &pool,
                             fs.as_ref(),
                             &candidates,
-                            &flushed_lsn_clone,
+                            durable,
                         );
                     }
                 }
@@ -91,23 +93,22 @@ impl Flusher {
         Self {
             handle: Some(handle),
             shutdown,
-            flushed_lsn,
         }
     }
 
     /// Flush a batch of dirty frames using sort-merge elevator batching.
     ///
-    /// 1. Gather pending writes, skipping frames whose `rec_lsn` is ahead
-    ///    of the flushed watermark (WAL-before-data ordering).
+    /// 1. Gather pending writes, skipping frames whose `rec_lsn` exceeds
+    ///    `durable` (WAL-before-data ordering — defer until WAL catches up).
     /// 2. Sort by `page_id` (disk offset).
     /// 3. Group adjacent pages into merged extents up to [`MAX_BATCH_BYTES`].
     /// 4. Write each extent via vectored I/O.
-    /// 5. Update descriptors and advance the flushed LSN watermark.
+    /// 5. Update frame descriptors (mark clean, clear rec_lsn).
     fn flush_batch(
         pool: &BufferPool,
         fs: &dyn FileSystem,
         candidates: &[crate::buffer::frame::FrameId],
-        flushed_lsn: &AtomicU64,
+        durable: u64,
     ) {
         let mut pending: Vec<Pending> = Vec::with_capacity(candidates.len());
         for &fid in candidates {
@@ -117,9 +118,10 @@ impl Flusher {
                 continue;
             }
             let rec_lsn = frame.desc.rec_lsn.load(Ordering::Relaxed);
-            let current_flushed = flushed_lsn.load(Ordering::Relaxed);
-            if rec_lsn != u64::MAX && rec_lsn > current_flushed {
-                // WAL-before-data ordering: skip until WAL is flushed.
+            if rec_lsn != u64::MAX && rec_lsn > durable {
+                // WAL-before-data ordering: the WAL record for this page has
+                // not been flushed to disk yet.  Defer this frame until the
+                // WAL's durable LSN advances past rec_lsn.
                 continue;
             }
             if frame.desc.io_inflight.swap(true, Ordering::Acquire) {
@@ -164,18 +166,13 @@ impl Flusher {
                     frame.desc.io_inflight.store(false, Ordering::Release);
                 }
             } else {
-                // Update descriptors and advance flushed LSN.
-                let mut max_lsn = 0u64;
+                // Update descriptors: mark frame clean.
                 for p in extent {
                     let frame = pool.frame(p.fid);
                     frame.desc.dirty.store(false, Ordering::Release);
                     frame.desc.state.store(FrameState::Clean as u8, Ordering::Release);
                     frame.desc.io_inflight.store(false, Ordering::Release);
                     frame.desc.rec_lsn.store(u64::MAX, Ordering::Relaxed);
-                    max_lsn = max_lsn.max(p.last_lsn);
-                }
-                if max_lsn > 0 {
-                    flushed_lsn.fetch_max(max_lsn, Ordering::Release);
                 }
             }
 
@@ -258,6 +255,12 @@ mod tests {
         (dir, fs, pool)
     }
 
+    /// Helper: create a `wal_durable_lsn` that is already past all LSNs (u64::MAX)
+    /// so that WAL-ordering never blocks during tests that do not exercise it.
+    fn open_durable_lsn() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(u64::MAX))
+    }
+
     #[test]
     fn flusher_cleans_dirty_frames() {
         let (_dir, fs, pool) = setup(4);
@@ -267,7 +270,7 @@ mod tests {
             guard.set_dirty(0);
         }
 
-        let flusher = Flusher::new(pool.clone(), fs.clone(), 0.05, 5);
+        let flusher = Flusher::new(pool.clone(), fs.clone(), 0.05, 5, open_durable_lsn());
         // Give the flusher time to run.
         sleep(Duration::from_millis(100));
         drop(flusher);
@@ -294,7 +297,7 @@ mod tests {
         }
 
         // Threshold = 50 %, interval = 5 ms.
-        let flusher = Flusher::new(pool.clone(), fs.clone(), 0.50, 5);
+        let flusher = Flusher::new(pool.clone(), fs.clone(), 0.50, 5, open_durable_lsn());
         sleep(Duration::from_millis(60));
         drop(flusher);
 
@@ -325,7 +328,7 @@ mod tests {
             g2.set_dirty(0);
         }
 
-        let flusher = Flusher::new(pool.clone(), fs.clone(), 0.05, 5);
+        let flusher = Flusher::new(pool.clone(), fs.clone(), 0.05, 5, open_durable_lsn());
         sleep(Duration::from_millis(200));
         drop(flusher);
 
@@ -345,5 +348,52 @@ mod tests {
             }
         }
         assert!(found1 && found2, "both adjacent pages should be flushed");
+    }
+
+    /// Verifies WAL-before-data ordering: a frame with rec_lsn=5 is NOT flushed
+    /// while durable_lsn=3, then IS flushed once durable_lsn advances to 5.
+    #[test]
+    fn wal_before_data_ordering_defers_frame_until_wal_catches_up() {
+        let (_dir, fs, pool) = setup(4);
+
+        // Mark page 1 dirty with rec_lsn=5 (WAL record not yet durable).
+        {
+            let mut guard = pool.fix_page(fs.as_ref(), 1).unwrap();
+            guard.buf_mut()[0] = 0xAB;
+            guard.set_dirty(5);
+        }
+
+        // Start flusher with durable_lsn=3 — should not flush rec_lsn=5.
+        let durable = Arc::new(AtomicU64::new(3));
+        let flusher = Flusher::new(pool.clone(), fs.clone(), 0.05, 5, durable.clone());
+
+        // Wait long enough for at least 2 sweep cycles.
+        sleep(Duration::from_millis(50));
+
+        // Frame must still be dirty: WAL not yet durable.
+        let mut still_dirty = false;
+        for frame in pool.iter_frames() {
+            if frame.desc.page_id.load(Ordering::Relaxed) == 1 {
+                still_dirty = frame.desc.dirty.load(Ordering::Relaxed);
+                break;
+            }
+        }
+        assert!(still_dirty, "frame must remain dirty while durable_lsn < rec_lsn");
+
+        // Advance durable_lsn to 5 — flusher should now flush the frame.
+        durable.store(5, Ordering::Release);
+
+        // Give the flusher time to detect the advance and flush.
+        sleep(Duration::from_millis(100));
+        drop(flusher);
+
+        let mut flushed = false;
+        for frame in pool.iter_frames() {
+            if frame.desc.page_id.load(Ordering::Relaxed) == 1 {
+                flushed = !frame.desc.dirty.load(Ordering::Relaxed);
+                break;
+            }
+        }
+        assert!(flushed, "frame must be clean after durable_lsn >= rec_lsn");
     }
 }
