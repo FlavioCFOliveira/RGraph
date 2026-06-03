@@ -3,14 +3,22 @@
 //! The AST is intentionally minimal: it supports the clauses and expressions
 //! required for Sprint 8 (fixed-length MATCH, WHERE, RETURN) and can be
 //! extended later for write clauses, aggregations, and sub-queries.
+//!
+//! Every AST node carries an optional [`TextRange`](text_size::TextRange)
+//! representing its source span in the original query text.  Spans are
+//! produced by the parser and consumed by the CST layer (see
+//! [`crate::cypher::syntax`]) for error reporting and IDE features.
 
 use crate::graph::property::{OrderedF64, Property};
 use std::collections::HashMap;
+use text_size::TextRange;
 
 /// A top-level Cypher statement (e.g. a full query).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statement {
     pub clauses: Vec<Clause>,
+    /// Source span covering the entire statement text.
+    pub span: Option<TextRange>,
 }
 
 /// A single clause in a Cypher statement.
@@ -23,10 +31,23 @@ pub enum Clause {
     // TODO: DELETE, SET, WITH, UNWIND, etc.
 }
 
+impl Clause {
+    /// Return the source span of this clause, if available.
+    pub fn span(&self) -> Option<TextRange> {
+        match self {
+            Clause::Match(c) => c.span,
+            Clause::Return(c) => c.span,
+            Clause::Where(c) => c.span,
+            Clause::Create(c) => c.span,
+        }
+    }
+}
+
 /// `MATCH (pattern)` clause.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchClause {
     pub pattern: Pattern,
+    pub span: Option<TextRange>,
 }
 
 /// `RETURN projection_list` clause.
@@ -36,24 +57,28 @@ pub struct ReturnClause {
     pub order_by: Vec<OrderItem>,
     pub skip: Option<Expression>,
     pub limit: Option<Expression>,
+    pub span: Option<TextRange>,
 }
 
 /// `WHERE expression` clause.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhereClause {
     pub predicate: Expression,
+    pub span: Option<TextRange>,
 }
 
 /// `CREATE (pattern)` clause.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateClause {
     pub pattern: Pattern,
+    pub span: Option<TextRange>,
 }
 
 /// A pattern is an alternating sequence of nodes and relationships.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pattern {
     pub elements: Vec<PatternElement>,
+    pub span: Option<TextRange>,
 }
 
 /// One element in a pattern chain.
@@ -63,12 +88,22 @@ pub enum PatternElement {
     Relationship(RelationshipPattern),
 }
 
+impl PatternElement {
+    pub fn span(&self) -> Option<TextRange> {
+        match self {
+            PatternElement::Node(n) => n.span,
+            PatternElement::Relationship(r) => r.span,
+        }
+    }
+}
+
 /// `(variable:Label {prop: value})`
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct NodePattern {
     pub variable: Option<String>,
     pub labels: Vec<String>,
     pub properties: HashMap<String, Expression>,
+    pub span: Option<TextRange>,
 }
 
 /// `-[:TYPE]->` or `<-[:TYPE]-`
@@ -79,6 +114,7 @@ pub struct RelationshipPattern {
     pub variable: Option<String>,
     pub properties: HashMap<String, Expression>,
     pub length: PathLength,
+    pub span: Option<TextRange>,
 }
 
 /// Direction of a relationship in a pattern.
@@ -107,6 +143,7 @@ impl Default for PathLength {
 pub struct Projection {
     pub expression: Expression,
     pub alias: Option<String>,
+    pub span: Option<TextRange>,
 }
 
 /// `expression ASC|DESC` in ORDER BY.
@@ -114,6 +151,7 @@ pub struct Projection {
 pub struct OrderItem {
     pub expression: Expression,
     pub ascending: bool,
+    pub span: Option<TextRange>,
 }
 
 /// Expressions supported by the Sprint 8 subset.
@@ -121,10 +159,10 @@ pub struct OrderItem {
 pub enum Expression {
     Literal(Literal),
     Variable(String),
-    PropertyAccess { base: Box<Expression>, property: String },
-    BinaryOp { op: BinaryOperator, left: Box<Expression>, right: Box<Expression> },
-    Comparison { op: ComparisonOperator, left: Box<Expression>, right: Box<Expression> },
-    UnaryOp { op: UnaryOperator, expr: Box<Expression> },
+    PropertyAccess { base: Box<Expression>, property: String, span: Option<TextRange> },
+    BinaryOp { op: BinaryOperator, left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
+    Comparison { op: ComparisonOperator, left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
+    UnaryOp { op: UnaryOperator, expr: Box<Expression>, span: Option<TextRange> },
     IsNull(Box<Expression>),
     IsNotNull(Box<Expression>),
     List(Vec<Expression>),
@@ -134,9 +172,29 @@ pub enum Expression {
         name: String,
         args: Vec<Expression>,
         distinct: bool,
+        span: Option<TextRange>,
     },
     /// Wildcard `*` used inside `count(*)`.
     Wildcard,
+}
+
+impl Expression {
+    /// Return the source span of this expression, if available.
+    pub fn span(&self) -> Option<TextRange> {
+        match self {
+            Expression::Literal(l) => l.span(),
+            Expression::Variable(_) => None,
+            Expression::PropertyAccess { span, .. } => *span,
+            Expression::BinaryOp { span, .. } => *span,
+            Expression::Comparison { span, .. } => *span,
+            Expression::UnaryOp { span, .. } => *span,
+            Expression::IsNull(_) | Expression::IsNotNull(_) => None,
+            Expression::List(_) => None,
+            Expression::Map(_) => None,
+            Expression::FunctionCall { span, .. } => *span,
+            Expression::Wildcard => None,
+        }
+    }
 }
 
 /// Binary arithmetic operators.
@@ -179,10 +237,28 @@ pub enum Literal {
     // TODO: Date, Duration, Point
 }
 
+impl Literal {
+    /// Return the source span of this literal, if available.
+    pub fn span(&self) -> Option<TextRange> {
+        None
+    }
+
+    /// Convert to a domain [`Property`] value.
+    pub fn to_property(&self) -> Property {
+        match self {
+            Literal::Null => Property::Null,
+            Literal::Boolean(b) => Property::Boolean(*b),
+            Literal::Integer(v) => Property::Integer(*v),
+            Literal::Float(v) => Property::Float(OrderedF64(*v)),
+            Literal::String(s) => Property::String(s.clone()),
+        }
+    }
+}
+
 impl Statement {
     /// Create a new empty statement.
     pub fn new() -> Self {
-        Self { clauses: Vec::new() }
+        Self { clauses: Vec::new(), span: None }
     }
 
     /// Append a clause.
@@ -195,19 +271,6 @@ impl Statement {
 impl Default for Statement {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Literal {
-    /// Convert to a domain [`Property`] value.
-    pub fn to_property(&self) -> Property {
-        match self {
-            Literal::Null => Property::Null,
-            Literal::Boolean(b) => Property::Boolean(*b),
-            Literal::Integer(v) => Property::Integer(*v),
-            Literal::Float(v) => Property::Float(OrderedF64(*v)),
-            Literal::String(s) => Property::String(s.clone()),
-        }
     }
 }
 
@@ -322,10 +385,10 @@ impl std::fmt::Display for Expression {
         match self {
             Expression::Literal(l) => write!(f, "{}", l),
             Expression::Variable(v) => write!(f, "{}", v),
-            Expression::PropertyAccess { base, property } => write!(f, "{}.{}", base, property),
-            Expression::BinaryOp { op, left, right } => write!(f, "({} {} {})", left, op, right),
-            Expression::Comparison { op, left, right } => write!(f, "({} {} {})", left, op, right),
-            Expression::UnaryOp { op, expr } => write!(f, "{}{}", op, expr),
+            Expression::PropertyAccess { base, property, .. } => write!(f, "{}.{}", base, property),
+            Expression::BinaryOp { op, left, right, .. } => write!(f, "({} {} {})", left, op, right),
+            Expression::Comparison { op, left, right, .. } => write!(f, "({} {} {})", left, op, right),
+            Expression::UnaryOp { op, expr, .. } => write!(f, "{}{}", op, expr),
             Expression::IsNull(e) => write!(f, "{} IS NULL", e),
             Expression::IsNotNull(e) => write!(f, "{} IS NOT NULL", e),
             Expression::List(items) => {
@@ -338,7 +401,7 @@ impl std::fmt::Display for Expression {
                     .collect();
                 write!(f, "{{{}}}", elems.join(", "))
             }
-            Expression::FunctionCall { name, args, distinct } => {
+            Expression::FunctionCall { name, args, distinct, .. } => {
                 let prefix = if *distinct { "DISTINCT " } else { "" };
                 let elems: Vec<String> = args.iter().map(|a| a.to_string()).collect();
                 write!(f, "{}{}({})", prefix, name, elems.join(", "))
@@ -418,6 +481,10 @@ impl std::fmt::Display for OrderItem {
     }
 }
 
+// ------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +499,7 @@ mod tests {
                             variable: Some("n".to_string()),
                             labels: vec!["Person".to_string()],
                             properties: HashMap::new(),
+                            span: None,
                         }),
                         PatternElement::Relationship(RelationshipPattern {
                             direction: Direction::Outgoing,
@@ -439,14 +507,18 @@ mod tests {
                             variable: None,
                             properties: HashMap::new(),
                             length: PathLength::Fixed(1),
+                            span: None,
                         }),
                         PatternElement::Node(NodePattern {
                             variable: Some("m".to_string()),
                             labels: vec!["Person".to_string()],
                             properties: HashMap::new(),
+                            span: None,
                         }),
                     ],
+                    span: None,
                 },
+                span: None,
             }))
             .with_clause(Clause::Where(WhereClause {
                 predicate: Expression::Comparison {
@@ -454,24 +526,30 @@ mod tests {
                     left: Box::new(Expression::PropertyAccess {
                         base: Box::new(Expression::Variable("n".to_string())),
                         property: "name".to_string(),
+                        span: None,
                     }),
                     right: Box::new(Expression::Literal(Literal::String("Alice".to_string()))),
+                    span: None,
                 },
+                span: None,
             }))
             .with_clause(Clause::Return(ReturnClause {
                 projections: vec![
                     Projection {
                         expression: Expression::Variable("n".to_string()),
                         alias: None,
+                        span: None,
                     },
                     Projection {
                         expression: Expression::Variable("m".to_string()),
                         alias: None,
+                        span: None,
                     },
                 ],
                 order_by: vec![],
                 skip: None,
                 limit: None,
+                span: None,
             }));
 
         assert_eq!(stmt.clauses.len(), 3);
@@ -491,6 +569,7 @@ mod tests {
             variable: Some("n".to_string()),
             labels: vec!["Person".to_string()],
             properties: HashMap::new(),
+            span: None,
         };
         assert_eq!(node.to_string(), "(n:Person)");
     }

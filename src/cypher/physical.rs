@@ -858,7 +858,7 @@ mod tests {
             vec![("x".to_string(), Value::Integer(15))].into_iter().collect(),
         ]));
         let mut filter = FilterOp::new(
-            Expression::Comparison {
+            Expression::Comparison { span: None,
                 op: crate::cypher::ast::ComparisonOperator::Gt,
                 left: Box::new(Expression::Variable("x".to_string())),
                 right: Box::new(Expression::Literal(Literal::Integer(10))),
@@ -879,8 +879,8 @@ mod tests {
             vec![("a".to_string(), Value::Integer(1))].into_iter().collect(),
         ]));
         let mut proj = ProjectOp::new(
-            vec![Projection {
-                expression: Expression::Variable("a".to_string()),
+            vec![Projection { span: None,
+                    expression: Expression::Variable("a".to_string()),
                 alias: Some("b".to_string()),
             }],
             input,

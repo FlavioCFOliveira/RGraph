@@ -84,17 +84,17 @@ impl CypherQueryService {
             Expression::Literal(Literal::Null) => Ok(ProtoValue {
                 kind: Some(proto::value::Kind::Null(proto::Null {})),
             }),
-            Expression::BinaryOp { op, left, right } => {
+            Expression::BinaryOp { op, left, right, .. } => {
                 let lhs = Self::eval_expression(left)?;
                 let rhs = Self::eval_expression(right)?;
                 Self::eval_binary_op(lhs, op, rhs)
             }
-            Expression::Comparison { op, left, right } => {
+            Expression::Comparison { op, left, right, .. } => {
                 let lhs = Self::eval_expression(left)?;
                 let rhs = Self::eval_expression(right)?;
                 Self::eval_comparison(lhs, op, rhs)
             }
-            Expression::UnaryOp { op, expr } => {
+            Expression::UnaryOp { op, expr, .. } => {
                 let val = Self::eval_expression(expr)?;
                 Self::eval_unary_op(op, val)
             }
@@ -102,7 +102,7 @@ impl CypherQueryService {
                 "variable '{}' not bound (execution engine not yet implemented)",
                 name
             ))),
-            Expression::PropertyAccess { base: _, property } => Err(RGraphError::Semantic(format!(
+            Expression::PropertyAccess { base: _, property, .. } => Err(RGraphError::Semantic(format!(
                 "property access .{} not supported (execution engine not yet implemented)",
                 property
             ))),

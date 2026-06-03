@@ -470,6 +470,7 @@ mod tests {
         let plan = LogicalPlan::new(LogicalOperator::Filter {
             input: Box::new(LogicalOperator::AllNodesScan),
             predicate: Expression::Comparison {
+                span: None,
                 op: ComparisonOperator::Gt,
                 left: Box::new(Expression::Variable("age".to_string())),
                 right: Box::new(Expression::Literal(Literal::Integer(18))),
@@ -484,8 +485,8 @@ mod tests {
     fn plan_explain_project() {
         let plan = LogicalPlan::new(LogicalOperator::Project {
             input: Box::new(LogicalOperator::AllNodesScan),
-            projections: vec![Projection {
-                expression: Expression::Variable("n".to_string()),
+            projections: vec![Projection { span: None,
+                    expression: Expression::Variable("n".to_string()),
                 alias: Some("node".to_string()),
             }],
         });
@@ -540,8 +541,8 @@ mod tests {
     fn project_output_variables_uses_alias() {
         let op = LogicalOperator::Project {
             input: Box::new(LogicalOperator::AllNodesScan),
-            projections: vec![Projection {
-                expression: Expression::Variable("n".to_string()),
+            projections: vec![Projection { span: None,
+                    expression: Expression::Variable("n".to_string()),
                 alias: Some("node".to_string()),
             }],
         };
@@ -552,7 +553,8 @@ mod tests {
     #[test]
     fn create_output_variables() {
         let pattern = Pattern {
-            elements: vec![PatternElement::Node(NodePattern {
+            span: None,
+            elements: vec![PatternElement::Node(NodePattern { span: None,
                 variable: Some("n".to_string()),
                 labels: vec!["Person".to_string()],
                 properties: HashMap::new(),

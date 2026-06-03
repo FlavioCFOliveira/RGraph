@@ -72,7 +72,7 @@ pub fn evaluate(expr: &Expression, ctx: &EvalContext) -> Result<Value, EvalError
                 message: format!("undefined variable '{}'", name),
             }),
 
-        Expression::PropertyAccess { base, property } => {
+        Expression::PropertyAccess { base, property, .. } => {
             let base_val = evaluate(base, ctx)?;
             match base_val {
                 Value::Map(mut entries) => entries
@@ -91,7 +91,7 @@ pub fn evaluate(expr: &Expression, ctx: &EvalContext) -> Result<Value, EvalError
             }
         }
 
-        Expression::BinaryOp { op, left, right } => {
+        Expression::BinaryOp { op, left, right, .. } => {
             let l = evaluate(left, ctx)?;
             let r = evaluate(right, ctx)?;
             let result = match op {
@@ -112,7 +112,7 @@ pub fn evaluate(expr: &Expression, ctx: &EvalContext) -> Result<Value, EvalError
             })
         }
 
-        Expression::Comparison { op, left, right } => {
+        Expression::Comparison { op, left, right, .. } => {
             let l = evaluate(left, ctx)?;
             let r = evaluate(right, ctx)?;
             let result = match op {
@@ -133,7 +133,7 @@ pub fn evaluate(expr: &Expression, ctx: &EvalContext) -> Result<Value, EvalError
             })
         }
 
-        Expression::UnaryOp { op, expr } => {
+        Expression::UnaryOp { op, expr, .. } => {
             let v = evaluate(expr, ctx)?;
             match op {
                 UnaryOperator::Not => v.not().ok_or_else(|| EvalError {
@@ -247,6 +247,7 @@ mod tests {
     fn eval_arithmetic_addition() {
         let ctx = EvalContext::new();
         let expr = Expression::BinaryOp {
+            span: None,
             op: BinaryOperator::Add,
             left: Box::new(Expression::Literal(Literal::Integer(3))),
             right: Box::new(Expression::Literal(Literal::Integer(4))),
@@ -272,6 +273,7 @@ mod tests {
     fn eval_comparison() {
         let ctx = EvalContext::new();
         let expr = Expression::Comparison {
+            span: None,
             op: ComparisonOperator::Gt,
             left: Box::new(Expression::Literal(Literal::Integer(5))),
             right: Box::new(Expression::Literal(Literal::Integer(3))),
@@ -283,6 +285,7 @@ mod tests {
     fn eval_not_operator() {
         let ctx = EvalContext::new();
         let expr = Expression::UnaryOp {
+            span: None,
             op: UnaryOperator::Not,
             expr: Box::new(Expression::Literal(Literal::Boolean(true))),
         };
@@ -293,6 +296,7 @@ mod tests {
     fn eval_neg_operator() {
         let ctx = EvalContext::new();
         let expr = Expression::UnaryOp {
+            span: None,
             op: UnaryOperator::Neg,
             expr: Box::new(Expression::Literal(Literal::Integer(7))),
         };
@@ -337,6 +341,7 @@ mod tests {
         map.insert("name".to_string(), Value::String("Alice".to_string()));
         let ctx = EvalContext::new().bind("n", Value::Map(map));
         let expr = Expression::PropertyAccess {
+            span: None,
             base: Box::new(Expression::Variable("n".to_string())),
             property: "name".to_string(),
         };
@@ -350,6 +355,7 @@ mod tests {
     fn eval_property_access_on_null() {
         let ctx = EvalContext::new().bind("n", Value::Null);
         let expr = Expression::PropertyAccess {
+            span: None,
             base: Box::new(Expression::Variable("n".to_string())),
             property: "name".to_string(),
         };
@@ -361,11 +367,13 @@ mod tests {
         let ctx = EvalContext::new().bind("x", Value::Integer(10));
         let projs = vec![
             Projection {
-                expression: Expression::Variable("x".to_string()),
+            span: None,
+            expression: Expression::Variable("x".to_string()),
                 alias: Some("a".to_string()),
             },
             Projection {
-                expression: Expression::Literal(Literal::Integer(5)),
+            span: None,
+            expression: Expression::Literal(Literal::Integer(5)),
                 alias: None,
             },
         ];
@@ -378,6 +386,7 @@ mod tests {
     fn eval_null_arithmetic() {
         let ctx = EvalContext::new();
         let expr = Expression::BinaryOp {
+            span: None,
             op: BinaryOperator::Add,
             left: Box::new(Expression::Literal(Literal::Null)),
             right: Box::new(Expression::Literal(Literal::Integer(5))),
@@ -389,6 +398,7 @@ mod tests {
     fn eval_string_concatenation() {
         let ctx = EvalContext::new();
         let expr = Expression::BinaryOp {
+            span: None,
             op: BinaryOperator::Add,
             left: Box::new(Expression::Literal(Literal::String("hello".to_string()))),
             right: Box::new(Expression::Literal(Literal::String(" ".to_string()))),

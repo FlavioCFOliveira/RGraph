@@ -5,11 +5,16 @@
 //!   Fixed-length patterns with labels, types, and property maps
 //!   Literals, variables, property access, comparisons, AND/OR/NOT
 //!
-//! The parser produces an [`ast::Statement`](crate::cypher::ast::Statement).
+//! The parser produces an [`ast::Statement`](crate::cypher::ast::Statement)
+//! annotated with source [`TextRange`](text_size::TextRange) spans on every
+//! node.  Spans are accumulated during parsing so that error reporters, the
+//! TCK harness, and IDE features can map AST elements back to the original
+//! query text.
 
 use crate::cypher::ast::*;
 use crate::error::RGraphError;
 use std::collections::HashMap;
+use text_size::{TextRange, TextSize};
 
 /// Parse error with source location.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +23,8 @@ pub struct ParseError {
     pub offset: usize,
     pub line: usize,
     pub column: usize,
+    /// The source span where the error occurred.
+    pub span: Option<TextRange>,
 }
 
 impl std::fmt::Display for ParseError {
@@ -42,9 +49,13 @@ impl From<ParseError> for RGraphError {
 }
 
 /// Parse a complete Cypher statement.
+///
+/// Every node in the returned [`Statement`] carries a [`TextRange`] that
+/// maps back to the original `input` string.
 pub fn parse(input: &str) -> Result<Statement, ParseError> {
     let mut parser = Parser::new(input);
-    let mut stmt = Statement::new();
+    let mut clauses = Vec::new();
+    let stmt_start = parser.offset();
 
     while !parser.is_eof() {
         parser.skip_whitespace();
@@ -52,13 +63,7 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
             break;
         }
         let clause = parser.parse_clause()?;
-        let _clause_name = match &clause {
-            Clause::Match(_) => "MATCH",
-            Clause::Where(_) => "WHERE",
-            Clause::Return(_) => "RETURN",
-            Clause::Create(_) => "CREATE",
-        };
-        stmt.clauses.push(clause);
+        clauses.push(clause);
         parser.skip_whitespace();
         if parser.peek_char() == Some(';') {
             parser.advance(); // optional statement terminator
@@ -66,11 +71,15 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
         }
     }
 
-    if stmt.clauses.is_empty() {
+    if clauses.is_empty() {
         return Err(parser.error("empty statement"));
     }
 
-    Ok(stmt)
+    let stmt_end = parser.offset();
+    Ok(Statement {
+        clauses,
+        span: Some(TextRange::new(stmt_start, stmt_end)),
+    })
 }
 
 struct Parser {
@@ -98,6 +107,10 @@ impl Parser {
         self.input.get(self.pos).copied()
     }
 
+    fn offset(&self) -> TextSize {
+        TextSize::from(self.pos as u32)
+    }
+
     fn advance(&mut self) -> Option<char> {
         let ch = self.input.get(self.pos).copied();
         if let Some(c) = ch {
@@ -113,11 +126,14 @@ impl Parser {
     }
 
     fn error(&self, msg: &str) -> ParseError {
+        let start = self.offset();
+        let end = TextSize::from((self.pos + 1).min(self.input.len()) as u32);
         ParseError {
             message: msg.to_string(),
             offset: self.pos,
             line: self.line,
             column: self.column,
+            span: Some(TextRange::new(start, end)),
         }
     }
 
@@ -167,36 +183,51 @@ impl Parser {
             return Err(self.error("unexpected end of input"));
         }
 
-        let start = self.pos;
+        let clause_start = self.offset();
         let keyword = self.read_keyword();
-        match keyword.to_ascii_uppercase().as_str() {
+        let kw_upper = keyword.to_ascii_uppercase();
+        match kw_upper.as_str() {
             "MATCH" => {
                 self.skip_whitespace();
                 let pattern = self.parse_pattern()?;
-                Ok(Clause::Match(MatchClause { pattern }))
+                let clause_end = self.offset();
+                Ok(Clause::Match(MatchClause {
+                    pattern,
+                    span: Some(TextRange::new(clause_start, clause_end)),
+                }))
             }
             "WHERE" => {
                 self.skip_whitespace();
                 let predicate = self.parse_expression(0)?;
-                Ok(Clause::Where(WhereClause { predicate }))
+                let clause_end = self.offset();
+                Ok(Clause::Where(WhereClause {
+                    predicate,
+                    span: Some(TextRange::new(clause_start, clause_end)),
+                }))
             }
             "RETURN" => {
                 self.skip_whitespace();
                 let (projections, order_by, skip, limit) = self.parse_return_body()?;
+                let clause_end = self.offset();
                 Ok(Clause::Return(ReturnClause {
                     projections,
                     order_by,
                     skip,
                     limit,
+                    span: Some(TextRange::new(clause_start, clause_end)),
                 }))
             }
             "CREATE" => {
                 self.skip_whitespace();
                 let pattern = self.parse_pattern()?;
-                Ok(Clause::Create(CreateClause { pattern }))
+                let clause_end = self.offset();
+                Ok(Clause::Create(CreateClause {
+                    pattern,
+                    span: Some(TextRange::new(clause_start, clause_end)),
+                }))
             }
             _ => {
-                self.pos = start;
+                self.pos = clause_start.into();
                 Err(self.error(&format!("unexpected keyword or token: '{}'", keyword)))
             }
         }
@@ -233,6 +264,7 @@ impl Parser {
             if self.is_eof() {
                 break;
             }
+            let kw_start = self.offset();
             let kw = self.read_keyword().to_ascii_uppercase();
             match kw.as_str() {
                 "ORDER" => {
@@ -252,6 +284,7 @@ impl Parser {
                 "" => break,
                 _ => {
                     // Not a keyword we recognise; backtrack.
+                    self.pos = kw_start.into();
                     break;
                 }
             }
@@ -266,6 +299,7 @@ impl Parser {
         let mut projections = Vec::new();
         loop {
             self.skip_whitespace();
+            let proj_start = self.offset();
             let expr = self.parse_expression(0)?;
             self.skip_whitespace();
 
@@ -287,10 +321,12 @@ impl Parser {
                     None
                 }
             };
+            let proj_end = self.offset();
 
             projections.push(Projection {
                 expression: expr,
                 alias,
+                span: Some(TextRange::new(proj_start, proj_end)),
             });
             self.skip_whitespace();
             if self.peek_char() == Some(',') {
@@ -306,6 +342,7 @@ impl Parser {
         let mut items = Vec::new();
         loop {
             self.skip_whitespace();
+            let item_start = self.offset();
             let expr = self.parse_expression(0)?;
             self.skip_whitespace();
             let ascending = match self.read_keyword().to_ascii_uppercase().as_str() {
@@ -313,7 +350,12 @@ impl Parser {
                 "ASC" => true,
                 _ => true,
             };
-            items.push(OrderItem { expression: expr, ascending });
+            let item_end = self.offset();
+            items.push(OrderItem {
+                expression: expr,
+                ascending,
+                span: Some(TextRange::new(item_start, item_end)),
+            });
             self.skip_whitespace();
             if self.peek_char() == Some(',') {
                 self.advance();
@@ -325,6 +367,7 @@ impl Parser {
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        let pattern_start = self.offset();
         let mut elements = Vec::new();
         loop {
             self.skip_whitespace();
@@ -340,11 +383,16 @@ impl Parser {
                 break;
             }
         }
-        Ok(Pattern { elements })
+        let pattern_end = self.offset();
+        Ok(Pattern {
+            elements,
+            span: Some(TextRange::new(pattern_start, pattern_end)),
+        })
     }
 
     fn parse_node_pattern(&mut self) -> Result<NodePattern, ParseError> {
         self.skip_whitespace();
+        let node_start = self.offset();
         if self.peek_char() != Some('(') {
             return Err(self.error("expected '(' to start node pattern"));
         }
@@ -380,16 +428,19 @@ impl Parser {
             return Err(self.error("expected ')' to end node pattern"));
         }
         self.advance(); // consume ')'
+        let node_end = self.offset();
 
         Ok(NodePattern {
             variable,
             labels,
             properties,
+            span: Some(TextRange::new(node_start, node_end)),
         })
     }
 
     fn parse_relationship_pattern(&mut self) -> Result<RelationshipPattern, ParseError> {
         self.skip_whitespace();
+        let rel_start = self.offset();
         let mut direction = Direction::Both;
 
         if self.peek_char() == Some('<') {
@@ -456,6 +507,7 @@ impl Parser {
             self.advance();
             direction = Direction::Outgoing;
         }
+        let rel_end = self.offset();
 
         Ok(RelationshipPattern {
             direction,
@@ -463,6 +515,7 @@ impl Parser {
             variable,
             properties,
             length: PathLength::Fixed(1),
+            span: Some(TextRange::new(rel_start, rel_end)),
         })
     }
 
@@ -535,6 +588,7 @@ impl Parser {
         min_bp: u8,
     ) -> Result<Expression, ParseError> {
         self.skip_whitespace();
+        let expr_start = self.offset();
         let mut lhs = self.parse_primary()?;
 
         loop {
@@ -550,17 +604,20 @@ impl Parser {
             self.advance_operator(&op)?;
             self.skip_whitespace();
             let rhs = self.parse_expression(rbp)?;
+            let expr_end = self.offset();
             if let Some(bin_op) = arithmetic_op(&op) {
                 lhs = Expression::BinaryOp {
                     op: bin_op,
                     left: Box::new(lhs),
                     right: Box::new(rhs),
+                    span: Some(TextRange::new(expr_start, expr_end)),
                 };
             } else {
                 lhs = Expression::Comparison {
                     op: comparison_op(&op),
                     left: Box::new(lhs),
                     right: Box::new(rhs),
+                    span: Some(TextRange::new(expr_start, expr_end)),
                 };
             }
         }
@@ -572,23 +629,28 @@ impl Parser {
             let start_line = self.line;
             let start_col = self.column;
             let kw = self.read_keyword().to_ascii_uppercase();
+            let expr_end = self.offset();
             match kw.as_str() {
                 "AND" => {
                     self.skip_whitespace();
                     let rhs = self.parse_expression(0)?;
+                    let expr_end = self.offset();
                     lhs = Expression::BinaryOp {
                         op: BinaryOperator::Mul, // reuse Mul as AND placeholder
                         left: Box::new(lhs),
                         right: Box::new(rhs),
+                        span: Some(TextRange::new(expr_start, expr_end)),
                     };
                 }
                 "OR" => {
                     self.skip_whitespace();
                     let rhs = self.parse_expression(0)?;
+                    let expr_end = self.offset();
                     lhs = Expression::BinaryOp {
                         op: BinaryOperator::Add, // reuse Add as OR placeholder
                         left: Box::new(lhs),
                         right: Box::new(rhs),
+                        span: Some(TextRange::new(expr_start, expr_end)),
                     };
                 }
                 _ => {
@@ -639,6 +701,7 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expression, ParseError> {
         self.skip_whitespace();
+        let expr_start = self.offset();
         match self.peek_char() {
             None => Err(self.error("unexpected end of input")),
             Some('(') => {
@@ -657,9 +720,11 @@ impl Parser {
             Some('-') => {
                 self.advance();
                 let expr = self.parse_primary()?;
+                let expr_end = self.offset();
                 Ok(Expression::UnaryOp {
                     op: UnaryOperator::Neg,
                     expr: Box::new(expr),
+                    span: Some(TextRange::new(expr_start, expr_end)),
                 })
             }
             Some('\'') | Some('"') => self.parse_string_literal(),
@@ -670,9 +735,11 @@ impl Parser {
                 if self.peek_char() == Some('.') {
                     self.advance();
                     let prop = self.parse_identifier()?;
+                    let expr_end = self.offset();
                     Ok(Expression::PropertyAccess {
                         base: Box::new(Expression::Variable(ident)),
                         property: prop,
+                        span: Some(TextRange::new(expr_start, expr_end)),
                     })
                 } else if self.peek_char() == Some('(') {
                     // Function call: ident(args...)
@@ -717,10 +784,12 @@ impl Parser {
                         return Err(self.error("expected ')' to end function call"));
                     }
                     self.advance(); // consume ')'
+                    let expr_end = self.offset();
                     Ok(Expression::FunctionCall {
                         name: ident,
                         args,
                         distinct: false, // TODO: propagate distinct correctly
+                        span: Some(TextRange::new(expr_start, expr_end)),
                     })
                 } else {
                     match ident.to_ascii_uppercase().as_str() {
@@ -730,9 +799,11 @@ impl Parser {
                         "NOT" => {
                             self.skip_whitespace();
                             let expr = self.parse_primary()?;
+                            let expr_end = self.offset();
                             Ok(Expression::UnaryOp {
                                 op: UnaryOperator::Not,
                                 expr: Box::new(expr),
+                                span: Some(TextRange::new(expr_start, expr_end)),
                             })
                         }
                         _ => Ok(Expression::Variable(ident)),
@@ -745,6 +816,7 @@ impl Parser {
 
     fn parse_list_literal(&mut self) -> Result<Expression, ParseError> {
         self.skip_whitespace();
+        let list_start = self.offset();
         if self.peek_char() != Some('[') {
             return Err(self.error("expected '[' to start list literal"));
         }
@@ -754,6 +826,7 @@ impl Parser {
         let mut items = Vec::new();
         if self.peek_char() == Some(']') {
             self.advance();
+            let list_end = self.offset();
             return Ok(Expression::List(items));
         }
 
@@ -774,11 +847,13 @@ impl Parser {
             return Err(self.error("expected ']' to end list literal"));
         }
         self.advance();
+        let list_end = self.offset();
         Ok(Expression::List(items))
     }
 
     fn parse_map_literal(&mut self) -> Result<Expression, ParseError> {
         self.skip_whitespace();
+        let map_start = self.offset();
         if self.peek_char() != Some('{') {
             return Err(self.error("expected '{' to start map literal"));
         }
@@ -788,6 +863,7 @@ impl Parser {
         let mut entries = Vec::new();
         if self.peek_char() == Some('}') {
             self.advance();
+            let map_end = self.offset();
             return Ok(Expression::Map(entries));
         }
 
@@ -815,14 +891,15 @@ impl Parser {
             return Err(self.error("expected '}' to end map literal"));
         }
         self.advance();
+        let map_end = self.offset();
         Ok(Expression::Map(entries))
     }
 
     fn parse_string_literal(&mut self) -> Result<Expression, ParseError> {
-        let quote = self.advance().unwrap();
+        let _quote = self.advance().unwrap();
         let mut s = String::new();
         while let Some(c) = self.peek_char() {
-            if c == quote {
+            if c == _quote {
                 self.advance();
                 break;
             } else if c == '\\' {
@@ -934,11 +1011,13 @@ fn arithmetic_op(op: &str) -> Option<BinaryOperator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use text_size::TextSize;
 
     #[test]
     fn parse_simple_match_return() {
         let stmt = parse("MATCH (n:Person)-[:KNOWS]->(m:Person) RETURN n, m").unwrap();
         assert_eq!(stmt.clauses.len(), 2);
+        assert!(stmt.span.is_some());
     }
 
     #[test]
@@ -1004,6 +1083,8 @@ mod tests {
     fn parse_error_unexpected_token() {
         let result = parse("MATCH @");
         assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.span.is_some());
     }
 
     #[test]
@@ -1128,6 +1209,24 @@ mod tests {
             }
         } else {
             panic!("expected RETURN clause");
+        }
+    }
+
+    #[test]
+    fn spans_are_populated() {
+        let stmt = parse("MATCH (n) RETURN n").unwrap();
+        assert!(stmt.span.is_some());
+        let range = stmt.span.unwrap();
+        assert_eq!(range.start(), TextSize::from(0));
+        assert_eq!(range.end(), TextSize::from(18));
+
+        if let Clause::Match(m) = &stmt.clauses[0] {
+            assert!(m.span.is_some());
+            let mrange = m.span.unwrap();
+            assert_eq!(mrange.start(), TextSize::from(0));
+            assert_eq!(mrange.end(), TextSize::from(10));
+        } else {
+            panic!("expected MATCH clause");
         }
     }
 }

@@ -251,8 +251,10 @@ mod tests {
     #[test]
     fn execute_simple_return() {
         let stmt = Statement::new().with_clause(Clause::Return(ReturnClause {
-            projections: vec![Projection {
-                expression: Expression::Literal(Literal::Integer(42)),
+                    span: None,
+                    projections: vec![Projection {
+                    span: None,
+                    expression: Expression::Literal(Literal::Integer(42)),
                 alias: None,
             }],
             order_by: vec![],
@@ -268,8 +270,10 @@ mod tests {
     #[test]
     fn execute_return_with_alias() {
         let stmt = Statement::new().with_clause(Clause::Return(ReturnClause {
-            projections: vec![Projection {
-                expression: Expression::Literal(Literal::String("hello".to_string())),
+                    span: None,
+                    projections: vec![Projection {
+                    span: None,
+                    expression: Expression::Literal(Literal::String("hello".to_string())),
                 alias: Some("greeting".to_string()),
             }],
             order_by: vec![],
@@ -323,11 +327,13 @@ mod tests {
     #[test]
     fn unsupported_match_clause() {
         let stmt = Statement::new()
-            .with_clause(Clause::Match(crate::cypher::ast::MatchClause {
-                pattern: crate::cypher::ast::Pattern { elements: vec![] },
+            .with_clause(Clause::Match(crate::cypher::ast::MatchClause { span: None,
+                pattern: crate::cypher::ast::Pattern { span: None, elements: vec![] },
             }))
             .with_clause(Clause::Return(ReturnClause {
-                projections: vec![Projection {
+                    span: None,
+                    projections: vec![Projection {
+                    span: None,
                     expression: Expression::Literal(Literal::Integer(1)),
                     alias: None,
                 }],

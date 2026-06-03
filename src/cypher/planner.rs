@@ -293,7 +293,7 @@ fn extract_aggregate(expr: &Expression) -> Option<(
     Expression,
     bool,
 )> {
-    if let Expression::FunctionCall { name, args, distinct } = expr {
+    if let Expression::FunctionCall { name, args, distinct, .. } = expr {
         let func = match name.to_ascii_uppercase().as_str() {
             "COUNT" => crate::cypher::plan::AggregateFunction::Count,
             "COLLECT" => crate::cypher::plan::AggregateFunction::Collect,
