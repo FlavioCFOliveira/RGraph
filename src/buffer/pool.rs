@@ -1,4 +1,5 @@
 use crate::buffer::frame::{Frame, FrameDescriptor, FrameId, FrameState};
+use crate::buffer::NumaTopology;
 use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::page::{PageId, PAGE_SIZE};
 use std::cell::UnsafeCell;
@@ -132,9 +133,27 @@ impl BufferPool {
     ///
     /// `frame_count` is normally `target_ram_bytes / PAGE_SIZE`.
     pub fn new(frame_count: u32, data_path: PathBuf) -> Self {
+        Self::new_numa(frame_count, data_path, &NumaTopology::detect())
+    }
+
+    /// Create a new buffer pool with explicit NUMA topology.
+    ///
+    /// Frames are partitioned evenly across NUMA nodes and allocated with
+    /// `mbind(MPOL_BIND)` on Linux.  On non-NUMA systems this behaves
+    /// identically to [`Self::new`].
+    pub fn new_numa(frame_count: u32, data_path: PathBuf, topo: &NumaTopology) -> Self {
         let mut frames = Vec::with_capacity(frame_count as usize);
-        for _ in 0..frame_count {
-            frames.push(Frame::new());
+        if topo.is_numa() {
+            // Partition frames across nodes round-robin.
+            for i in 0..frame_count {
+                let node_id = (i as usize) % topo.node_count;
+                let buf = AlignedBuffer::zeroed_on_node(PAGE_SIZE, Some(node_id));
+                frames.push(Frame::with_buffer(buf));
+            }
+        } else {
+            for _ in 0..frame_count {
+                frames.push(Frame::new());
+            }
         }
         let shards: [Mutex<HashMap<PageId, FrameId>>; SHARD_COUNT] =
             std::array::from_fn(|_| Mutex::new(HashMap::new()));
@@ -586,5 +605,37 @@ mod tests {
         handle.as_slice_mut()[0] = 0x01;
         assert_eq!(handle.as_slice()[0], 0x01);
         assert_eq!(handle.desc().pin_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn new_numa_creates_pool_without_panic() {
+        let (_dir, fs, pool) = temp_pool(4);
+        // Creating a NUMA-aware pool should not panic on any topology.
+        let topo = NumaTopology::detect();
+        let pool2 = BufferPool::new_numa(4, pool.data_path.clone(), &topo);
+        // Verify basic operations still work.
+        let guard = pool2.fix_page(&fs, 1).unwrap();
+        assert_eq!(guard.desc().pin_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn numa_pool_partitions_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rgraph.db");
+        let fs = PosixFileSystem::new(false);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.set_len(64 * PAGE_SIZE as u64).unwrap();
+        f.flush().unwrap();
+        drop(f);
+
+        let topo = NumaTopology {
+            node_count: 2,
+            cpus_per_node: vec![vec![0], vec![1]],
+        };
+        let pool = BufferPool::new_numa(4, path, &topo);
+        // On Linux with NUMA support, frames are allocated round-robin.
+        // On non-Linux or when mbind fails, it falls back to standard alloc.
+        // The test simply ensures no panic and that the pool has 4 frames.
+        assert_eq!(pool.frame_count, 4);
     }
 }

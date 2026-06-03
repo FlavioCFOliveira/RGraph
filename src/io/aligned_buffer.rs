@@ -12,11 +12,19 @@ use std::slice;
 ///
 /// The buffer is `Send` and `Sync` because the allocation is plain
 /// page-aligned memory with no aliasing.
+/// Deallocation strategy for [`AlignedBuffer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreeStrategy {
+    RustDealloc,
+    LibcFree,
+}
+
 #[derive(Debug)]
 pub struct AlignedBuffer {
     ptr: *mut u8,
     len: usize,
     cap: usize,
+    free_strategy: FreeStrategy,
 }
 
 impl AlignedBuffer {
@@ -25,16 +33,37 @@ impl AlignedBuffer {
 
     /// Allocate a zeroed buffer of `size` bytes aligned to [`Self::ALIGNMENT`].
     pub fn zeroed(size: usize) -> Self {
+        Self::zeroed_on_node(size, None)
+    }
+
+    /// Allocate a zeroed buffer bound to a specific NUMA node.
+    ///
+    /// `node_id` is the zero-based NUMA node index.  On platforms without
+    /// NUMA support, or when `node_id` is `None`, this falls back to the
+    /// standard aligned allocator.
+    pub fn zeroed_on_node(size: usize, node_id: Option<usize>) -> Self {
         let layout =
             Layout::from_size_align(size, Self::ALIGNMENT).expect("valid aligned layout");
-        // SAFETY: layout is non-zero and alignment is a power of two.
-        let ptr = unsafe { alloc(layout) };
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
+        let (ptr, free_strategy) = if let Some(node) = node_id {
+            if let Some(p) = crate::buffer::numa::alloc_numa_aligned(size, Self::ALIGNMENT, node) {
+                (p, FreeStrategy::LibcFree)
+            } else {
+                let p = unsafe { alloc(layout) };
+                if p.is_null() {
+                    std::alloc::handle_alloc_error(layout);
+                }
+                (p, FreeStrategy::RustDealloc)
+            }
+        } else {
+            let p = unsafe { alloc(layout) };
+            if p.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            (p, FreeStrategy::RustDealloc)
+        };
         // SAFETY: we own `ptr..ptr+size` and it is valid for writes.
         unsafe { std::ptr::write_bytes(ptr, 0, size) };
-        Self { ptr, len: size, cap: size }
+        Self { ptr, len: size, cap: size, free_strategy }
     }
 
     /// Length in bytes.
@@ -77,6 +106,12 @@ impl Clone for AlignedBuffer {
     }
 }
 
+impl Default for AlignedBuffer {
+    fn default() -> Self {
+        Self::zeroed(0)
+    }
+}
+
 // SAFETY: `AlignedBuffer` owns its memory and there is no aliasing.
 unsafe impl Send for AlignedBuffer {}
 unsafe impl Sync for AlignedBuffer {}
@@ -99,10 +134,26 @@ impl DerefMut for AlignedBuffer {
 
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
-        let layout =
-            Layout::from_size_align(self.cap, Self::ALIGNMENT).expect("valid aligned layout");
-        // SAFETY: `ptr` was allocated with exactly this layout.
-        unsafe { dealloc(self.ptr, layout) };
+        match self.free_strategy {
+            FreeStrategy::RustDealloc => {
+                let layout =
+                    Layout::from_size_align(self.cap, Self::ALIGNMENT).expect("valid aligned layout");
+                // SAFETY: `ptr` was allocated with exactly this layout.
+                unsafe { dealloc(self.ptr, layout) };
+            }
+            #[cfg(target_os = "linux")]
+            FreeStrategy::LibcFree => {
+                // SAFETY: `ptr` came from posix_memalign and must be freed with libc::free.
+                unsafe { libc::free(self.ptr as *mut libc::c_void) };
+            }
+            #[cfg(not(target_os = "linux"))]
+            FreeStrategy::LibcFree => {
+                // Unreachable on non-Linux, but keep for completeness.
+                let layout =
+                    Layout::from_size_align(self.cap, Self::ALIGNMENT).expect("valid aligned layout");
+                unsafe { dealloc(self.ptr, layout) };
+            }
+        }
     }
 }
 

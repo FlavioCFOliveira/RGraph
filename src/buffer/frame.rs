@@ -116,6 +116,15 @@ impl Frame {
             buf: AlignedBuffer::zeroed(PAGE_SIZE),
         }
     }
+
+    /// Create a frame backed by an existing buffer.
+    pub fn with_buffer(buf: AlignedBuffer) -> Self {
+        assert_eq!(buf.len(), PAGE_SIZE, "frame buffer must be PAGE_SIZE");
+        Self {
+            desc: FrameDescriptor::new(),
+            buf,
+        }
+    }
 }
 
 #[cfg(test)]
