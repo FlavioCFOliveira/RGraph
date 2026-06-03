@@ -1,0 +1,163 @@
+syntax = "proto3";
+
+package rgraph;
+
+// ------------------------------------------------------------------
+// Value types used in query results and parameters
+// ------------------------------------------------------------------
+
+message Value {
+  oneof kind {
+    Null null = 1;
+    bool boolean = 2;
+    int64 integer = 3;
+    double float = 4;
+    string string = 5;
+    bytes bytes = 6;
+    ListValue list = 7;
+    MapValue map = 8;
+    NodeValue node = 9;
+    RelationshipValue relationship = 10;
+  }
+}
+
+message Null {}
+
+message ListValue {
+  repeated Value values = 1;
+}
+
+message MapValue {
+  map<string, Value> entries = 1;
+}
+
+message NodeValue {
+  uint64 node_id = 1;
+  string label = 2;
+  map<string, Value> properties = 3;
+}
+
+message RelationshipValue {
+  uint64 edge_id = 1;
+  string rel_type = 2;
+  uint64 source_id = 3;
+  uint64 target_id = 4;
+  map<string, Value> properties = 5;
+}
+
+// ------------------------------------------------------------------
+// Cypher query service
+// ------------------------------------------------------------------
+
+service CypherQuery {
+  rpc Execute(QueryRequest) returns (QueryResponse);
+  rpc ExecuteStream(stream QueryRequest) returns (stream QueryResponse);
+}
+
+message QueryRequest {
+  // Cypher query text (e.g. "RETURN 1 + 2 AS result").
+  string query = 1;
+  // Optional named parameters.
+  map<string, Value> parameters = 2;
+}
+
+message QueryResponse {
+  oneof result {
+    // Query executed successfully; each row is a map of column names to values.
+    ResultSet result_set = 1;
+    // Execution error.
+    ErrorPayload error = 2;
+  }
+}
+
+message ResultSet {
+  repeated string columns = 1;
+  repeated Row rows = 2;
+}
+
+message Row {
+  repeated Value values = 1;
+}
+
+message ErrorPayload {
+  string code = 1;
+  string message = 2;
+}
+
+// ------------------------------------------------------------------
+// Transaction service
+// ------------------------------------------------------------------
+
+service TransactionManager {
+  rpc Begin(BeginRequest) returns (BeginResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Rollback(RollbackRequest) returns (RollbackResponse);
+}
+
+message BeginRequest {
+  // Optional read-only hint.
+  bool read_only = 1;
+}
+
+message BeginResponse {
+  oneof result {
+    uint64 tx_id = 1;
+    ErrorPayload error = 2;
+  }
+}
+
+message CommitRequest {
+  uint64 tx_id = 1;
+}
+
+message CommitResponse {
+  oneof result {
+    bool ok = 1;
+    ErrorPayload error = 2;
+  }
+}
+
+message RollbackRequest {
+  uint64 tx_id = 1;
+}
+
+message RollbackResponse {
+  oneof result {
+    bool ok = 1;
+    ErrorPayload error = 2;
+  }
+}
+
+// ------------------------------------------------------------------
+// Health / admin service
+// ------------------------------------------------------------------
+
+service Health {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Ready(ReadinessRequest) returns (ReadinessResponse);
+  rpc Metrics(MetricsRequest) returns (MetricsResponse);
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  ServingStatus status = 1;
+}
+
+message ReadinessRequest {}
+
+message ReadinessResponse {
+  bool ready = 1;
+}
+
+message MetricsRequest {}
+
+message MetricsResponse {
+  // Prometheus text exposition format.
+  string prometheus_text = 1;
+}

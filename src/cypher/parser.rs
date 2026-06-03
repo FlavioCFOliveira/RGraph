@@ -529,11 +529,19 @@ impl Parser {
             self.advance_operator(&op)?;
             self.skip_whitespace();
             let rhs = self.parse_expression(rbp)?;
-            lhs = Expression::Comparison {
-                op: comparison_op(&op),
-                left: Box::new(lhs),
-                right: Box::new(rhs),
-            };
+            if let Some(bin_op) = arithmetic_op(&op) {
+                lhs = Expression::BinaryOp {
+                    op: bin_op,
+                    left: Box::new(lhs),
+                    right: Box::new(rhs),
+                };
+            } else {
+                lhs = Expression::Comparison {
+                    op: comparison_op(&op),
+                    left: Box::new(lhs),
+                    right: Box::new(rhs),
+                };
+            }
         }
 
         // Handle AND / OR (lowest precedence)
@@ -689,7 +697,7 @@ impl Parser {
         let mut op = String::new();
         let mut lookahead = self.pos;
         while let Some(&c) = self.input.get(lookahead) {
-            if "<>=!".contains(c) {
+            if "<>=!+-*/%".contains(c) {
                 op.push(c);
                 lookahead += 1;
             } else {
@@ -715,6 +723,8 @@ fn infix_binding_power(op: &str) -> (u8, u8) {
     match op {
         "=" | "<>" => (1, 2),
         "<" | ">" | "<=" | ">=" => (3, 4),
+        "+" | "-" => (5, 6),
+        "*" | "/" | "%" => (7, 8),
         _ => (0, 0),
     }
 }
@@ -728,6 +738,17 @@ fn comparison_op(op: &str) -> ComparisonOperator {
         ">" => ComparisonOperator::Gt,
         ">=" => ComparisonOperator::Ge,
         _ => ComparisonOperator::Eq,
+    }
+}
+
+fn arithmetic_op(op: &str) -> Option<BinaryOperator> {
+    match op {
+        "+" => Some(BinaryOperator::Add),
+        "-" => Some(BinaryOperator::Sub),
+        "*" => Some(BinaryOperator::Mul),
+        "/" => Some(BinaryOperator::Div),
+        "%" => Some(BinaryOperator::Mod),
+        _ => None,
     }
 }
 
