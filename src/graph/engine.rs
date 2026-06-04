@@ -397,7 +397,20 @@ impl GraphStorageEngine {
             let recovery = AriesRecovery::new(&wal_fs, &wal_dir, &data_path, checkpoint_lsn);
             let result = recovery.recover(&mut wal_writer)?;
             if result.max_lsn > 0 {
+                // H15: make the recovery REDO/UNDO writes durable BEFORE advancing
+                // the checkpoint, so a crash here can never leave last_checkpoint_lsn
+                // ahead of the data it claims is applied.  After this fsync every
+                // change <= max_lsn is durably applied, so we advance the checkpoint
+                // to max_lsn: the next recovery starts from here and reaches a
+                // fixpoint (no unbounded re-doing on each restart).  This also keeps
+                // the Option-A redo-commit-filter sound — every page still needing
+                // REDO after the checkpoint was dirtied by a transaction whose
+                // records are >= the checkpoint and therefore in the ATT.
+                let data_handle = fs.open(&data_path, false)?;
+                data_handle.sync_data()?;
+                drop(data_handle);
                 pm.superblock.current_wal_lsn = result.max_lsn;
+                pm.superblock.last_checkpoint_lsn = result.max_lsn;
                 pm.sync_superblock(fs)?;
             }
         }
@@ -2920,6 +2933,44 @@ mod tests {
 
         let retrieved = engine.get_edge(100, &fs).unwrap().unwrap();
         assert_eq!(retrieved.first_property, prop_slot);
+    }
+
+    #[test]
+    fn recovery_advances_checkpoint_and_reaches_fixpoint() {
+        // Regression gate for finding H15 (2026-06-04): after recovery the
+        // engine fsyncs the recovered data and advances last_checkpoint_lsn to
+        // the recovered max_lsn, so a subsequent reopen with no new writes starts
+        // from the checkpoint and re-does no work (a fixpoint) rather than
+        // replaying the whole WAL every restart.
+        let (_dir, fs, path) = temp_fs();
+        {
+            let mut engine = GraphStorageEngine::init(path.clone(), &fs).unwrap();
+            for i in 1..=5u64 {
+                engine.put_node(&NodeRecord::new(i, 1), &fs).unwrap();
+            }
+            engine.sync(&fs).unwrap();
+        }
+
+        // First reopen: recovery runs and advances the checkpoint.
+        let engine = GraphStorageEngine::open(path.clone(), &fs).unwrap();
+        let ckpt = engine.page_manager.superblock.last_checkpoint_lsn;
+        assert!(
+            ckpt > 0,
+            "recovery must advance last_checkpoint_lsn (got {ckpt})"
+        );
+        drop(engine);
+
+        // Second reopen with no new writes: the checkpoint is stable (fixpoint),
+        // and the data is intact.
+        let engine2 = GraphStorageEngine::open(path, &fs).unwrap();
+        assert_eq!(
+            engine2.page_manager.superblock.last_checkpoint_lsn, ckpt,
+            "checkpoint must be stable across a no-write reopen"
+        );
+        assert!(
+            engine2.get_node(3, &fs).unwrap().is_some(),
+            "recovered nodes must survive both reopens"
+        );
     }
 
     #[test]
