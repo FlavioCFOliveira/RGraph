@@ -376,13 +376,24 @@ fn build_match_plan(
 
 /// Build the operator tree for a `RETURN` clause.
 ///
-/// The tree is stacked as:
+/// Without aggregation the tree is:
 /// ```text
 /// Project
-///   Aggregate (optional, if projections contain aggregate functions)
-///     Sort (optional)
-///       Skip (optional)
-///         Limit (optional)
+///   Limit (optional)
+///     Skip (optional)
+///       Sort (optional)
+///         input
+/// ```
+///
+/// With aggregation the Sort/Skip/Limit move *above* the Aggregate (so ORDER BY
+/// can reference grouping keys and aggregate results), and a pass-through
+/// Project re-orders the aggregate output into the RETURN column order:
+/// ```text
+/// Project (pass-through, by output key)
+///   Limit (optional)
+///     Skip (optional)
+///       Sort (optional)        -- references AggregateOp output keys
+///         Aggregate
 ///           input
 /// ```
 fn build_return_plan(
@@ -392,27 +403,6 @@ fn build_return_plan(
     // Use SingleRow when there is no data-producing input (RETURN-only query).
     let mut op = input.unwrap_or(LogicalOperator::SingleRow);
 
-    if !ret.order_by.is_empty() {
-        op = LogicalOperator::Sort {
-            input: Box::new(op),
-            order_by: ret.order_by.clone(),
-        };
-    }
-
-    if let Some(skip_expr) = &ret.skip {
-        op = LogicalOperator::Skip {
-            input: Box::new(op),
-            expression: skip_expr.clone(),
-        };
-    }
-
-    if let Some(limit_expr) = &ret.limit {
-        op = LogicalOperator::Limit {
-            input: Box::new(op),
-            expression: limit_expr.clone(),
-        };
-    }
-
     // Detect aggregate functions in projections.
     let (grouping_projections, aggregate_projections): (Vec<_>, Vec<_>) = ret
         .projections
@@ -420,48 +410,180 @@ fn build_return_plan(
         .cloned()
         .partition(|p| !is_aggregate_expression(&p.expression));
 
-    if !aggregate_projections.is_empty() {
-        // Build aggregation operator.
-        let grouping_keys: Vec<Expression> = grouping_projections
+    if aggregate_projections.is_empty() {
+        // No aggregation: Sort/Skip/Limit operate on the scan rows directly,
+        // then a Project shapes the output.
+        if !ret.order_by.is_empty() {
+            op = LogicalOperator::Sort {
+                input: Box::new(op),
+                order_by: ret.order_by.clone(),
+            };
+        }
+        if let Some(skip_expr) = &ret.skip {
+            op = LogicalOperator::Skip {
+                input: Box::new(op),
+                expression: skip_expr.clone(),
+            };
+        }
+        if let Some(limit_expr) = &ret.limit {
+            op = LogicalOperator::Limit {
+                input: Box::new(op),
+                expression: limit_expr.clone(),
+            };
+        }
+        op = LogicalOperator::Project {
+            input: Box::new(op),
+            projections: ret.projections.clone(),
+        };
+        return Ok(op);
+    }
+
+    // ── Aggregation path ───────────────────────────────────────────────────
+
+    // The grouping key for projection `p` is bound by AggregateOp under the
+    // string form of its expression; an aggregate result is bound under its
+    // alias (or the expression's string form when unaliased).
+    let grouping_keys: Vec<Expression> = grouping_projections
+        .iter()
+        .map(|p| p.expression.clone())
+        .collect();
+    let aggregations: Vec<crate::cypher::plan::Aggregation> = aggregate_projections
+        .iter()
+        .map(|p| {
+            let (func, arg, distinct) = extract_aggregate(&p.expression).unwrap_or((
+                crate::cypher::plan::AggregateFunction::Count,
+                Expression::Literal(crate::cypher::ast::Literal::Null),
+                false,
+            ));
+            crate::cypher::plan::Aggregation {
+                alias: p.alias.clone().unwrap_or_else(|| p.expression.to_string()),
+                function: func,
+                argument: arg,
+                distinct,
+            }
+        })
+        .collect();
+
+    op = LogicalOperator::Aggregate {
+        input: Box::new(op),
+        grouping_keys,
+        aggregations,
+    };
+
+    // Sort/Skip/Limit run *after* the Aggregate so ORDER BY can reference the
+    // aggregate output.  The AggregateOp binds grouping keys under their
+    // expression string (e.g. `n.kind`) and aggregates under their alias, so an
+    // ORDER BY expression must be rewritten to a `Variable` referencing that
+    // bound key — otherwise evaluating `n.kind` would look up the now-absent
+    // pattern variable `n`.
+    if !ret.order_by.is_empty() {
+        let rewritten: Vec<OrderItem> = ret
+            .order_by
             .iter()
-            .map(|p| p.expression.clone())
-            .collect();
-        let aggregations: Vec<crate::cypher::plan::Aggregation> = aggregate_projections
-            .iter()
-            .map(|p| {
-                let (func, arg, distinct) = extract_aggregate(&p.expression).unwrap_or((
-                    crate::cypher::plan::AggregateFunction::Count,
-                    Expression::Literal(crate::cypher::ast::Literal::Null),
-                    false,
-                ));
-                crate::cypher::plan::Aggregation {
-                    alias: p.alias.clone().unwrap_or_else(|| p.expression.to_string()),
-                    function: func,
-                    argument: arg,
-                    distinct,
-                }
+            .map(|item| OrderItem {
+                expression: rewrite_order_key_for_aggregation(
+                    &item.expression,
+                    &grouping_projections,
+                    &aggregate_projections,
+                ),
+                ascending: item.ascending,
+                span: item.span,
             })
             .collect();
-
-        op = LogicalOperator::Aggregate {
+        op = LogicalOperator::Sort {
             input: Box::new(op),
-            grouping_keys,
-            aggregations,
+            order_by: rewritten,
         };
-
-        // Wrap in Project so that aliases and column order are preserved.
-        op = LogicalOperator::Project {
+    }
+    if let Some(skip_expr) = &ret.skip {
+        op = LogicalOperator::Skip {
             input: Box::new(op),
-            projections: ret.projections.clone(),
+            expression: skip_expr.clone(),
         };
-    } else {
-        op = LogicalOperator::Project {
+    }
+    if let Some(limit_expr) = &ret.limit {
+        op = LogicalOperator::Limit {
             input: Box::new(op),
-            projections: ret.projections.clone(),
+            expression: limit_expr.clone(),
         };
     }
 
+    // Pass-through Project: re-order the aggregate output into the RETURN column
+    // order and apply final aliases.  Each projection references the value the
+    // AggregateOp already bound — by expression string for grouping keys, by
+    // alias-or-expression-string for aggregates — and must NOT re-evaluate the
+    // aggregate expression (e.g. `count(n)`), which would fail because the
+    // pattern variable `n` is gone post-aggregation (rmp Task 190).
+    let pass_through: Vec<Projection> = ret
+        .projections
+        .iter()
+        .map(|p| {
+            // Key under which AggregateOp bound this projection's value.
+            let bound_key = if is_aggregate_expression(&p.expression) {
+                p.alias.clone().unwrap_or_else(|| p.expression.to_string())
+            } else {
+                p.expression.to_string()
+            };
+            // Final output column name.
+            let output_name = p.alias.clone().unwrap_or_else(|| p.expression.to_string());
+            Projection {
+                expression: Expression::Variable(bound_key),
+                alias: Some(output_name),
+                span: p.span,
+            }
+        })
+        .collect();
+    op = LogicalOperator::Project {
+        input: Box::new(op),
+        projections: pass_through,
+    };
+
     Ok(op)
+}
+
+/// Rewrite an ORDER BY expression so it resolves against the AggregateOp output.
+///
+/// The AggregateOp binds grouping keys under their expression string and
+/// aggregate results under their alias.  An ORDER BY expression that matches a
+/// grouping key (e.g. `n.kind`), a projection alias (e.g. `kind`), or an
+/// aggregate projection (e.g. `count(*)`) is replaced with a `Variable`
+/// referencing that bound key.  Anything else is left unchanged.
+fn rewrite_order_key_for_aggregation(
+    expr: &Expression,
+    grouping_projections: &[Projection],
+    aggregate_projections: &[Projection],
+) -> Expression {
+    let expr_str = expr.to_string();
+
+    // Match a grouping projection by its expression string or its alias.
+    for p in grouping_projections {
+        if p.expression.to_string() == expr_str {
+            return Expression::Variable(p.expression.to_string());
+        }
+        if let Some(alias) = &p.alias
+            && (alias == &expr_str || matches!(expr, Expression::Variable(v) if v == alias))
+        {
+            // ORDER BY references the alias; AggregateOp bound the value under
+            // the grouping key's expression string.
+            return Expression::Variable(p.expression.to_string());
+        }
+    }
+
+    // Match an aggregate projection by alias or expression string; AggregateOp
+    // bound the result under `alias.unwrap_or(expression_string)`.
+    for p in aggregate_projections {
+        let bound_key = p.alias.clone().unwrap_or_else(|| p.expression.to_string());
+        if bound_key == expr_str || p.expression.to_string() == expr_str {
+            return Expression::Variable(bound_key);
+        }
+        if let Some(alias) = &p.alias
+            && matches!(expr, Expression::Variable(v) if v == alias)
+        {
+            return Expression::Variable(bound_key);
+        }
+    }
+
+    expr.clone()
 }
 
 /// Return `true` if the expression contains an aggregate function call.

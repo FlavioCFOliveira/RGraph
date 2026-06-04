@@ -606,3 +606,160 @@ fn labelled_match_after_restart_resolves_via_persisted_catalog() {
         "an unknown label must not match any node"
     );
 }
+
+// ------------------------------------------------------------------
+// Task 190: end-to-end aggregation binds the MATCH pattern variables, so
+// count/sum/avg/min/max/collect evaluate over the matched rows, and grouped
+// aggregation groups correctly.
+// ------------------------------------------------------------------
+
+/// Project a single float column out of a result, in row order.
+fn float_column(result: &QueryResult, column: &str) -> Vec<f64> {
+    let idx = result
+        .columns
+        .iter()
+        .position(|c| c == column)
+        .unwrap_or_else(|| panic!("column '{column}' not in {:?}", result.columns));
+    result
+        .rows
+        .iter()
+        .map(|row| match &row[idx] {
+            Value::Float(f) => f.0,
+            Value::Integer(i) => *i as f64,
+            other => panic!("column '{column}' value is not numeric: {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn count_aggregates_over_matched_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rgraph.db");
+    let fs = PosixFileSystem::new(false);
+    init_db(&db_path, &fs);
+    seed_three(&db_path, &fs);
+
+    // count(n): the pattern variable n must be in scope for the aggregate.
+    let count_n = run_write(&db_path, "MATCH (n) RETURN count(n) AS c", &fs);
+    assert_eq!(
+        integer_column(&count_n, "c"),
+        vec![3],
+        "count(n) returns the matched node count"
+    );
+
+    // count(*): counts rows directly.
+    let count_star = run_write(&db_path, "MATCH (n) RETURN count(*) AS c", &fs);
+    assert_eq!(integer_column(&count_star, "c"), vec![3]);
+}
+
+#[test]
+fn numeric_aggregates_over_matched_property() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rgraph.db");
+    let fs = PosixFileSystem::new(false);
+    init_db(&db_path, &fs);
+    seed_three(&db_path, &fs); // ages: 30, 25, 40
+
+    let sum = run_write(&db_path, "MATCH (n) RETURN sum(n.age) AS s", &fs);
+    assert_eq!(integer_column(&sum, "s"), vec![95]);
+
+    let avg = run_write(&db_path, "MATCH (n) RETURN avg(n.age) AS a", &fs);
+    let avg_vals = float_column(&avg, "a");
+    assert_eq!(avg_vals.len(), 1);
+    assert!(
+        (avg_vals[0] - 95.0 / 3.0).abs() < 1e-9,
+        "avg(n.age) = {} should be ~31.667",
+        avg_vals[0]
+    );
+
+    let minmax = run_write(
+        &db_path,
+        "MATCH (n) RETURN min(n.age) AS mn, max(n.age) AS mx",
+        &fs,
+    );
+    assert_eq!(integer_column(&minmax, "mn"), vec![25]);
+    assert_eq!(integer_column(&minmax, "mx"), vec![40]);
+}
+
+#[test]
+fn collect_aggregates_matched_values_into_a_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rgraph.db");
+    let fs = PosixFileSystem::new(false);
+    init_db(&db_path, &fs);
+    seed_three(&db_path, &fs);
+
+    let result = run_write(&db_path, "MATCH (n) RETURN collect(n.name) AS names", &fs);
+    assert_eq!(result.rows.len(), 1);
+    match &result.rows[0][0] {
+        Value::List(items) => {
+            let mut names: Vec<String> = items
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => panic!("non-string in collect: {other:?}"),
+                })
+                .collect();
+            names.sort();
+            assert_eq!(
+                names,
+                vec!["Alice".to_string(), "Bob".to_string(), "Carol".to_string()]
+            );
+        }
+        other => panic!("collect must return a List, got {other:?}"),
+    }
+}
+
+#[test]
+fn grouped_aggregation_groups_and_orders_correctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rgraph.db");
+    let fs = PosixFileSystem::new(false);
+    init_db(&db_path, &fs);
+
+    // Two kinds: A (Alice 30, Carol 40) and B (Bob 25).
+    run_write(
+        &db_path,
+        "CREATE (a:Person {name: 'Alice', age: 30, kind: 'A'})",
+        &fs,
+    );
+    run_write(
+        &db_path,
+        "CREATE (b:Person {name: 'Bob', age: 25, kind: 'B'})",
+        &fs,
+    );
+    run_write(
+        &db_path,
+        "CREATE (c:Person {name: 'Carol', age: 40, kind: 'A'})",
+        &fs,
+    );
+
+    // Grouped count, ordered by the grouping key.
+    let counts = run_write(
+        &db_path,
+        "MATCH (n) RETURN n.kind AS kind, count(*) AS c ORDER BY n.kind",
+        &fs,
+    );
+    assert_eq!(
+        string_column(&counts, "kind"),
+        vec!["A".to_string(), "B".to_string()],
+        "groups appear once each, ordered by kind"
+    );
+    assert_eq!(
+        integer_column(&counts, "c"),
+        vec![2, 1],
+        "kind A has two members, kind B has one"
+    );
+
+    // Grouped sum.
+    let sums = run_write(
+        &db_path,
+        "MATCH (n) RETURN n.kind AS kind, sum(n.age) AS total ORDER BY n.kind",
+        &fs,
+    );
+    assert_eq!(
+        integer_column(&sums, "total"),
+        vec![70, 25],
+        "kind A sums to 30+40=70, kind B to 25"
+    );
+}
