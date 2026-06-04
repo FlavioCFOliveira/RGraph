@@ -62,13 +62,55 @@ pub struct ServerRuntime {
     pub shutting_down: Arc<AtomicBool>,
 }
 
+impl ServerConfig {
+    /// Validate the server configuration, returning the first violation as a
+    /// typed [`RGraphError::Argument`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RGraphError::Argument`] when:
+    ///
+    /// - `port` is `0` (no ephemeral binding for the server listener);
+    /// - `max_connections` is `0`;
+    /// - `tls_enabled` is `true` but `tls_cert_path` or `tls_key_path` is
+    ///   missing.
+    pub fn validate(&self) -> Result<(), RGraphError> {
+        if self.port == 0 {
+            return Err(RGraphError::Argument(
+                "server port must not be 0".into(),
+            ));
+        }
+        if self.max_connections == 0 {
+            return Err(RGraphError::Argument(
+                "max_connections must be > 0".into(),
+            ));
+        }
+        if self.tls_enabled {
+            if self.tls_cert_path.is_none() {
+                return Err(RGraphError::Argument(
+                    "tls_enabled is true but tls_cert_path is not set".into(),
+                ));
+            }
+            if self.tls_key_path.is_none() {
+                return Err(RGraphError::Argument(
+                    "tls_enabled is true but tls_key_path is not set".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ServerRuntime {
     /// Build a multi-threaded Tokio runtime and return a [`ServerRuntime`] handle.
     ///
     /// # Errors
     ///
-    /// Returns [`RGraphError::Internal`] if the runtime cannot be constructed.
+    /// Returns [`RGraphError::Argument`] if the [`ServerConfig`] is invalid
+    /// (see [`ServerConfig::validate`]), or [`RGraphError::Internal`] if the
+    /// runtime itself cannot be constructed.
     pub fn new(config: ServerConfig) -> Result<Self, RGraphError> {
+        config.validate()?;
         let runtime = Builder::new_multi_thread()
             .worker_threads(config.worker_threads)
             .thread_name("rgraph-server")
@@ -190,5 +232,34 @@ mod tests {
         assert!(!rt.shutting_down.load(Ordering::Relaxed));
         // Explicitly drop the runtime outside an async context.
         drop(rt);
+    }
+
+    #[test]
+    fn default_server_config_is_valid() {
+        assert!(ServerConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn tls_enabled_without_cert_is_rejected() {
+        let mut config = ServerConfig::default();
+        config.tls_enabled = true;
+        config.tls_key_path = Some(std::path::PathBuf::from("/etc/rgraph/key.pem"));
+        // cert missing
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("tls_cert_path"), "got: {err}");
+        // The same contradiction is rejected by the runtime constructor.
+        let mut config = ServerConfig::default();
+        config.tls_enabled = true;
+        config.tls_key_path = Some(std::path::PathBuf::from("/etc/rgraph/key.pem"));
+        assert!(ServerRuntime::new(config).is_err());
+    }
+
+    #[test]
+    fn zero_port_is_rejected() {
+        let mut config = ServerConfig::default();
+        config.port = 0;
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("port"), "got: {err}");
+        assert!(ServerRuntime::new(config).is_err());
     }
 }
