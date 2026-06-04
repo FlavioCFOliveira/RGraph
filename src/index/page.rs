@@ -2,12 +2,10 @@
 //!
 //! Extends the slotted page format with B+ tree specific headers.
 
-use crate::io::AlignedBuffer;
-use crate::storage::page::{PageHeader, PageId, PageType, SlottedPage};
-#[cfg(feature = "prefix_compression")]
-use crate::storage::page::PAGE_SIZE;
 #[cfg(feature = "prefix_compression")]
 use crate::index::prefix::{common_prefix, compress_record, decompress_record, extract_key};
+use crate::io::AlignedBuffer;
+use crate::storage::page::{PAGE_SIZE, PageHeader, PageId, PageType, SlottedPage};
 
 /// Size of the B+ tree specific header extension (after the 64-byte page header).
 pub const BTREE_HEADER_SIZE: usize = 32;
@@ -111,19 +109,14 @@ impl BTreePage {
         let offset = size_of::<PageHeader>();
         let bytes = &self.inner.buf[offset..offset + size_of::<BTreeHeader>()];
         // SAFETY: bytes length matches struct size.
-        unsafe {
-            std::ptr::read_unaligned(bytes.as_ptr() as *const BTreeHeader)
-        }
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const BTreeHeader) }
     }
 
     /// Write the B+ tree header at offset 64.
     pub fn write_btree_header(&mut self, header: &BTreeHeader) {
         let offset = size_of::<PageHeader>();
         let bytes = unsafe {
-            std::slice::from_raw_parts(
-                header as *const _ as *const u8,
-                size_of::<BTreeHeader>(),
-            )
+            std::slice::from_raw_parts(header as *const _ as *const u8, size_of::<BTreeHeader>())
         };
         self.inner.buf[offset..offset + bytes.len()].copy_from_slice(bytes);
     }
@@ -158,8 +151,14 @@ impl BTreePage {
         }
         let ptr_bytes = &data[key_len..];
         Some(u64::from_be_bytes([
-            ptr_bytes[0], ptr_bytes[1], ptr_bytes[2], ptr_bytes[3],
-            ptr_bytes[4], ptr_bytes[5], ptr_bytes[6], ptr_bytes[7],
+            ptr_bytes[0],
+            ptr_bytes[1],
+            ptr_bytes[2],
+            ptr_bytes[3],
+            ptr_bytes[4],
+            ptr_bytes[5],
+            ptr_bytes[6],
+            ptr_bytes[7],
         ]))
     }
 
@@ -245,9 +244,7 @@ impl BTreePage {
     /// Existing slot data is **not** rewritten; callers must call
     /// [`recompute_prefix`] when they want to compress existing records.
     #[cfg(feature = "prefix_compression")]
-    pub fn set_common_prefix(&mut self,
-        prefix: &[u8],
-    ) {
+    pub fn set_common_prefix(&mut self, prefix: &[u8]) {
         let max_prefix = 512usize; // generous upper bound
         let prefix = &prefix[..prefix.len().min(max_prefix)];
         let len = prefix.len();
@@ -264,8 +261,7 @@ impl BTreePage {
         }
 
         // Write [len: u16 BE][prefix bytes].
-        self.inner.buf[header_end..header_end + 2]
-            .copy_from_slice(&(len as u16).to_be_bytes());
+        self.inner.buf[header_end..header_end + 2].copy_from_slice(&(len as u16).to_be_bytes());
         self.inner.buf[storage_start..storage_end].copy_from_slice(prefix);
 
         // Update header.
@@ -287,8 +283,7 @@ impl BTreePage {
     /// This is typically called immediately after a page split, when the
     /// remaining keys are highly homogeneous.
     #[cfg(feature = "prefix_compression")]
-    pub fn recompute_prefix(&mut self,
-    ) {
+    pub fn recompute_prefix(&mut self) {
         // Gather full keys (ignoring values) from every live slot.
         let mut keys: Vec<Vec<u8>> = Vec::new();
         let mut records: Vec<Vec<u8>> = Vec::new();
@@ -369,6 +364,24 @@ impl BTreePage {
         full.extend_from_slice(&prefix);
         full.extend_from_slice(suffix);
         Some(full)
+    }
+
+    /// Would a record of `record_len` bytes fit without triggering an internal
+    /// slotted-page compaction?
+    ///
+    /// On a build-only page (no deleted slots) the underlying
+    /// [`SlottedPage::insert`] only compacts when a record would otherwise not
+    /// fit — and that compaction is not B+-tree-header aware, so it would
+    /// corrupt the page.  The bulk loader uses this predicate to seal a leaf
+    /// *before* that ever happens.
+    pub fn has_room_for(&self, record_len: usize) -> bool {
+        use crate::storage::page::Slot;
+        let h = self.inner.header();
+        let used = SlottedPage::HEADER_SIZE
+            + h.free_space_offset as usize
+            + h.slot_count as usize * std::mem::size_of::<Slot>();
+        let available = PAGE_SIZE.saturating_sub(used);
+        record_len + std::mem::size_of::<Slot>() <= available
     }
 
     /// Free space available in the page (accounting for both headers).

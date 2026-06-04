@@ -26,6 +26,16 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// A descend path: a stack of `(branch_page_id, child_index)` pairs recorded
+/// from the root down to a target node's parent.
+///
+/// `child_index` is the slot chosen at that branch (see
+/// [`BPlusTree::branch_slot`]); `child_index == key_count` denotes the rightmost
+/// child.  The descend path is the authoritative way to locate a node's parent
+/// and siblings during splits, merges, and borrows — it works identically in
+/// in-memory and buffer-pool modes, unlike a global parent-pointer scan.
+type DescendPath = Vec<(PageId, usize)>;
+
 /// Configuration knobs for a B+ tree.
 #[derive(Debug, Clone)]
 pub struct BPlusTreeConfig {
@@ -154,9 +164,7 @@ impl BPlusTree {
         let id = *next;
         *next += 1;
         // If a pool is attached, ensure the data file is large enough.
-        if let (Some(pool), Some(fs)) = (&self.pool,
-            self.fs.as_deref()
-        ) {
+        if let (Some(pool), Some(fs)) = (&self.pool, self.fs.as_deref()) {
             let required_len = id * crate::storage::page::PAGE_SIZE as u64;
             if let Ok(handle) = fs.open(&pool.data_path, false) {
                 if let Ok(current_len) = handle.len() {
@@ -167,6 +175,17 @@ impl BPlusTree {
             }
         }
         id
+    }
+
+    /// Allocate a fresh page id (public entry point for the bulk loader).
+    pub fn alloc_page_public(&self) -> PageId {
+        self.alloc_page()
+    }
+
+    /// Install `page` at `page_id`, stamping a fresh LSN (public entry point
+    /// for the bulk loader).
+    pub fn put_page_public(&self, page_id: PageId, page: BTreePage) {
+        self.put_page_with_lsn(page_id, page);
     }
 
     pub fn get_page(&self, page_id: PageId) -> Option<BTreePage> {
@@ -207,10 +226,7 @@ impl BPlusTree {
     }
 
     /// Search for `key` and return `(page_id, slot)` of the leaf entry.
-    pub fn search(
-        &self,
-        key: &CompositeKey,
-    ) -> Option<(PageId, u16)> {
+    pub fn search(&self, key: &CompositeKey) -> Option<(PageId, u16)> {
         let root = self.get_page(self.root_page_id.load(Ordering::Relaxed))?;
         let (leaf_id, _) = self.find_leaf(root, key)?;
         let leaf = self.get_page(leaf_id)?;
@@ -229,10 +245,7 @@ impl BPlusTree {
     /// re-reads each page in the path and verifies its LSN has not changed.
     /// If validation fails, retries up to `config.optimistic_retry` times,
     /// then falls back to pessimistic [`search`].
-    pub fn optimistic_search(
-        &self,
-        key: &CompositeKey,
-    ) -> Option<(PageId, u16)> {
+    pub fn optimistic_search(&self, key: &CompositeKey) -> Option<(PageId, u16)> {
         let max_retry = self.config.optimistic_retry;
         for _ in 0..=max_retry {
             let root_id = self.root_page_id.load(Ordering::Relaxed);
@@ -282,68 +295,102 @@ impl BPlusTree {
     }
 
     /// Insert `key` -> `value` into the tree.
-    pub fn insert(
-        &self,
-        key: &CompositeKey,
-        value: &[u8],
-    ) -> Result<(), BTreeError> {
-        let guard = self.latch_mgr.latch(self.root_page_id.load(Ordering::Relaxed), LatchMode::Exclusive);
-        let root = self.get_page(self.root_page_id.load(Ordering::Relaxed)).ok_or(BTreeError::MissingRoot)?;
+    pub fn insert(&self, key: &CompositeKey, value: &[u8]) -> Result<(), BTreeError> {
+        let guard = self.latch_mgr.latch(
+            self.root_page_id.load(Ordering::Relaxed),
+            LatchMode::Exclusive,
+        );
+        let root_id = self.root_page_id.load(Ordering::Relaxed);
+        let root = self.get_page(root_id).ok_or(BTreeError::MissingRoot)?;
 
         // Fast path: empty tree, insert directly into root leaf.
         if root.is_leaf() && root.key_count() == 0 {
             let mut root_mut = root.clone();
             let record = encode_kv(key.as_slice(), value);
-            if root_mut.insert_raw(&record).is_some() {
-                self.put_page_with_lsn(self.root_page_id.load(Ordering::Relaxed), root_mut);
+            if root_mut.has_room_for(record.len()) && root_mut.insert_raw(&record).is_some() {
+                self.put_page_with_lsn(root_id, root_mut);
                 drop(guard);
                 return Ok(());
             }
             // Root is physically full despite being logically empty; fall through to split.
         }
 
-        // Descend to leaf with latch coupling (simplified: exclusive all the way).
-        let (leaf_id, mut leaf) = self.descend_to_leaf_exclusive(root.clone(), key)
+        // Descend to the leaf, recording the parent chain as a stack of
+        // (branch_page_id, child_slot) pairs.  The descend path — never a
+        // HashMap scan — is how splits locate their parent, which is required
+        // for buffer-pool mode where the in-memory `pages` map is empty.
+        let (leaf_id, leaf, path) = self
+            .descend_to_leaf_with_path(root, key)
             .ok_or(BTreeError::MissingLeaf)?;
 
         let record = encode_kv(key.as_slice(), value);
 
-        // Check if key already exists.
+        // Overwrite path: if the key already exists, rebuild the leaf with the
+        // new value.  Rebuilding (rather than delete + insert_raw_at) avoids the
+        // underlying slotted-page compaction, which is not B+-tree-header aware.
         let slot = Self::leaf_lower_bound(&leaf, key);
         if let Some(existing) = Self::leaf_key(&leaf, slot)
             && existing.as_slice() == key.as_slice()
         {
-            // Overwrite value in place.
-            let mut new_leaf = leaf.clone();
-            new_leaf.delete(slot);
-            if new_leaf.insert_raw_at(slot, &record).is_some() {
-                self.put_page_with_lsn(leaf_id, new_leaf);
+            if let Some(rebuilt) = Self::rebuild_leaf_replacing(&leaf, slot, &record) {
+                self.put_page_with_lsn(leaf_id, rebuilt);
                 drop(guard);
                 return Ok(());
             }
-            // Leaf full after delete; fall through to split.
+            // Replacement does not fit (value grew): fall through to split.
+            let result = self.split_leaf(leaf_id, leaf, key, value, &path);
+            drop(guard);
+            return result;
         }
 
-        if leaf.insert_raw_at(slot, &record).is_some() {
+        // Insert proactively only when the record fits; otherwise split.  We
+        // must never let `insert_raw_at` trigger the slotted-page compaction.
+        if leaf.has_room_for(record.len()) {
+            let mut leaf = leaf;
+            leaf.insert_raw_at(slot, &record)
+                .expect("INVARIANT: record fits after has_room_for check");
             self.put_page_with_lsn(leaf_id, leaf);
             drop(guard);
             return Ok(());
         }
 
-        // Leaf is full: split.
+        // Leaf is full: split, resolving the parent via the descend path.
+        let result = self.split_leaf(leaf_id, leaf, key, value, &path);
         drop(guard);
-        self.split_leaf(leaf_id, leaf, key, value)?;
-        Ok(())
+        result
+    }
+
+    /// Rebuild a leaf with the record at `slot` replaced by `record`.
+    ///
+    /// Returns `None` if the replacement record does not fit.  The leaf is
+    /// rebuilt from scratch through a B+-tree-header-aware path, so no
+    /// slotted-page compaction is triggered.
+    fn rebuild_leaf_replacing(leaf: &BTreePage, slot: u16, record: &[u8]) -> Option<BTreePage> {
+        let mut rebuilt = BTreePage::new_leaf(leaf.page_id());
+        rebuilt.set_siblings(
+            leaf.btree_header().sibling_prev,
+            leaf.btree_header().sibling_next,
+        );
+        for i in 0..leaf.key_count() {
+            let rec = if i == slot { record } else { leaf.key(i)? };
+            if !rebuilt.has_room_for(rec.len()) {
+                return None;
+            }
+            rebuilt.insert_raw(rec)?;
+        }
+        Some(rebuilt)
     }
 
     /// Delete `key` from the tree. Returns true if the key was found.
-    pub fn delete(
-        &self,
-        key: &CompositeKey,
-    ) -> Result<bool, BTreeError> {
-        let guard = self.latch_mgr.latch(self.root_page_id.load(Ordering::Relaxed), LatchMode::Exclusive);
-        let root = self.get_page(self.root_page_id.load(Ordering::Relaxed)).ok_or(BTreeError::MissingRoot)?;
-        let (leaf_id, mut leaf) = self.descend_to_leaf_exclusive(root.clone(), key)
+    pub fn delete(&self, key: &CompositeKey) -> Result<bool, BTreeError> {
+        let guard = self.latch_mgr.latch(
+            self.root_page_id.load(Ordering::Relaxed),
+            LatchMode::Exclusive,
+        );
+        let root_id = self.root_page_id.load(Ordering::Relaxed);
+        let root = self.get_page(root_id).ok_or(BTreeError::MissingRoot)?;
+        let (leaf_id, mut leaf, path) = self
+            .descend_to_leaf_with_path(root, key)
             .ok_or(BTreeError::MissingLeaf)?;
 
         let slot = Self::leaf_lower_bound(&leaf, key);
@@ -356,6 +403,9 @@ impl BPlusTree {
         if found {
             leaf.delete(slot);
             self.put_page_with_lsn(leaf_id, leaf);
+            // Rebalance the leaf if it underflowed (borrow from a sibling or
+            // merge), propagating separator changes up the descend path.
+            self.rebalance_after_delete(leaf_id, &path)?;
         }
 
         drop(guard);
@@ -381,28 +431,53 @@ impl BPlusTree {
         Some((leaf_id, path))
     }
 
-    fn descend_to_leaf_exclusive(
+    /// Descend from `page` to the target leaf, recording the parent chain.
+    ///
+    /// Returns `(leaf_id, leaf_page, path)` where `path` is a stack of
+    /// `(branch_page_id, child_index)` pairs from the root down to the leaf's
+    /// parent.  `child_index` is the index produced by [`Self::branch_slot`];
+    /// `child_index == key_count` denotes the rightmost child.  The path is the
+    /// authoritative way to locate a node's parent and its siblings — it works
+    /// identically in in-memory and buffer-pool modes.
+    fn descend_to_leaf_with_path(
         &self,
         mut page: BTreePage,
         key: &CompositeKey,
-    ) -> Option<(PageId, BTreePage)> {
+    ) -> Option<(PageId, BTreePage, DescendPath)> {
+        let mut path: DescendPath = Vec::new();
         while page.is_branch() {
-            let child = Self::branch_child(&page, key);
+            let (child, idx) = Self::branch_slot(&page, key);
+            path.push((page.page_id(), idx));
             page = self.get_page(child)?;
         }
-        Some((page.page_id(), page))
+        Some((page.page_id(), page, path))
     }
 
     /// Given a branch page and a key, return the child page id to follow.
     fn branch_child(page: &BTreePage, key: &CompositeKey) -> PageId {
-        let count = page.key_count();
+        Self::branch_slot(page, key).0
+    }
+
+    /// Resolve `(child_page_id, child_index)` for `key` within a branch page.
+    ///
+    /// `child_index` ranges over `0..=key_count`; the value `key_count`
+    /// indicates that the rightmost child pointer was selected.
+    ///
+    /// Separator semantics: `child_pointer(i)` (the left child of separator
+    /// `i`) holds keys strictly less than separator `i`.  A separator equals
+    /// the first key of the subtree to its right, so a key equal to a separator
+    /// must descend rightward.  We therefore follow the first separator
+    /// strictly greater than `key` (`sep > key`); keys `>=` every separator
+    /// fall through to the rightmost child.
+    fn branch_slot(page: &BTreePage, key: &CompositeKey) -> (PageId, usize) {
+        let count = page.key_count() as usize;
         let mut lo = 0usize;
-        let mut hi = count as usize;
+        let mut hi = count;
         while lo < hi {
             let mid = (lo + hi) / 2;
             let sep = page.separator_key(mid as u16);
             if let Some(sep) = sep {
-                if sep < key.as_slice() {
+                if sep <= key.as_slice() {
                     lo = mid + 1;
                 } else {
                     hi = mid;
@@ -411,10 +486,10 @@ impl BPlusTree {
                 hi = mid;
             }
         }
-        if lo < count as usize {
-            page.child_pointer(lo as u16).unwrap_or(0)
+        if lo < count {
+            (page.child_pointer(lo as u16).unwrap_or(0), lo)
         } else {
-            page.btree_header().rightmost_child
+            (page.btree_header().rightmost_child, count)
         }
     }
 
@@ -447,8 +522,7 @@ impl BPlusTree {
         if 2 + key_len > kv.len() {
             return None;
         }
-        Some(CompositeKey::from_slice(
-            &kv[2..2 + key_len]))
+        Some(CompositeKey::from_slice(&kv[2..2 + key_len]))
     }
 
     fn leaf_value(page: &BTreePage, slot: u16) -> Option<Vec<u8>> {
@@ -515,6 +589,7 @@ impl BPlusTree {
         leaf: BTreePage,
         new_key: &CompositeKey,
         new_value: &[u8],
+        path: &[(PageId, usize)],
     ) -> Result<(), BTreeError> {
         let new_leaf_id = self.alloc_page();
         let mut new_leaf = BTreePage::new_leaf(new_leaf_id);
@@ -561,167 +636,493 @@ impl BPlusTree {
         self.put_page_with_lsn(leaf_id, left_leaf);
         self.put_page_with_lsn(new_leaf_id, new_leaf);
 
-        // Propagate separator to parent.
+        // The separator is the first key of the right half.  Keys `<` the
+        // separator live in `leaf_id`; keys `>=` it live in `new_leaf_id`.
         let separator = entries[mid].0.clone();
-        self.insert_into_parent(leaf_id, new_leaf_id, &separator)?;
+        self.insert_into_parent(leaf_id, new_leaf_id, &separator, path)?;
 
         Ok(())
     }
 
+    /// Insert the separator for a split into the parent identified by the
+    /// descend `path`.
+    ///
+    /// `left_child` is the (already-persisted) lower half and `right_child`
+    /// the upper half of the node that just split.  `separator` is the key
+    /// such that keys `< separator` belong to `left_child` and keys
+    /// `>= separator` belong to `right_child`.
+    ///
+    /// `path` is the stack of `(branch_id, child_index)` pairs recorded on the
+    /// way down; its last element is the direct parent.  When `path` is empty
+    /// the node that split was the root, so a new root is created.
     fn insert_into_parent(
         &self,
         left_child: PageId,
         right_child: PageId,
         separator: &[u8],
+        path: &[(PageId, usize)],
     ) -> Result<(), BTreeError> {
-        if left_child == self.root_page_id.load(Ordering::Relaxed) {
-            // Split root: create a new root branch.
+        let Some((&(parent_id, child_index), ancestors)) = path.split_last() else {
+            // The split node was the root: grow the tree by one level.
             let new_root_id = self.alloc_page();
-            let mut new_root = BTreePage::new_branch(new_root_id, 1);
-            // child_pointer(0) = left_child (keys < separator).
-            let record = encode_branch_entry(separator, left_child);
-            new_root.insert_raw(&record);
+            let old_level = self
+                .get_page(left_child)
+                .map(|p| p.btree_header().level)
+                .unwrap_or(0);
+            let mut new_root = BTreePage::new_branch(new_root_id, old_level + 1);
+            new_root.insert_raw(&encode_branch_entry(separator, left_child));
             new_root.set_rightmost_child(right_child);
             self.put_page_with_lsn(new_root_id, new_root);
-            // Update root id atomically.
             self.root_page_id.store(new_root_id, Ordering::Relaxed);
             return Ok(());
-        }
+        };
 
-        // Find parent and insert separator.
-        let parent_id = self.find_parent(left_child).ok_or(BTreeError::MissingParent)?;
         let parent = self.get_page(parent_id).ok_or(BTreeError::MissingParent)?;
+        let (mut seps, mut children) = Self::decode_branch(&parent);
 
-        let old_rightmost = parent.btree_header().rightmost_child;
+        // `child_index` is the slot in the parent that pointed at the node
+        // which just split.  That pointer must now address `left_child`, and a
+        // new separator + `right_child` are inserted immediately after it.
+        debug_assert!(child_index < children.len());
+        children[child_index] = left_child;
+        seps.insert(child_index, separator.to_vec());
+        children.insert(child_index + 1, right_child);
 
-        // Collect all existing entries from parent.
-        let mut entries: Vec<(Vec<u8>, PageId)> = Vec::new();
-        for i in 0..parent.slot_count() {
-            if let Some(kv) = parent.key(i) {
-                let key_len = kv.len().saturating_sub(8);
-                if key_len > 0 && key_len + 8 <= kv.len() {
-                    let k = kv[..key_len].to_vec();
-                    let child = u64::from_be_bytes([
-                        kv[key_len], kv[key_len + 1], kv[key_len + 2], kv[key_len + 3],
-                        kv[key_len + 4], kv[key_len + 5], kv[key_len + 6], kv[key_len + 7],
-                    ]);
-                    entries.push((k, child));
-                }
-            }
-        }
-
-        // Update the entry that points to left_child.
-        let mut updated = false;
-        for entry in entries.iter_mut() {
-            if entry.1 == left_child {
-                // The existing separator now points to right_child.
-                entry.1 = right_child;
-                updated = true;
-                break;
-            }
-        }
-        if !updated && old_rightmost == left_child {
-            // left_child was the rightmost; no entry to update.
-        }
-
-        // Insert new separator pointing to left_child.
-        entries.push((separator.to_vec(), left_child));
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Rebuild parent from scratch.
-        let mut parent_mut = BTreePage::new_branch(parent_id, parent.btree_header().level);
-        for (k, child) in &entries {
-            parent_mut.insert_raw(&encode_branch_entry(k, *child));
-        }
-        if old_rightmost == left_child {
-            parent_mut.set_rightmost_child(right_child);
-        } else {
-            parent_mut.set_rightmost_child(old_rightmost);
-        }
-
-        if parent_mut.key_count() as usize == entries.len() {
-            self.put_page_with_lsn(parent_id, parent_mut);
+        let level = parent.btree_header().level;
+        if let Some(branch) = Self::try_build_branch(parent_id, level, &seps, &children) {
+            self.put_page_with_lsn(parent_id, branch);
             return Ok(());
         }
 
-        // Parent branch is full: split branch.
-        self.split_branch(parent_id, parent_mut, left_child, right_child, separator)
+        // Parent overflowed: split it and recurse using the ancestor path.
+        self.split_branch(parent_id, level, seps, children, ancestors)
     }
 
+    /// Split an overflowing branch whose canonical `(seps, children)` form is
+    /// given, promoting the middle separator into the grandparent.
     fn split_branch(
         &self,
         branch_id: PageId,
-        branch: BTreePage,
-        left_child: PageId,
-        _right_child: PageId,
-        separator: &[u8],
+        level: u8,
+        seps: Vec<Vec<u8>>,
+        children: Vec<PageId>,
+        ancestors: &[(PageId, usize)],
     ) -> Result<(), BTreeError> {
+        // children.len() == seps.len() + 1.  Promote seps[mid]; it does not
+        // appear in either child branch (standard B+ tree internal split).
+        let mid = seps.len() / 2;
+        let promoted = seps[mid].clone();
+
+        let left_seps = seps[..mid].to_vec();
+        let left_children = children[..=mid].to_vec();
+        let right_seps = seps[mid + 1..].to_vec();
+        let right_children = children[mid + 1..].to_vec();
+
+        let left_branch = Self::build_branch(branch_id, level, &left_seps, &left_children);
         let new_branch_id = self.alloc_page();
-        let mut new_branch = BTreePage::new_branch(new_branch_id, branch.btree_header().level);
-        let old_rightmost = branch.btree_header().rightmost_child;
-
-        // Collect existing entries plus the new one.
-        let mut entries: Vec<(Vec<u8>, PageId)> = Vec::new();
-        for i in 0..branch.slot_count() {
-            if let Some(kv) = branch.key(i) {
-                let key_len = kv.len().saturating_sub(8);
-                if key_len > 0 && key_len + 8 <= kv.len() {
-                    let k = kv[..key_len].to_vec();
-                    let child = u64::from_be_bytes([
-                        kv[key_len], kv[key_len + 1], kv[key_len + 2], kv[key_len + 3],
-                        kv[key_len + 4], kv[key_len + 5], kv[key_len + 6], kv[key_len + 7],
-                    ]);
-                    entries.push((k, child));
-                }
-            }
-        }
-        entries.push((separator.to_vec(), left_child));
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mid = entries.len() / 2;
-        let mid_sep = entries[mid].0.clone();
-
-        // Repopulate original branch with left half.
-        let mut left_branch = BTreePage::new_branch(branch_id, branch.btree_header().level);
-        for (k, child) in &entries[..mid] {
-            left_branch.insert_raw(&encode_branch_entry(k, *child));
-        }
-        // rightmost_child = first child of right half (keys >= last separator in left).
-        left_branch.set_rightmost_child(entries[mid].1);
-
-        // Populate new branch with right half.
-        for (k, child) in &entries[mid..] {
-            new_branch.insert_raw(&encode_branch_entry(k, *child));
-        }
-        // rightmost_child inherits old rightmost (keys >= last separator overall).
-        new_branch.set_rightmost_child(old_rightmost);
+        let right_branch = Self::build_branch(new_branch_id, level, &right_seps, &right_children);
 
         self.put_page_with_lsn(branch_id, left_branch);
-        self.put_page_with_lsn(new_branch_id, new_branch);
+        self.put_page_with_lsn(new_branch_id, right_branch);
 
-        self.insert_into_parent(branch_id, new_branch_id, &mid_sep)
+        self.insert_into_parent(branch_id, new_branch_id, &promoted, ancestors)
     }
 
-    fn find_parent(
-        &self,
-        child_id: PageId,
-    ) -> Option<PageId> {
-        let pages = self.pages.lock().unwrap();
-        for (&pid, page) in pages.iter() {
-            if page.is_branch() {
-                for i in 0..page.key_count() {
-                    if page.child_pointer(i) == Some(child_id) {
-                        return Some(pid);
-                    }
-                }
-                if page.btree_header().rightmost_child == child_id {
-                    return Some(pid);
-                }
+    // ── Canonical branch (seps, children) helpers ──────────────────────────
+    //
+    // On disk a branch stores `N` slots of `(separator_i, pointer_i)` plus a
+    // `rightmost_child`.  `pointer_i` addresses the subtree of keys
+    // `<= separator_i`; `rightmost_child` addresses keys `> separator_{N-1}`.
+    // The canonical in-memory form is `seps` (length `N`) and `children`
+    // (length `N + 1`), where `children[i]` is separated from `children[i+1]`
+    // by `seps[i]`.
+
+    /// Decode a branch page into its canonical `(seps, children)` form.
+    fn decode_branch(page: &BTreePage) -> (Vec<Vec<u8>>, Vec<PageId>) {
+        let count = page.key_count() as usize;
+        let mut seps = Vec::with_capacity(count);
+        let mut children = Vec::with_capacity(count + 1);
+        for i in 0..count as u16 {
+            if let Some(sep) = page.separator_key(i) {
+                seps.push(sep.to_vec());
+            }
+            if let Some(child) = page.child_pointer(i) {
+                children.push(child);
             }
         }
-        None
+        children.push(page.btree_header().rightmost_child);
+        (seps, children)
     }
 
+    /// Build a branch page from canonical form, asserting it fits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the entries do not fit; use [`Self::try_build_branch`] when
+    /// overflow is expected and must be handled by splitting.
+    fn build_branch(
+        branch_id: PageId,
+        level: u8,
+        seps: &[Vec<u8>],
+        children: &[PageId],
+    ) -> BTreePage {
+        Self::try_build_branch(branch_id, level, seps, children)
+            .expect("INVARIANT: branch half-page must fit after a split")
+    }
+
+    /// Try to build a branch page from canonical form.
+    ///
+    /// Returns `None` if any entry does not fit (caller must split).
+    fn try_build_branch(
+        branch_id: PageId,
+        level: u8,
+        seps: &[Vec<u8>],
+        children: &[PageId],
+    ) -> Option<BTreePage> {
+        debug_assert_eq!(children.len(), seps.len() + 1);
+        let mut branch = BTreePage::new_branch(branch_id, level);
+        for (i, sep) in seps.iter().enumerate() {
+            branch.insert_raw(&encode_branch_entry(sep, children[i]))?;
+        }
+        branch.set_rightmost_child(*children.last().unwrap());
+        Some(branch)
+    }
+
+    // ── Delete rebalancing: borrow / merge ─────────────────────────────────
+
+    /// Byte-fill ratio of a page's record area, ignoring both headers.
+    ///
+    /// Used to detect underflow against [`BPlusTreeConfig::min_fill_ratio`].
+    fn fill_ratio(&self, page: &BTreePage) -> f64 {
+        let usable = (self.config.page_size
+            - crate::storage::page::SlottedPage::HEADER_SIZE
+            - crate::index::page::BTREE_HEADER_SIZE) as f64;
+        if usable <= 0.0 {
+            return 1.0;
+        }
+        let mut bytes = 0usize;
+        for i in 0..page.slot_count() {
+            if let Some(rec) = page.key(i) {
+                bytes += rec.len();
+            }
+        }
+        bytes as f64 / usable
+    }
+
+    /// Is `page` underfull and therefore eligible for borrow/merge?
+    ///
+    /// A page with no entries is always underfull.  The root is never
+    /// considered underfull by this predicate; root collapse is handled
+    /// separately.
+    fn is_underfull(&self, page: &BTreePage) -> bool {
+        page.key_count() == 0 || self.fill_ratio(page) < self.config.min_fill_ratio
+    }
+
+    /// Rebalance the tree after a delete made `leaf_id` potentially underfull.
+    ///
+    /// Walks the descend `path` from the leaf's parent upward, borrowing from
+    /// or merging with a sibling at each level that underflows, and collapsing
+    /// the root when it is left with a single child.
+    fn rebalance_after_delete(
+        &self,
+        leaf_id: PageId,
+        path: &[(PageId, usize)],
+    ) -> Result<(), BTreeError> {
+        let leaf = self.get_page(leaf_id).ok_or(BTreeError::MissingLeaf)?;
+        // The root leaf (empty path) may shrink to empty; nothing to reclaim.
+        if path.is_empty() || !self.is_underfull(&leaf) {
+            return Ok(());
+        }
+        self.rebalance_node(leaf_id, path)
+    }
+
+    /// Borrow-or-merge `node_id` (a leaf or branch) with a sibling, given the
+    /// descend `path` whose last element is `node_id`'s parent.
+    fn rebalance_node(&self, node_id: PageId, path: &[(PageId, usize)]) -> Result<(), BTreeError> {
+        let Some((&(parent_id, child_index), ancestors)) = path.split_last() else {
+            return Ok(());
+        };
+        let parent = self.get_page(parent_id).ok_or(BTreeError::MissingParent)?;
+        let (mut seps, mut children) = Self::decode_branch(&parent);
+        debug_assert_eq!(children.len(), seps.len() + 1);
+        debug_assert!(child_index < children.len());
+
+        let node = self.get_page(node_id).ok_or(BTreeError::MissingLeaf)?;
+        let is_leaf = node.is_leaf();
+
+        // Prefer the left sibling, then the right, for a borrow.
+        let has_left = child_index > 0;
+        let has_right = child_index + 1 < children.len();
+
+        // ── Try to borrow from the left sibling ────────────────────────────
+        if has_left {
+            let left_id = children[child_index - 1];
+            let left = self.get_page(left_id).ok_or(BTreeError::MissingLeaf)?;
+            if self.can_lend(&left) {
+                let new_sep = if is_leaf {
+                    self.borrow_leaf_from_left(left_id, node_id)?
+                } else {
+                    self.borrow_branch_from_left(left_id, node_id, &seps[child_index - 1])?
+                };
+                seps[child_index - 1] = new_sep;
+                let level = parent.btree_header().level;
+                let branch = Self::build_branch(parent_id, level, &seps, &children);
+                self.put_page_with_lsn(parent_id, branch);
+                return Ok(());
+            }
+        }
+
+        // ── Try to borrow from the right sibling ───────────────────────────
+        if has_right {
+            let right_id = children[child_index + 1];
+            let right = self.get_page(right_id).ok_or(BTreeError::MissingLeaf)?;
+            if self.can_lend(&right) {
+                let new_sep = if is_leaf {
+                    self.borrow_leaf_from_right(node_id, right_id)?
+                } else {
+                    self.borrow_branch_from_right(node_id, right_id, &seps[child_index])?
+                };
+                seps[child_index] = new_sep;
+                let level = parent.btree_header().level;
+                let branch = Self::build_branch(parent_id, level, &seps, &children);
+                self.put_page_with_lsn(parent_id, branch);
+                return Ok(());
+            }
+        }
+
+        // ── Merge: no sibling can lend ─────────────────────────────────────
+        // Merge `node` into its left sibling when present, otherwise merge the
+        // right sibling into `node`.  The separating key in the parent is
+        // dropped (leaves) or pulled down (branches).
+        let (merge_left_idx, sep_idx) = if has_left {
+            (child_index - 1, child_index - 1)
+        } else {
+            (child_index, child_index)
+        };
+        let left_id = children[merge_left_idx];
+        let right_id = children[merge_left_idx + 1];
+        let separator = seps[sep_idx].clone();
+
+        if is_leaf {
+            self.merge_leaves(left_id, right_id)?;
+        } else {
+            self.merge_branches(left_id, right_id, &separator)?;
+        }
+
+        // Remove the dropped separator and the now-defunct right child from
+        // the parent's canonical form.
+        seps.remove(sep_idx);
+        children.remove(merge_left_idx + 1);
+
+        // The right page is now unreachable; reclaim its id.
+        self.free_page(right_id);
+
+        // Root collapse: a root branch with no separators has a single child,
+        // which becomes the new root (the tree loses a level).
+        if ancestors.is_empty()
+            && parent_id == self.root_page_id.load(Ordering::Relaxed)
+            && seps.is_empty()
+        {
+            let only_child = children[0];
+            self.root_page_id.store(only_child, Ordering::Relaxed);
+            self.free_page(parent_id);
+            return Ok(());
+        }
+
+        let level = parent.btree_header().level;
+        let parent_branch = Self::build_branch(parent_id, level, &seps, &children);
+        let parent_underfull = self.is_underfull(&parent_branch);
+        self.put_page_with_lsn(parent_id, parent_branch);
+
+        // Propagate underflow up the tree.
+        if parent_underfull && !ancestors.is_empty() {
+            self.rebalance_node(parent_id, ancestors)?;
+        }
+        Ok(())
+    }
+
+    /// Can `page` spare one entry without itself underflowing?
+    fn can_lend(&self, page: &BTreePage) -> bool {
+        if page.key_count() <= 1 {
+            return false;
+        }
+        // After removing one entry the page must still be at or above the
+        // minimum fill.  Approximate by requiring strictly more than the
+        // minimum number of bytes plus the largest single record.
+        let mut sizes: Vec<usize> = Vec::new();
+        for i in 0..page.slot_count() {
+            if let Some(rec) = page.key(i) {
+                sizes.push(rec.len());
+            }
+        }
+        if sizes.len() <= 1 {
+            return false;
+        }
+        let usable = (self.config.page_size
+            - crate::storage::page::SlottedPage::HEADER_SIZE
+            - crate::index::page::BTREE_HEADER_SIZE) as f64;
+        let total: usize = sizes.iter().sum();
+        let max_rec = sizes.iter().copied().max().unwrap_or(0);
+        ((total - max_rec) as f64 / usable) >= self.config.min_fill_ratio
+    }
+
+    /// Move the last entry of `left` leaf to the front of `right` leaf.
+    /// Returns the new separator (the first key of `right` after the move).
+    fn borrow_leaf_from_left(
+        &self,
+        left_id: PageId,
+        right_id: PageId,
+    ) -> Result<Vec<u8>, BTreeError> {
+        let mut left = self.get_page(left_id).ok_or(BTreeError::MissingLeaf)?;
+        let mut right = self.get_page(right_id).ok_or(BTreeError::MissingLeaf)?;
+        let last = left.key_count() - 1;
+        let rec = left.key(last).ok_or(BTreeError::MergeFailed)?.to_vec();
+        left.delete(last);
+        right.insert_raw_at(0, &rec);
+        self.put_page_with_lsn(left_id, left);
+        let new_sep = leaf_record_key(&rec).to_vec();
+        self.put_page_with_lsn(right_id, right);
+        Ok(new_sep)
+    }
+
+    /// Move the first entry of `right` leaf to the end of `left` leaf.
+    /// Returns the new separator (the first key remaining in `right`).
+    fn borrow_leaf_from_right(
+        &self,
+        left_id: PageId,
+        right_id: PageId,
+    ) -> Result<Vec<u8>, BTreeError> {
+        let mut left = self.get_page(left_id).ok_or(BTreeError::MissingLeaf)?;
+        let mut right = self.get_page(right_id).ok_or(BTreeError::MissingLeaf)?;
+        let rec = right.key(0).ok_or(BTreeError::MergeFailed)?.to_vec();
+        right.delete(0);
+        left.insert_raw(&rec);
+        let new_first = right.key(0).ok_or(BTreeError::MergeFailed)?.to_vec();
+        let new_sep = leaf_record_key(&new_first).to_vec();
+        self.put_page_with_lsn(left_id, left);
+        self.put_page_with_lsn(right_id, right);
+        Ok(new_sep)
+    }
+
+    /// Rotate one entry from `left` branch through the parent into `right`.
+    /// `parent_sep` is the current separator between the two branches.
+    /// Returns the replacement separator to store in the parent.
+    fn borrow_branch_from_left(
+        &self,
+        left_id: PageId,
+        right_id: PageId,
+        parent_sep: &[u8],
+    ) -> Result<Vec<u8>, BTreeError> {
+        let left = self.get_page(left_id).ok_or(BTreeError::MissingParent)?;
+        let right = self.get_page(right_id).ok_or(BTreeError::MissingParent)?;
+        let (mut lseps, mut lchildren) = Self::decode_branch(&left);
+        let (mut rseps, mut rchildren) = Self::decode_branch(&right);
+
+        // The left branch's last separator is promoted to the parent; the old
+        // parent separator descends to the front of the right branch.
+        let moved_sep = lseps.pop().ok_or(BTreeError::MergeFailed)?;
+        let moved_child = lchildren.pop().ok_or(BTreeError::MergeFailed)?;
+        rseps.insert(0, parent_sep.to_vec());
+        rchildren.insert(0, moved_child);
+
+        let level = left.btree_header().level;
+        let lb = Self::build_branch(left_id, level, &lseps, &lchildren);
+        let rb = Self::build_branch(right_id, level, &rseps, &rchildren);
+        self.put_page_with_lsn(left_id, lb);
+        self.put_page_with_lsn(right_id, rb);
+        Ok(moved_sep)
+    }
+
+    /// Rotate one entry from `right` branch through the parent into `left`.
+    /// Returns the replacement separator to store in the parent.
+    fn borrow_branch_from_right(
+        &self,
+        left_id: PageId,
+        right_id: PageId,
+        parent_sep: &[u8],
+    ) -> Result<Vec<u8>, BTreeError> {
+        let left = self.get_page(left_id).ok_or(BTreeError::MissingParent)?;
+        let right = self.get_page(right_id).ok_or(BTreeError::MissingParent)?;
+        let (mut lseps, mut lchildren) = Self::decode_branch(&left);
+        let (mut rseps, mut rchildren) = Self::decode_branch(&right);
+
+        // The old parent separator descends to the end of the left branch; the
+        // right branch's first separator is promoted to the parent.
+        let moved_sep = if rseps.is_empty() {
+            return Err(BTreeError::MergeFailed);
+        } else {
+            rseps.remove(0)
+        };
+        let moved_child = rchildren.remove(0);
+        lseps.push(parent_sep.to_vec());
+        lchildren.push(moved_child);
+
+        let level = left.btree_header().level;
+        let lb = Self::build_branch(left_id, level, &lseps, &lchildren);
+        let rb = Self::build_branch(right_id, level, &rseps, &rchildren);
+        self.put_page_with_lsn(left_id, lb);
+        self.put_page_with_lsn(right_id, rb);
+        Ok(moved_sep)
+    }
+
+    /// Merge the `right` leaf into the `left` leaf, re-chaining siblings.
+    fn merge_leaves(&self, left_id: PageId, right_id: PageId) -> Result<(), BTreeError> {
+        let mut left = self.get_page(left_id).ok_or(BTreeError::MissingLeaf)?;
+        let right = self.get_page(right_id).ok_or(BTreeError::MissingLeaf)?;
+        for i in 0..right.key_count() {
+            if let Some(rec) = right.key(i)
+                && left.insert_raw(rec).is_none()
+            {
+                return Err(BTreeError::MergeFailed);
+            }
+        }
+        // Re-chain: left.next = right.next, and right.next.prev = left.
+        let right_next = right.btree_header().sibling_next;
+        left.set_siblings(left.btree_header().sibling_prev, right_next);
+        self.put_page_with_lsn(left_id, left);
+        if right_next != 0
+            && let Some(mut next) = self.get_page(right_next)
+        {
+            next.set_siblings(left_id, next.btree_header().sibling_next);
+            self.put_page_with_lsn(right_next, next);
+        }
+        Ok(())
+    }
+
+    /// Merge the `right` branch into the `left` branch, pulling `separator`
+    /// down between them (standard B+ tree internal merge).
+    fn merge_branches(
+        &self,
+        left_id: PageId,
+        right_id: PageId,
+        separator: &[u8],
+    ) -> Result<(), BTreeError> {
+        let left = self.get_page(left_id).ok_or(BTreeError::MissingParent)?;
+        let right = self.get_page(right_id).ok_or(BTreeError::MissingParent)?;
+        let (mut lseps, mut lchildren) = Self::decode_branch(&left);
+        let (rseps, rchildren) = Self::decode_branch(&right);
+
+        lseps.push(separator.to_vec());
+        lseps.extend(rseps);
+        lchildren.extend(rchildren);
+
+        let level = left.btree_header().level;
+        let merged = Self::try_build_branch(left_id, level, &lseps, &lchildren)
+            .ok_or(BTreeError::MergeFailed)?;
+        self.put_page_with_lsn(left_id, merged);
+        Ok(())
+    }
+
+    /// Return `page_id` to the in-memory free pool (best effort).
+    ///
+    /// In buffer-pool mode the page simply becomes unreferenced; a future
+    /// free-list integration can reclaim its space on disk.
+    fn free_page(&self, page_id: PageId) {
+        if self.pool.is_none() {
+            let mut pages = self.pages.lock().unwrap();
+            pages.remove(&page_id);
+        }
+    }
 }
 
 /// Errors that can occur during B+ tree operations.
@@ -763,6 +1164,22 @@ fn encode_branch_entry(key: &[u8], child: PageId) -> Vec<u8> {
     buf
 }
 
+/// Extract the key portion of a leaf record `[key_len: u16 BE][key][value]`.
+///
+/// Returns an empty slice for malformed records; callers treat such records as
+/// having a minimal separating key, which only affects rebalancing heuristics,
+/// never correctness of stored data.
+fn leaf_record_key(record: &[u8]) -> &[u8] {
+    if record.len() < 2 {
+        return &[];
+    }
+    let key_len = u16::from_be_bytes([record[0], record[1]]) as usize;
+    if 2 + key_len > record.len() {
+        return &[];
+    }
+    &record[2..2 + key_len]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,7 +1214,9 @@ mod tests {
             tree.insert(&k, &i.to_be_bytes()).unwrap();
         }
         // After many inserts, root should have become a branch.
-        let root = tree.get_page(tree.root_page_id.load(Ordering::Relaxed)).unwrap();
+        let root = tree
+            .get_page(tree.root_page_id.load(Ordering::Relaxed))
+            .unwrap();
         assert!(root.is_branch() || root.key_count() > 0);
     }
 
@@ -856,11 +1275,7 @@ mod tests {
         }
         for i in 1u128..=200 {
             let k = node_id_key(i);
-            assert!(
-                tree.search(&k).is_some(),
-                "key {} should be present",
-                i
-            );
+            assert!(tree.search(&k).is_some(), "key {} should be present", i);
         }
     }
 
@@ -872,7 +1287,9 @@ mod tests {
             tree.insert(&k, &i.to_be_bytes()).unwrap();
         }
         // Verify root is valid.
-        let root = tree.get_page(tree.root_page_id.load(Ordering::Relaxed)).unwrap();
+        let root = tree
+            .get_page(tree.root_page_id.load(Ordering::Relaxed))
+            .unwrap();
         assert!(root.is_branch() || root.key_count() > 0);
     }
 
@@ -972,8 +1389,7 @@ mod tests {
         let pool = Arc::new(BufferPool::new(8, path.clone()));
 
         // Build tree with pool attached.
-        let tree = BPlusTree::new(BPlusTreeConfig::default())
-            .with_pool(pool.clone(), fs.clone());
+        let tree = BPlusTree::new(BPlusTreeConfig::default()).with_pool(pool.clone(), fs.clone());
         for i in 1u128..=50 {
             let k = node_id_key(i);
             tree.insert(&k, &i.to_be_bytes()).unwrap();
@@ -988,5 +1404,205 @@ mod tests {
         // The page should be a leaf (all 50 small keys fit in one page).
         assert!(persisted.is_leaf(), "persisted root should still be a leaf");
         assert_eq!(persisted.key_count(), 50, "all 50 keys should be present");
+    }
+
+    // ── Task 170: structural correctness ──────────────────────────────────
+
+    /// Build a pool-backed tree and return `(tree, _pool, _fs, _dir)`.  The
+    /// trailing handles must be kept alive for the duration of the test.
+    fn pool_tree() -> (
+        BPlusTree,
+        std::sync::Arc<crate::buffer::pool::BufferPool>,
+        std::sync::Arc<dyn FileSystem>,
+        tempfile::TempDir,
+    ) {
+        use crate::buffer::pool::BufferPool;
+        use crate::io::posix::PosixFileSystem;
+        use crate::storage::page::{PAGE_SIZE, PageType, SlottedPage};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rgraph.db");
+        let fs = Arc::new(PosixFileSystem::new(false)) as Arc<dyn FileSystem>;
+        let file_pages = 4096u64;
+        {
+            let handle = fs.open(&path, true).unwrap();
+            handle.set_len(file_pages * PAGE_SIZE as u64).unwrap();
+            drop(handle);
+        }
+        let handle = fs.open(&path, false).unwrap();
+        for pid in 0..file_pages {
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.update_checksum();
+            handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
+        }
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        let pool = Arc::new(BufferPool::new(256, path));
+        let tree = BPlusTree::new(BPlusTreeConfig::default()).with_pool(pool.clone(), fs.clone());
+        (tree, pool, fs, dir)
+    }
+
+    #[test]
+    fn pool_mode_grows_multi_level_and_branch_split_succeeds() {
+        // In buffer-pool mode the old `find_parent` HashMap scan was empty, so
+        // a branch split returned MissingParent.  With descend-path parent
+        // tracking the tree must grow to multiple levels without error.
+        let (tree, _pool, _fs, _dir) = pool_tree();
+        for i in 1u128..=4000 {
+            tree.insert(&node_id_key(i), &i.to_be_bytes())
+                .unwrap_or_else(|e| panic!("insert {i} failed: {e}"));
+        }
+        let root = tree
+            .get_page(tree.root_page_id.load(Ordering::Relaxed))
+            .unwrap();
+        assert!(root.is_branch(), "4000 keys must produce a branch root");
+        assert!(
+            root.btree_header().level >= 1,
+            "tree must have at least one internal level"
+        );
+        for i in 1u128..=4000 {
+            assert!(
+                tree.search(&node_id_key(i)).is_some(),
+                "key {i} must be findable in pool-mode tree"
+            );
+        }
+    }
+
+    #[test]
+    fn full_split_then_many_deletes_stays_balanced_and_searchable() {
+        let tree = BPlusTree::new(BPlusTreeConfig::default());
+        let n = 2000u128;
+        for i in 1..=n {
+            tree.insert(&node_id_key(i), &i.to_be_bytes()).unwrap();
+        }
+        // Delete the lower half; every remaining key must still be findable and
+        // every deleted key must be gone.
+        for i in 1..=(n / 2) {
+            assert!(
+                tree.delete(&node_id_key(i)).unwrap(),
+                "delete {i} not found"
+            );
+        }
+        for i in 1..=(n / 2) {
+            assert!(
+                tree.search(&node_id_key(i)).is_none(),
+                "deleted key {i} still present"
+            );
+        }
+        for i in (n / 2 + 1)..=n {
+            assert!(
+                tree.search(&node_id_key(i)).is_some(),
+                "surviving key {i} missing after deletes"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_until_empty_reclaims_and_keeps_searches_correct() {
+        let tree = BPlusTree::new(BPlusTreeConfig::default());
+        let n = 1500u128;
+        for i in 1..=n {
+            tree.insert(&node_id_key(i), &i.to_be_bytes()).unwrap();
+        }
+        // Delete every key in a scrambled order.
+        let mut order: Vec<u128> = (1..=n).collect();
+        // Simple deterministic shuffle.
+        order.sort_by_key(|&x| (x.wrapping_mul(2654435761)) & 0xffff);
+        for &i in &order {
+            assert!(
+                tree.delete(&node_id_key(i)).unwrap(),
+                "delete {i} not found"
+            );
+            assert!(
+                tree.search(&node_id_key(i)).is_none(),
+                "key {i} present right after its own delete"
+            );
+        }
+        // The tree is now empty: no key is findable and the root has collapsed
+        // back to (at most) a single leaf.
+        for i in 1..=n {
+            assert!(tree.search(&node_id_key(i)).is_none(), "key {i} survived");
+        }
+        let root = tree
+            .get_page(tree.root_page_id.load(Ordering::Relaxed))
+            .unwrap();
+        assert!(
+            root.is_leaf(),
+            "after emptying, the root must collapse to a leaf (was a {:?})",
+            if root.is_branch() { "branch" } else { "leaf" }
+        );
+        assert_eq!(root.key_count(), 0, "empty tree root must hold no keys");
+
+        // The tree must remain usable: re-insert and find.
+        tree.insert(&node_id_key(42), b"again").unwrap();
+        assert!(tree.search(&node_id_key(42)).is_some());
+    }
+
+    #[test]
+    fn insert_random_order_all_keys_findable() {
+        // Random insertion order exercises middle-of-tree splits and separator
+        // updates that ascending insertion never reaches.
+        let tree = BPlusTree::new(BPlusTreeConfig::default());
+        let n = 2000u128;
+        let mut order: Vec<u128> = (1..=n).collect();
+        order.sort_by_key(|&x| (x.wrapping_mul(2654435761)) & 0xffff);
+        for &k in &order {
+            tree.insert(&node_id_key(k), &k.to_be_bytes()).unwrap();
+        }
+        for k in 1..=n {
+            assert!(tree.search(&node_id_key(k)).is_some(), "key {k} missing");
+        }
+    }
+
+    #[test]
+    fn large_value_splits_preserve_all_keys() {
+        // ~600-byte values pack ~12 records per 8 KiB leaf, so splits begin at
+        // low key counts.  This regression-guards the slotted-page compaction
+        // hazard that previously discarded leaf entries during a split.
+        let tree = BPlusTree::new(BPlusTreeConfig::default());
+        let big = vec![0xABu8; 600];
+        let order: [u128; 20] = [
+            10, 20, 30, 40, 50, 25, 15, 35, 5, 45, 12, 22, 32, 8, 18, 28, 38, 48, 2, 42,
+        ];
+        for &k in &order {
+            tree.insert(&node_id_key(k), &big).unwrap();
+        }
+        for &k in &order {
+            let (pid, slot) = tree
+                .search(&node_id_key(k))
+                .unwrap_or_else(|| panic!("key {k} missing after large-value splits"));
+            let page = tree.get_page(pid).unwrap();
+            let kv = page.key(slot).unwrap();
+            let kl = u16::from_be_bytes([kv[0], kv[1]]) as usize;
+            assert_eq!(&kv[2 + kl..], &big[..], "key {k} value corrupted");
+        }
+    }
+
+    #[test]
+    fn interleaved_insert_delete_search_consistency() {
+        use std::collections::BTreeSet;
+        let tree = BPlusTree::new(BPlusTreeConfig::default());
+        let mut present: BTreeSet<u128> = BTreeSet::new();
+        for step in 0u128..3000 {
+            let key = (step.wrapping_mul(48271) % 1000) + 1;
+            if present.contains(&key) {
+                tree.delete(&node_id_key(key)).unwrap();
+                present.remove(&key);
+            } else {
+                tree.insert(&node_id_key(key), &key.to_be_bytes()).unwrap();
+                present.insert(key);
+            }
+        }
+        for k in 1u128..=1000 {
+            let found = tree.search(&node_id_key(k)).is_some();
+            assert_eq!(
+                found,
+                present.contains(&k),
+                "key {k}: tree.search={found} but model={}",
+                present.contains(&k)
+            );
+        }
     }
 }
