@@ -7,8 +7,19 @@
 //!
 //! A [`PageDefragmenter`] walks the leaf chain of a [`BPlusTree`] and
 //! rewrites any leaf whose dead space exceeds a configurable threshold.
-//! The compacted page is written back through the same `put_page_with_lsn`
-//! path so that buffer-pool integration and WAL durability are preserved.
+//! The compacted page is written back through the tree's `put_page_with_lsn`
+//! path, which stamps a fresh page LSN and marks the buffer-pool frame dirty.
+//!
+//! # Durability caveat
+//!
+//! Defragmentation is **not** WAL-logged on its own.  `put_page_with_lsn` only
+//! emits a physical redo/undo record when it runs inside an active logged batch
+//! (see [`BPlusTree::insert_batch_logged`]); the defragmenter does not open such
+//! a batch.  A compacted page therefore reaches durable storage only when the
+//! buffer pool flushes the dirty frame (checkpoint or eviction).  Because the
+//! rewrite is logically idempotent — it preserves the page's key set, only
+//! reclaiming dead space — a crash before the flush simply leaves the original
+//! fragmented page intact, so no recovery action is required.
 //!
 //! In a full production implementation the old page pointer would be swapped
 //! atomically via crossbeam-epoch reclamation; here the swap is performed

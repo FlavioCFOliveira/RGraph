@@ -1,8 +1,21 @@
 //! Core B+ tree operations: search, point insert/delete, split, merge.
 //!
 //! The tree is built over slotted pages and uses latch crabbing for
-//! concurrency.  Structural changes are logged to WAL as physical
-//! redo/undo records.
+//! concurrency.
+//!
+//! # WAL logging scope
+//!
+//! WAL logging is **opt-in per call site**, not automatic for every mutation:
+//!
+//! * [`BPlusTree::insert_batch_logged`] is the only path that writes WAL
+//!   records.  It emits one physical redo/undo record per touched index page
+//!   (full after-image plus an embedded before-image) and flushes before
+//!   returning, giving write-ahead durability that ARIES recovery replays.
+//! * The plain [`BPlusTree::insert`], [`BPlusTree::insert_batch`], and
+//!   [`BPlusTree::delete`] paths mutate the in-memory/buffer-pool pages
+//!   **without** logging.  Callers that need durability for those mutations
+//!   must drive them through `insert_batch_logged` or persist the pages via the
+//!   buffer pool's own checkpoint/flush path.
 //!
 //! # Deferred work
 //!

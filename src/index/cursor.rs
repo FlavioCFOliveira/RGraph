@@ -1,17 +1,26 @@
 //! B+ tree cursor and range scan iterator.
 //!
-//! The cursor holds a latch on the current leaf and follows sibling
-//! pointers for forward/backward traversal.
+//! Two cursor types live here with different isolation guarantees:
+//!
+//! * [`BTreeCursor`] is a single-page, in-memory cursor used by unit tests.
+//!   It owns a *copy* of one leaf page and does **not** hold any latch, so it
+//!   is not safe to use against a tree being mutated concurrently.
+//! * [`BTreeRangeCursor`] is the tree-backed range scan.  It holds a shared
+//!   structural latch for its whole lifetime and reloads sibling leaves, so it
+//!   correctly spans many leaves while blocking concurrent splits/merges.
 
 use crate::index::key::CompositeKey;
 use crate::index::latch::LatchCoupling;
 use crate::index::page::BTreePage;
 use crate::storage::page::PageId;
 
-/// Cursor over a B+ tree leaf chain.
+/// Single-page, in-memory cursor over one B+ tree leaf.
 ///
-/// The cursor holds a shared latch on the current leaf page while it is
-/// alive, preventing concurrent splits from freeing the page underneath it.
+/// This cursor owns a *copy* of one leaf page and walks its slots; it does
+/// **not** acquire or hold any latch, and it does not follow sibling pointers
+/// across pages.  It is intended for unit tests and single-leaf inspection.
+/// For a latched, multi-leaf range scan that is safe under concurrent writers,
+/// use [`BTreeRangeCursor`].
 pub struct BTreeCursor<'a> {
     #[allow(dead_code)]
     latch_mgr: &'a LatchCoupling,

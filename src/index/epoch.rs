@@ -1,8 +1,17 @@
-//! Crossbeam-epoch integration for lock-free page snapshotting.
+//! Crossbeam-epoch integration for page snapshotting (prototype).
 //!
 //! This module provides an `EpochPageTable` that stores `BTreePage`s behind
-//! `crossbeam_epoch::Atomic` pointers, enabling lock-free reads and
+//! `crossbeam_epoch::Atomic` pointers and uses epoch-based reclamation for
 //! deferred destruction of replaced pages.
+//!
+//! # Not yet lock-free
+//!
+//! The table itself is still a `Mutex<HashMap<PageId, Atomic<BTreePage>>>`, so
+//! both reads and writes serialise on the map mutex; only the *page snapshot
+//! retirement* is epoch-protected, not the table lookup.  Making the lookup
+//! genuinely lock-free (e.g. a concurrent hash map or a fully atomic page
+//! table) is future work.  This prototype is gated behind the off-by-default
+//! `epoch` feature and is not wired into [`crate::index::btree`].
 
 use crate::index::page::BTreePage;
 use crate::storage::page::PageId;
@@ -50,8 +59,13 @@ impl EpochPageTable {
         table.insert(page_id, Atomic::new(page));
     }
 
-    /// Load a page snapshot without taking a mutex.
-    /// The caller must hold an active epoch pin.
+    /// Load a page snapshot for `page_id`.
+    ///
+    /// The caller must hold an active epoch pin (`guard`); the returned
+    /// reference is valid for as long as that pin is held.  Note that this
+    /// still takes the table mutex to find the entry — only the snapshot
+    /// pointer behind it is epoch-protected (see the module-level note on the
+    /// prototype not yet being lock-free).
     pub fn load<'a>(
         &self,
         page_id: PageId,

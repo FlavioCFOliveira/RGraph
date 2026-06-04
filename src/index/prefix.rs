@@ -1,9 +1,22 @@
-//! Prefix compression for B+ tree pages.
+//! Prefix compression for B+ tree pages (prototype, feature-gated).
 //!
-//! Reduces per-page key storage by extracting the longest common prefix
-//! shared by all keys on a page and storing it once in the page header
-//! area.  Each slot then stores only the suffix, typically cutting key
-//! sizes by 30–50 % for RDF URI keys and adjacency keys.
+//! The intended scheme reduces per-page key storage by extracting the longest
+//! common prefix shared by all keys on a page and storing it once in the page
+//! header area; each slot then stores only the suffix.  For long, highly
+//! redundant keys (RDF URI keys, adjacency keys) this can materially shrink
+//! key bytes per page.
+//!
+//! # Not wired into the tree
+//!
+//! This module is gated behind the off-by-default `prefix_compression` feature
+//! and provides only the codec primitives ([`common_prefix`],
+//! [`compress_record`], [`decompress_record`], [`extract_key`]).  It is **not**
+//! used by [`crate::index::btree`]: the tree's comparators
+//! (`branch_child`, `leaf_lower_bound`) compare raw record bytes, so enabling
+//! compression today would corrupt key ordering and lookups.  Wiring it in
+//! requires making every comparison path reconstruct the full key first; that
+//! is future work.  The "30–50 % saving" figure is a design target, not a
+//! measured result.
 
 /// Compute the longest common prefix of a slice of byte strings.
 ///

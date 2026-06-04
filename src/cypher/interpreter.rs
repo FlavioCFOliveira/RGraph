@@ -1,12 +1,16 @@
 //! Expression interpreter — evaluates [`ast::Expression`] into [`Value`].
 //!
-//! Implements the full openCypher expression semantics including:
+//! Implements openCypher expression semantics including:
 //! - Kleene three-valued logic for AND/OR/XOR/NOT
 //! - Regex `=~` with full-match Java-compatible semantics
-//! - Complete scalar function library
+//! - A broad scalar/list/string/math function library (see the function
+//!   dispatch in this module for the exact set supported today)
 //! - CASE expressions, list comprehensions, quantifiers, reduce, EXISTS
 //! - Parameter binding via execution context
 //! - Null propagation throughout
+//!
+//! Coverage is validated against the openCypher TCK rather than claimed to be
+//! exhaustive here; consult the TCK suite for the authoritative compliance set.
 
 use crate::cypher::ast::*;
 use crate::cypher::value::Value;
