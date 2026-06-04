@@ -279,7 +279,7 @@ impl Eq for OrderedF64 {}
 
 impl PartialOrd for OrderedF64 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.total_cmp(other))
+        Some(self.cmp(other))
     }
 }
 

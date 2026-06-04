@@ -28,7 +28,7 @@ pub fn num_bitmap_pages(next_free_page_id: u64) -> usize {
     if next_free_page_id == 0 {
         return 1;
     }
-    ((next_free_page_id as usize) + PAGES_PER_BITMAP - 1) / PAGES_PER_BITMAP
+    (next_free_page_id as usize).div_ceil(PAGES_PER_BITMAP)
 }
 
 // ── PageManager ───────────────────────────────────────────────────────────────

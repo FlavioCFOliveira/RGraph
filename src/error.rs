@@ -306,6 +306,10 @@ impl From<crate::cypher::executor::ExecError> for RGraphError {
 /// invariants).  Such failures are not part of the openCypher TCK and must
 /// never be reported under a query-error class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// The variant names are the canonical openCypher TCK error-class names; the
+// shared `Error` suffix is mandated by the spec taxonomy, not incidental, so
+// the `enum_variant_names` lint is suppressed.
+#[allow(clippy::enum_variant_names)]
 pub enum TckErrorClass {
     /// SyntaxError — malformed query.
     SyntaxError,

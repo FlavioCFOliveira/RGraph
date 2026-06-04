@@ -27,7 +27,7 @@
 
 use crate::index::btree::BPlusTree;
 use crate::index::page::BTreePage;
-use crate::storage::page::{PageId, PAGE_SIZE};
+use crate::storage::page::{PAGE_SIZE, PageId};
 
 /// Threshold: when dead space exceeds this fraction of the page, the
 /// page is considered a candidate for defragmentation.
@@ -54,11 +54,12 @@ impl<'a> PageDefragmenter<'a> {
         let mut leaf_id = self.leftmost_leaf();
         while leaf_id != 0 {
             if let Some(page) = self.tree.get_page(leaf_id) {
-                if page.is_leaf() && self.needs_defrag(&page) {
-                    if let Some(compact) = self.compact_page(&page) {
-                        self.tree.put_page_with_lsn(leaf_id, compact);
-                        rewritten += 1;
-                    }
+                if page.is_leaf()
+                    && self.needs_defrag(&page)
+                    && let Some(compact) = self.compact_page(&page)
+                {
+                    self.tree.put_page_with_lsn(leaf_id, compact);
+                    rewritten += 1;
                 }
                 leaf_id = page.btree_header().sibling_next;
             } else {
@@ -70,18 +71,21 @@ impl<'a> PageDefragmenter<'a> {
 
     /// Find the left-most leaf in the tree.
     fn leftmost_leaf(&self) -> PageId {
-        let mut page_id = self.tree.root_page_id.load(std::sync::atomic::Ordering::Relaxed);
+        let mut page_id = self
+            .tree
+            .root_page_id
+            .load(std::sync::atomic::Ordering::Relaxed);
         loop {
             if let Some(page) = self.tree.get_page(page_id) {
                 if page.is_leaf() {
                     return page_id;
                 }
                 // Follow the first child pointer of the branch.
-                if page.key_count() > 0 {
-                    if let Some(child) = page.child_pointer(0) {
-                        page_id = child;
-                        continue;
-                    }
+                if page.key_count() > 0
+                    && let Some(child) = page.child_pointer(0)
+                {
+                    page_id = child;
+                    continue;
                 }
                 page_id = page.btree_header().rightmost_child;
             } else {
@@ -91,9 +95,7 @@ impl<'a> PageDefragmenter<'a> {
     }
 
     /// Check whether `page` exceeds the dead-space threshold.
-    fn needs_defrag(&self,
-        page: &BTreePage,
-    ) -> bool {
+    fn needs_defrag(&self, page: &BTreePage) -> bool {
         let free = page.free_space();
         let capacity = PAGE_SIZE
             - std::mem::size_of::<crate::storage::page::PageHeader>()
@@ -106,10 +108,7 @@ impl<'a> PageDefragmenter<'a> {
     /// laid out contiguously.  Returns `None` if compaction fails
     /// (e.g. records do not fit, which should never happen for a
     /// defragmentation-only rewrite).
-    fn compact_page(
-        &self,
-        page: &BTreePage,
-    ) -> Option<BTreePage> {
+    fn compact_page(&self, page: &BTreePage) -> Option<BTreePage> {
         let page_id = page.page_id();
         let page_type = if page.is_leaf() {
             crate::storage::page::PageType::BTreeLeaf
@@ -132,8 +131,7 @@ impl<'a> PageDefragmenter<'a> {
         new_inner.header_mut().free_space_offset = crate::index::page::BTREE_HEADER_SIZE as u16;
 
         let mut new_page = crate::index::page::BTreePage { inner: new_inner };
-        new_page.write_btree_header(&page.btree_header()
-        );
+        new_page.write_btree_header(&page.btree_header());
         // Re-insert records preserving order.
         for (idx, record) in records.iter().enumerate() {
             let result = new_page.inner.insert_at(idx as u16, record);

@@ -511,10 +511,10 @@ fn parse_turtle(content: &str) -> Result<Vec<ImportRecord>, CliError> {
     }
     // Object-only nodes that were not also subjects.
     for n in nodes {
-        if let ImportRecord::Node { key: Some(k), .. } = &n {
-            if !subject_order.contains(k) {
-                ordered_nodes.push(n);
-            }
+        if let ImportRecord::Node { key: Some(k), .. } = &n
+            && !subject_order.contains(k)
+        {
+            ordered_nodes.push(n);
         }
     }
 
@@ -559,10 +559,10 @@ fn clean_iri(term: &str) -> String {
 /// (and should therefore become an edge).
 fn parse_turtle_literal(object: &str) -> Option<Property> {
     let trimmed = object.trim();
-    if trimmed.starts_with('"') {
+    if let Some(rest) = trimmed.strip_prefix('"') {
         // Quoted string literal, possibly with a datatype suffix we ignore.
-        let end = trimmed[1..].find('"').map(|i| i + 1)?;
-        return Some(Property::String(trimmed[1..end].to_owned()));
+        let end = rest.find('"')?;
+        return Some(Property::String(rest[..end].to_owned()));
     }
     if let Ok(i) = trimmed.parse::<i64>() {
         return Some(Property::Integer(i));

@@ -9,7 +9,6 @@ use crate::cypher::ast;
 use crate::cypher::syntax::{
     CstBuilder, StatementNode, SyntaxKind,
 };
-use text_size::TextRange;
 
 /// Convert an AST [`ast::Statement`] into a [`rowan`] CST.
 pub fn ast_to_cst(stmt: &ast::Statement) -> StatementNode {
@@ -362,7 +361,7 @@ fn convert_expression(b: &mut CstBuilder, expr: &ast::Expression) {
         }
         ast::Expression::UnaryOp { op, expr, .. } => {
             b.start_node(SyntaxKind::UNARY_EXPR);
-            b.token(SyntaxKind::PUNCT, &op.to_string().trim());
+            b.token(SyntaxKind::PUNCT, op.to_string().trim());
             convert_expression(b, expr);
             b.finish_node();
         }

@@ -163,10 +163,10 @@ pub fn execute_naive(stmt: &Statement) -> Result<QueryResult, ExecError> {
 
         let mut rows = vec![values];
 
-        if let Some(skip) = skip_val {
-            if skip > 0 {
-                rows.clear();
-            }
+        if let Some(skip) = skip_val
+            && skip > 0
+        {
+            rows.clear();
         }
         if let Some(limit) = limit_val {
             if limit == 0 {

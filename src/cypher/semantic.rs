@@ -134,7 +134,7 @@ pub fn analyse(stmt: &Statement) -> Result<Scope, SemanticError> {
             }
             Clause::Return(r) => {
                 has_scope = true;
-                let has_aggregates = r.projections.iter().any(|p| contains_aggregate(&p.expression));
+                let _has_aggregates = r.projections.iter().any(|p| contains_aggregate(&p.expression));
 
                 if r.star {
                     // RETURN * — no variable checks needed.
@@ -211,40 +211,6 @@ fn collect_pattern_variables_relaxed(
                 if let Some(v) = &r.variable {
                     scope.variables.insert(v.clone());
                     scope.variable_source.entry(v.clone()).or_insert_with(|| "MATCH".to_string());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Strict version that rejects re-binding of already-bound variables.
-fn collect_pattern_variables(
-    pattern: &Pattern,
-    scope: &mut Scope,
-) -> Result<(), SemanticError> {
-    for elem in &pattern.elements {
-        match elem {
-            PatternElement::Node(n) => {
-                if let Some(v) = &n.variable {
-                    if scope.variables.contains(v) {
-                        return Err(SemanticError {
-                            message: format!("variable '{}' already bound in this scope", v),
-                        });
-                    }
-                    scope.variables.insert(v.clone());
-                    scope.variable_source.insert(v.clone(), "MATCH".to_string());
-                }
-            }
-            PatternElement::Relationship(r) => {
-                if let Some(v) = &r.variable {
-                    if scope.variables.contains(v) {
-                        return Err(SemanticError {
-                            message: format!("variable '{}' already bound in this scope", v),
-                        });
-                    }
-                    scope.variables.insert(v.clone());
-                    scope.variable_source.insert(v.clone(), "MATCH".to_string());
                 }
             }
         }
@@ -393,9 +359,9 @@ pub fn contains_aggregate(expr: &Expression) -> bool {
         Expression::List(items) => items.iter().any(contains_aggregate),
         Expression::Map(entries) => entries.iter().any(|(_, v)| contains_aggregate(v)),
         Expression::Case { subject, alternatives, default, .. } => {
-            subject.as_ref().map_or(false, |s| contains_aggregate(s))
+            subject.as_ref().is_some_and(|s| contains_aggregate(s))
                 || alternatives.iter().any(|a| contains_aggregate(&a.condition) || contains_aggregate(&a.result))
-                || default.as_ref().map_or(false, |d| contains_aggregate(d))
+                || default.as_ref().is_some_and(|d| contains_aggregate(d))
         }
         _ => false,
     }

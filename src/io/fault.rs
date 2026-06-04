@@ -80,27 +80,6 @@ impl FaultInjectFileSystem {
     pub fn set_config(&self, config: FaultConfig) {
         *self.config.lock().unwrap() = config;
     }
-
-    fn bump_counter(&self) -> u64 {
-        self.op_counter.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn maybe_fault(&self, op: OpMask) -> Option<FaultKind> {
-        let n = self.bump_counter();
-        let cfg = self.config.lock().unwrap();
-        for rule in &cfg.rules {
-            if !matches_op(op, rule.op_mask) {
-                continue;
-            }
-            if let Some(every) = rule.every_n {
-                if (n % every) != 0 {
-                    continue;
-                }
-            }
-            return Some(rule.kind);
-        }
-        None
-    }
 }
 
 fn matches_op(op: OpMask, mask: OpMask) -> bool {
@@ -157,10 +136,10 @@ impl FaultInjectFileHandle {
             if !matches_op(op, rule.op_mask) {
                 continue;
             }
-            if let Some(every) = rule.every_n {
-                if (n % every) != 0 {
-                    continue;
-                }
+            if let Some(every) = rule.every_n
+                && !n.is_multiple_of(every)
+            {
+                continue;
             }
             return Some(rule.kind);
         }
@@ -283,13 +262,9 @@ impl FileHandle for FaultInjectFileHandle {
         if let Some(kind) = self.maybe_fault(OpMask {
             set_len: true,
             ..OpMask::default()
-        }) {
-            match kind {
-                FaultKind::Eio => {
-                    return Err(io::Error::from_raw_os_error(libc::EIO));
-                }
-                _ => {}
-            }
+        }) && let FaultKind::Eio = kind
+        {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
         }
         self.inner.set_len(len)
     }

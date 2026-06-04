@@ -195,12 +195,11 @@ impl BPlusTree {
         // If a pool is attached, ensure the data file is large enough.
         if let (Some(pool), Some(fs)) = (&self.pool, self.fs.as_deref()) {
             let required_len = id * crate::storage::page::PAGE_SIZE as u64;
-            if let Ok(handle) = fs.open(&pool.data_path, false) {
-                if let Ok(current_len) = handle.len() {
-                    if current_len < required_len {
-                        let _ = handle.set_len(required_len);
-                    }
-                }
+            if let Ok(handle) = fs.open(&pool.data_path, false)
+                && let Ok(current_len) = handle.len()
+                && current_len < required_len
+            {
+                let _ = handle.set_len(required_len);
             }
         }
         id

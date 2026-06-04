@@ -38,14 +38,14 @@ impl Id {
     }
 
     /// Return the raw 16-byte representation.
-    pub fn to_bytes(&self) -> [u8; 16] {
+    pub fn to_bytes(self) -> [u8; 16] {
         *self.0.as_bytes()
     }
 
     /// Return the identifier as an unsigned 128-bit integer.
     ///
     /// This is useful for ordering and hashing in indexes.
-    pub fn to_u128(&self) -> u128 {
+    pub fn to_u128(self) -> u128 {
         u128::from_be_bytes(self.to_bytes())
     }
 

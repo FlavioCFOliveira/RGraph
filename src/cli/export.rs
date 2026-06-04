@@ -71,7 +71,7 @@ fn user_properties(
             k != LABEL_KEY && k != TYPE_KEY && k != KEY_KEY
         })
         .collect();
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries.sort_by_key(|(a, _)| *a);
     entries
 }
 

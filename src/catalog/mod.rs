@@ -212,10 +212,11 @@ fn encode_section(buf: &mut Vec<u8>, map: &HashMap<String, u32>) {
     }
 }
 
-fn decode_section(
-    bytes: &[u8],
-    pos: &mut usize,
-) -> Option<(HashMap<String, u32>, HashMap<u32, String>, u32)> {
+/// A decoded catalog section: the forward `name -> id` map, the reverse
+/// `id -> name` map, and the next free id.
+type DecodedSection = (HashMap<String, u32>, HashMap<u32, String>, u32);
+
+fn decode_section(bytes: &[u8], pos: &mut usize) -> Option<DecodedSection> {
     let count = read_u32_le(bytes, pos)? as usize;
     let mut map = HashMap::with_capacity(count);
     let mut rev = HashMap::with_capacity(count);

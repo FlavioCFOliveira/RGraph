@@ -28,7 +28,7 @@
 //! integration under time pressure.
 
 use super::{FileHandle, FileSystem};
-use io_uring::{opcode, types, IoUring};
+use io_uring::{IoUring, opcode, types};
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
@@ -110,7 +110,8 @@ impl FileSystem for IoUringFileSystem {
 
         let file = match opts.open(path) {
             Ok(f) => f,
-            Err(e) => {
+            Err(e) =>
+            {
                 #[cfg(target_os = "linux")]
                 if self.use_odirect && e.raw_os_error() == Some(libc::EINVAL) {
                     let mut opts2 = OpenOptions::new();
@@ -183,17 +184,16 @@ impl FileHandle for IoUringFileHandle {
 
         unsafe {
             let mut sq = ring.submission();
-            sq.push(&readv_e).map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "io_uring submission queue full")
-            })?;
+            sq.push(&readv_e)
+                .map_err(|_| io::Error::other("io_uring submission queue full"))?;
         }
 
         ring.submit_and_wait(1)?;
 
         let mut cq = ring.completion();
-        let cqe = cq.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "io_uring completion queue empty")
-        })?;
+        let cqe = cq
+            .next()
+            .ok_or_else(|| io::Error::other("io_uring completion queue empty"))?;
 
         let res = cqe.result();
         if res < 0 {
@@ -204,7 +204,10 @@ impl FileHandle for IoUringFileHandle {
         if bytes_read != total_expected {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("short readv: expected {}, got {}", total_expected, bytes_read),
+                format!(
+                    "short readv: expected {}, got {}",
+                    total_expected, bytes_read
+                ),
             ));
         }
         Ok(())
@@ -233,17 +236,16 @@ impl FileHandle for IoUringFileHandle {
 
         unsafe {
             let mut sq = ring.submission();
-            sq.push(&writev_e).map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "io_uring submission queue full")
-            })?;
+            sq.push(&writev_e)
+                .map_err(|_| io::Error::other("io_uring submission queue full"))?;
         }
 
         ring.submit_and_wait(1)?;
 
         let mut cq = ring.completion();
-        let cqe = cq.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "io_uring completion queue empty")
-        })?;
+        let cqe = cq
+            .next()
+            .ok_or_else(|| io::Error::other("io_uring completion queue empty"))?;
 
         let res = cqe.result();
         if res < 0 {
@@ -254,7 +256,10 @@ impl FileHandle for IoUringFileHandle {
         if bytes_written != total_expected {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
-                format!("short writev: expected {}, got {}", total_expected, bytes_written),
+                format!(
+                    "short writev: expected {}, got {}",
+                    total_expected, bytes_written
+                ),
             ));
         }
         Ok(())
@@ -299,24 +304,20 @@ impl IoUringFileHandle {
         } else {
             io_uring::types::FsyncFlags::DATASYNC
         };
-        let fsync_e = opcode::Fsync::new(fd)
-            .flags(flags)
-            .build()
-            .user_data(0x03);
+        let fsync_e = opcode::Fsync::new(fd).flags(flags).build().user_data(0x03);
 
         unsafe {
             let mut sq = ring.submission();
-            sq.push(&fsync_e).map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "io_uring submission queue full")
-            })?;
+            sq.push(&fsync_e)
+                .map_err(|_| io::Error::other("io_uring submission queue full"))?;
         }
 
         ring.submit_and_wait(1)?;
 
         let mut cq = ring.completion();
-        let cqe = cq.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "io_uring completion queue empty")
-        })?;
+        let cqe = cq
+            .next()
+            .ok_or_else(|| io::Error::other("io_uring completion queue empty"))?;
 
         let res = cqe.result();
         if res < 0 {
@@ -423,7 +424,7 @@ mod tests {
     #[test]
     fn buffer_pool_compatibility() {
         use crate::buffer::pool::BufferPool;
-        use crate::storage::page::{PageType, PAGE_SIZE, SlottedPage};
+        use crate::storage::page::{PAGE_SIZE, PageType, SlottedPage};
         use std::io::Write;
 
         let fs = IoUringFileSystem::new(32, false).unwrap();

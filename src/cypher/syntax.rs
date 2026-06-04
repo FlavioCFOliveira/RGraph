@@ -28,6 +28,11 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u16)]
 #[allow(non_camel_case_types)]
+// SCREAMING_CASE variant names are the deliberate, idiomatic CST convention
+// (cf. rust-analyzer's `SyntaxKind`): each variant mirrors a grammar token or
+// node name verbatim, so renaming to CamelCase would obscure the grammar
+// mapping. The acronym-casing lint is therefore suppressed for this enum only.
+#[allow(clippy::upper_case_acronyms)]
 pub enum SyntaxKind {
     // --- Leaf tokens (0..=99) --------------------------------------
     /// End-of-file sentinel.
@@ -222,7 +227,13 @@ macro_rules! typed_wrapper {
         impl $name {
             /// Wrap a raw node, panicking if the kind does not match.
             pub fn new(node: CstNode) -> Self {
-                assert_eq!(node.kind(), $kind, "expected {}, got {}", $kind, node.kind());
+                assert_eq!(
+                    node.kind(),
+                    $kind,
+                    "expected {}, got {}",
+                    $kind,
+                    node.kind()
+                );
                 Self(node)
             }
 
@@ -395,10 +406,7 @@ mod tests {
         assert_eq!(err.syntax().kind(), SyntaxKind::ERROR);
         let children: Vec<_> = err.syntax().children_with_tokens().collect();
         assert_eq!(children.len(), 1);
-        assert_eq!(
-            children[0].kind(),
-            SyntaxKind::ERROR_TOKEN
-        );
+        assert_eq!(children[0].kind(), SyntaxKind::ERROR_TOKEN);
     }
 
     #[test]

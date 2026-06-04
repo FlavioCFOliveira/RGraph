@@ -339,9 +339,8 @@ impl TckHarness {
             Err(_) => return Some((TckErrorClass::SyntaxError, ErrorPhase::CompileTime)),
             Ok(stmt) => {
                 // Try semantic analysis.
-                match crate::cypher::semantic::analyse(&stmt) {
-                    Err(_) => return Some((TckErrorClass::SemanticError, ErrorPhase::CompileTime)),
-                    Ok(_) => {}
+                if crate::cypher::semantic::analyse(&stmt).is_err() {
+                    return Some((TckErrorClass::SemanticError, ErrorPhase::CompileTime));
                 }
             }
         }

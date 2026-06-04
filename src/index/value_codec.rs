@@ -40,12 +40,15 @@ pub enum Value {
     Map(Vec<u8>),  // opaque payload for now
 }
 
-impl Value {
-    /// Create a `Value::String` from a `&str`.
-    pub fn from_str(s: &str) -> Self {
+impl From<&str> for Value {
+    /// Create a `Value::String` from a `&str` (infallible, hence `From` rather
+    /// than `FromStr`).
+    fn from(s: &str) -> Self {
         Value::String(s.as_bytes().to_vec())
     }
+}
 
+impl Value {
     /// Create a `Value::Int64`.
     pub fn from_i64(v: i64) -> Self {
         Value::Int64(v)
@@ -389,9 +392,9 @@ mod tests {
 
     #[test]
     fn string_roundtrip() {
-        roundtrip(&Value::from_str(""));
-        roundtrip(&Value::from_str("hello"));
-        roundtrip(&Value::from_str("🚀 unicode"));
+        roundtrip(&Value::from(""));
+        roundtrip(&Value::from("hello"));
+        roundtrip(&Value::from("🚀 unicode"));
     }
 
     #[test]
@@ -474,7 +477,7 @@ mod tests {
         let mut encoded: Vec<Vec<u8>> = Vec::new();
         for s in values {
             let mut buf = Vec::new();
-            encode(&Value::from_str(s), &mut buf);
+            encode(&Value::from(s), &mut buf);
             encoded.push(buf);
         }
         for i in 1..encoded.len() {
@@ -498,7 +501,7 @@ mod tests {
         let mut float_buf = Vec::new();
         encode(&Value::from_f64(0.0), &mut float_buf);
         let mut string_buf = Vec::new();
-        encode(&Value::from_str(""), &mut string_buf);
+        encode(&Value::from(""), &mut string_buf);
         let mut list_buf = Vec::new();
         encode(&Value::List(vec![]), &mut list_buf);
         let mut map_buf = Vec::new();

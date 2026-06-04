@@ -8,11 +8,14 @@ use std::thread::{sleep, spawn, JoinHandle};
 use std::time::Duration;
 
 /// A pending dirty page ready for batch flush.
+///
+/// The WAL-before-data ordering decision is made on each frame's `rec_lsn`
+/// *before* it is added to the pending set (see [`Flusher::flush_batch`]), so a
+/// pending entry only needs the frame id and its disk page id.
 #[derive(Debug, Clone, Copy)]
 struct Pending {
     fid: FrameId,
     page_id: PageId,
-    last_lsn: u64,
 }
 
 /// Default threshold: start flushing when > 10 % of frames are dirty.
@@ -138,11 +141,7 @@ impl Flusher {
                 frame.desc.io_inflight.store(false, Ordering::Release);
                 continue;
             }
-            pending.push(Pending {
-                fid,
-                page_id,
-                last_lsn: frame.desc.last_lsn.load(Ordering::Relaxed),
-            });
+            pending.push(Pending { fid, page_id });
         }
 
         if pending.is_empty() {

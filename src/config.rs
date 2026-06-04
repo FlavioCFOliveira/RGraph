@@ -12,18 +12,15 @@ use std::path::{Path, PathBuf};
 
 /// Supported graph data models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum GraphMode {
     /// Label Property Graph (default).
+    #[default]
     Lpg,
     /// Resource Description Framework.
     Rdf,
 }
 
-impl Default for GraphMode {
-    fn default() -> Self {
-        GraphMode::Lpg
-    }
-}
 
 impl std::str::FromStr for GraphMode {
     type Err = RGraphError;
@@ -223,60 +220,60 @@ impl Config {
         if let Ok(v) = std::env::var(format!("{}DATABASE_PATH", prefix)) {
             self.database_path = PathBuf::from(v);
         }
-        if let Ok(v) = std::env::var(format!("{}GRAPH_MODE", prefix)) {
-            if let Ok(mode) = v.parse() {
-                self.graph_mode = mode;
-            }
+        if let Ok(v) = std::env::var(format!("{}GRAPH_MODE", prefix))
+            && let Ok(mode) = v.parse()
+        {
+            self.graph_mode = mode;
         }
-        if let Ok(v) = std::env::var(format!("{}PAGE_CACHE_SIZE_MB", prefix)) {
-            if let Ok(n) = v.parse() {
-                self.page_cache_size_mb = n;
-            }
+        if let Ok(v) = std::env::var(format!("{}PAGE_CACHE_SIZE_MB", prefix))
+            && let Ok(n) = v.parse()
+        {
+            self.page_cache_size_mb = n;
         }
-        if let Ok(v) = std::env::var(format!("{}WAL_CACHE_SIZE_MB", prefix)) {
-            if let Ok(n) = v.parse() {
-                self.wal_cache_size_mb = n;
-            }
+        if let Ok(v) = std::env::var(format!("{}WAL_CACHE_SIZE_MB", prefix))
+            && let Ok(n) = v.parse()
+        {
+            self.wal_cache_size_mb = n;
         }
-        if let Ok(v) = std::env::var(format!("{}MAX_CONNECTIONS", prefix)) {
-            if let Ok(n) = v.parse() {
-                self.max_connections = n;
-            }
+        if let Ok(v) = std::env::var(format!("{}MAX_CONNECTIONS", prefix))
+            && let Ok(n) = v.parse()
+        {
+            self.max_connections = n;
         }
-        if let Ok(v) = std::env::var(format!("{}WORKER_THREADS", prefix)) {
-            if let Ok(n) = v.parse() {
-                self.worker_threads = n;
-            }
+        if let Ok(v) = std::env::var(format!("{}WORKER_THREADS", prefix))
+            && let Ok(n) = v.parse()
+        {
+            self.worker_threads = n;
         }
-        if let Ok(v) = std::env::var(format!("{}CPU_POOL_THREADS", prefix)) {
-            if let Ok(n) = v.parse() {
-                self.cpu_pool_threads = n;
-            }
+        if let Ok(v) = std::env::var(format!("{}CPU_POOL_THREADS", prefix))
+            && let Ok(n) = v.parse()
+        {
+            self.cpu_pool_threads = n;
         }
-        if let Ok(v) = std::env::var(format!("{}DEFAULT_PAGE_SIZE", prefix)) {
-            if let Ok(n) = v.parse() {
-                self.default_page_size = n;
-            }
+        if let Ok(v) = std::env::var(format!("{}DEFAULT_PAGE_SIZE", prefix))
+            && let Ok(n) = v.parse()
+        {
+            self.default_page_size = n;
         }
-        if let Ok(v) = std::env::var(format!("{}ENABLE_COMPRESSION", prefix)) {
-            if let Ok(b) = v.parse() {
-                self.enable_compression = b;
-            }
+        if let Ok(v) = std::env::var(format!("{}ENABLE_COMPRESSION", prefix))
+            && let Ok(b) = v.parse()
+        {
+            self.enable_compression = b;
         }
-        if let Ok(v) = std::env::var(format!("{}TCK_MODE", prefix)) {
-            if let Ok(b) = v.parse() {
-                self.tck_mode = b;
-            }
+        if let Ok(v) = std::env::var(format!("{}TCK_MODE", prefix))
+            && let Ok(b) = v.parse()
+        {
+            self.tck_mode = b;
         }
-        if let Ok(v) = std::env::var(format!("{}USE_ODIRECT", prefix)) {
-            if let Ok(b) = v.parse() {
-                self.use_odirect = b;
-            }
+        if let Ok(v) = std::env::var(format!("{}USE_ODIRECT", prefix))
+            && let Ok(b) = v.parse()
+        {
+            self.use_odirect = b;
         }
-        if let Ok(v) = std::env::var(format!("{}TLS_ENABLED", prefix)) {
-            if let Ok(b) = v.parse() {
-                self.tls_enabled = b;
-            }
+        if let Ok(v) = std::env::var(format!("{}TLS_ENABLED", prefix))
+            && let Ok(b) = v.parse()
+        {
+            self.tls_enabled = b;
         }
         if let Ok(v) = std::env::var(format!("{}TLS_CERT_PATH", prefix)) {
             self.tls_cert_path = Some(PathBuf::from(v));
@@ -418,9 +415,9 @@ impl Config {
 }
 
 fn parse_string(value: &str) -> Result<String> {
-    if value.starts_with('"') && value.ends_with('"') {
-        Ok(value[1..value.len() - 1].to_string())
-    } else if value.starts_with('\'') && value.ends_with('\'') {
+    if (value.starts_with('"') && value.ends_with('"'))
+        || (value.starts_with('\'') && value.ends_with('\''))
+    {
         Ok(value[1..value.len() - 1].to_string())
     } else {
         Err(RGraphError::Argument(format!(

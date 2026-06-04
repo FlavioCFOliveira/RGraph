@@ -74,8 +74,8 @@ pub fn optimize(root: LogicalOperator) -> LogicalOperator {
     // Pass 1: push predicates into scans.
     let root = predicate_pushdown(root);
     // Pass 2: replace AllNodesScan + label filter with NodeByLabelScan.
-    let root = label_scan_preference(root);
-    root
+    
+    label_scan_preference(root)
 }
 
 pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
@@ -254,7 +254,7 @@ fn build_match_plan(
     input: Option<LogicalOperator>,
 ) -> Result<LogicalOperator, PlanError> {
     let mut current_op: Option<LogicalOperator> = input;
-    /// The variable name of the most recently processed node.
+    // The variable name of the most recently processed node.
     let mut last_node_var: Option<String> = None;
 
     let elems = &pattern.elements;

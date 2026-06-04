@@ -1,4 +1,4 @@
-use crate::storage::page::{PageId, PAGE_SIZE};
+use crate::storage::page::PageId;
 use std::cell::RefCell;
 
 /// State kept per thread to detect sequential access patterns.

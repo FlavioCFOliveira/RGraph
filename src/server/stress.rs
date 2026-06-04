@@ -168,9 +168,9 @@ impl StressHarness {
             let ops_done = ops_done.clone();
             let ops_failed = ops_failed.clone();
             let hist = hist.clone();
-            let lost_updates = lost_updates.clone();
+            let _lost_updates = lost_updates.clone();
             let dirty_reads = dirty_reads.clone();
-            let phantom_reads = phantom_reads.clone();
+            let _phantom_reads = phantom_reads.clone();
             let account_balances = account_balances.clone();
             let accounts = accounts.clone();
 

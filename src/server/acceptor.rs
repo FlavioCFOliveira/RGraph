@@ -45,7 +45,7 @@ impl ProtocolMultiplexer {
     pub async fn detect(stream: &mut TcpStream) -> Result<Protocol, RGraphError> {
         let mut buf = [0u8; 6];
         match stream.peek(&mut buf).await {
-            Ok(0) => return Ok(Protocol::Unknown), // closed immediately
+            Ok(0) => Ok(Protocol::Unknown), // closed immediately
             Ok(n) if n >= 4 => {
                 // HTTP/2 connection preface starts with "PRI *".
                 if &buf[..4] == b"PRI " {

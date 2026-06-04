@@ -391,19 +391,17 @@ impl LogicalOperator {
                     vars.extend(inp.output_variables());
                 }
                 for elem in &pattern.elements {
-                    if let PatternElement::Node(n) = elem {
-                        if let Some(v) = &n.variable {
-                            if !vars.contains(v) {
-                                vars.push(v.clone());
-                            }
-                        }
+                    if let PatternElement::Node(n) = elem
+                        && let Some(v) = &n.variable
+                        && !vars.contains(v)
+                    {
+                        vars.push(v.clone());
                     }
-                    if let PatternElement::Relationship(r) = elem {
-                        if let Some(v) = &r.variable {
-                            if !vars.contains(v) {
-                                vars.push(v.clone());
-                            }
-                        }
+                    if let PatternElement::Relationship(r) = elem
+                        && let Some(v) = &r.variable
+                        && !vars.contains(v)
+                    {
+                        vars.push(v.clone());
                     }
                 }
             }
@@ -514,15 +512,15 @@ impl LogicalOperator {
             }
             LogicalOperator::Merge { pattern, .. } => {
                 for elem in &pattern.elements {
-                    if let PatternElement::Node(n) = elem {
-                        if let Some(v) = &n.variable {
-                            vars.push(v.clone());
-                        }
+                    if let PatternElement::Node(n) = elem
+                        && let Some(v) = &n.variable
+                    {
+                        vars.push(v.clone());
                     }
-                    if let PatternElement::Relationship(r) = elem {
-                        if let Some(v) = &r.variable {
-                            vars.push(v.clone());
-                        }
+                    if let PatternElement::Relationship(r) = elem
+                        && let Some(v) = &r.variable
+                    {
+                        vars.push(v.clone());
                     }
                 }
             }

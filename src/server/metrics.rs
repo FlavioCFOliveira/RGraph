@@ -295,6 +295,12 @@ pub struct HealthService {
     ready: RwLock<bool>,
 }
 
+impl Default for HealthService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HealthService {
     pub fn new() -> Self {
         Self {

@@ -345,7 +345,7 @@ pub fn evaluate(expr: &Expression, ctx: &EvalContext) -> Result<Value, EvalError
             match (l, r) {
                 (Value::String(s), Value::String(pattern)) => {
                     // openCypher =~ semantics: full-match, case-sensitive, Java regex dialect.
-                    let re = Regex::new(&pattern).map_err(|e| EvalError {
+                    let _re = Regex::new(&pattern).map_err(|e| EvalError {
                         message: format!("invalid regex '{}': {}", pattern, e),
                     })?;
                     // Anchored full-match equivalent: ^pattern$.
@@ -396,10 +396,7 @@ pub fn evaluate(expr: &Expression, ctx: &EvalContext) -> Result<Value, EvalError
                 let condition_val = if let Some(subject) = &subject_val {
                     // Simple CASE: CASE x WHEN v THEN ...
                     let when_val = evaluate(&alt.condition, ctx)?;
-                    match subject.cypher_eq(&when_val) {
-                        Some(Value::Boolean(true)) => true,
-                        _ => false,
-                    }
+                    matches!(subject.cypher_eq(&when_val), Some(Value::Boolean(true)))
                 } else {
                     // Generic CASE: CASE WHEN pred THEN ...
                     match evaluate(&alt.condition, ctx)? {
@@ -452,7 +449,7 @@ pub fn evaluate(expr: &Expression, ctx: &EvalContext) -> Result<Value, EvalError
             }
         }
 
-        Expression::PatternComprehension { variable, pattern, filter, projection, .. } => {
+        Expression::PatternComprehension { variable: _, pattern: _, filter: _, projection: _, .. } => {
             // Pattern comprehensions require graph access — return empty list when
             // no graph context is available in pure expression evaluation.
             Ok(Value::List(vec![]))
@@ -587,7 +584,7 @@ pub fn kleene_xor(l: Value, r: Value) -> Value {
 fn eval_function(
     name: &str,
     args: &[Expression],
-    distinct: bool,
+    _distinct: bool,
     ctx: &EvalContext,
 ) -> Result<Value, EvalError> {
     // Aggregate functions are handled in the physical AggregateOp.
@@ -747,7 +744,7 @@ fn eval_function(
                 Value::Null => Ok(Value::Null),
                 Value::Integer(i) => Ok(Value::Integer(i)),
                 Value::Float(f) => Ok(Value::Float(OrderedF64(f.0.ceil()))),
-                other => Err(EvalError { message: format!("ceil() requires numeric") }),
+                _other => Err(EvalError { message: "ceil() requires numeric".to_string() }),
             }
         }
         "FLOOR" => {

@@ -28,17 +28,17 @@ impl NumaTopology {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if let Some(id_str) = name_str.strip_prefix("node") {
-                    if let Ok(node_id) = id_str.parse::<usize>() {
-                        let cpulist_path = entry.path().join("cpulist");
-                        let cpus = if cpulist_path.exists() {
-                            parse_cpulist(&fs::read_to_string(&cpulist_path).unwrap_or_default())
-                        } else {
-                            Vec::new()
-                        };
-                        nodes.push(node_id);
-                        cpus_per_node.push(cpus);
-                    }
+                if let Some(id_str) = name_str.strip_prefix("node")
+                    && let Ok(node_id) = id_str.parse::<usize>()
+                {
+                    let cpulist_path = entry.path().join("cpulist");
+                    let cpus = if cpulist_path.exists() {
+                        parse_cpulist(&fs::read_to_string(&cpulist_path).unwrap_or_default())
+                    } else {
+                        Vec::new()
+                    };
+                    nodes.push(node_id);
+                    cpus_per_node.push(cpus);
                 }
             }
         }
@@ -129,7 +129,12 @@ pub fn alloc_numa_aligned(size: usize, alignment: usize, node_id: usize) -> Opti
 
 /// Linux kernel constants for memory policy (not exposed by all libc
 /// versions, so we define them here).
+///
+/// The full `MPOL_*` mode set is reproduced for ABI fidelity even though
+/// `mbind_to_node` only uses `MPOL_BIND`; the unused modes document the kernel
+/// enum and keep the constants available if other policies are wired in later.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 mod linux_mpol {
     pub const MPOL_DEFAULT: libc::c_int = 0;
     pub const MPOL_PREFERRED: libc::c_int = 1;
@@ -173,10 +178,6 @@ fn mbind_to_node(ptr: *mut u8, size: usize, node_id: usize) -> bool {
         )
     };
     res == 0
-}
-
-fn align_up(addr: usize, align: usize) -> usize {
-    (addr + align - 1) & !(align - 1)
 }
 
 #[cfg(test)]

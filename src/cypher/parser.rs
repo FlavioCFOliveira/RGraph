@@ -15,6 +15,20 @@ use crate::error::RGraphError;
 use std::collections::HashMap;
 use text_size::{TextRange, TextSize};
 
+/// The trailing `ORDER BY` / `SKIP` / `LIMIT` of a projection clause.
+type OrderSkipLimit = (Vec<OrderItem>, Option<Expression>, Option<Expression>);
+
+/// The parsed body of a `RETURN` / `WITH` clause:
+/// `(distinct, star, projections, order_by, skip, limit)`.
+type ReturnBody = (
+    bool,
+    bool,
+    Vec<Projection>,
+    Vec<OrderItem>,
+    Option<Expression>,
+    Option<Expression>,
+);
+
 /// Parse error with source location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -528,7 +542,7 @@ impl Parser {
 
     // ── Return / WITH body ─────────────────────────────────────────────────
 
-    fn parse_return_body(&mut self) -> Result<(bool, bool, Vec<Projection>, Vec<OrderItem>, Option<Expression>, Option<Expression>), ParseError> {
+    fn parse_return_body(&mut self) -> Result<ReturnBody, ParseError> {
         let distinct = if matches!(self.peek(), Token::Distinct) {
             self.advance();
             true
@@ -548,7 +562,7 @@ impl Parser {
         Ok((distinct, false, projections, order_by, skip, limit))
     }
 
-    fn parse_order_skip_limit(&mut self) -> Result<(Vec<OrderItem>, Option<Expression>, Option<Expression>), ParseError> {
+    fn parse_order_skip_limit(&mut self) -> Result<OrderSkipLimit, ParseError> {
         let mut order_by = Vec::new();
         let mut skip = None;
         let mut limit = None;
@@ -768,16 +782,11 @@ impl Parser {
         let node = self.parse_node_pattern()?;
         elements.push(PatternElement::Node(node));
 
-        loop {
-            match self.peek() {
-                Token::Dash | Token::LArrow => {
-                    let rel = self.parse_relationship_pattern()?;
-                    elements.push(PatternElement::Relationship(rel));
-                    let node = self.parse_node_pattern()?;
-                    elements.push(PatternElement::Node(node));
-                }
-                _ => break,
-            }
+        while matches!(self.peek(), Token::Dash | Token::LArrow) {
+            let rel = self.parse_relationship_pattern()?;
+            elements.push(PatternElement::Relationship(rel));
+            let node = self.parse_node_pattern()?;
+            elements.push(PatternElement::Node(node));
         }
 
         let end = self.peek_span().start();
@@ -996,11 +1005,7 @@ impl Parser {
         let expr_start = self.peek_span().start();
         let mut lhs = self.parse_unary()?;
 
-        loop {
-            let op = match self.current_infix_op() {
-                Some(op) => op,
-                None => break,
-            };
+        while let Some(op) = self.current_infix_op() {
             let (lbp, rbp) = infix_binding_power(&op);
             if lbp < min_bp { break; }
 
@@ -1065,7 +1070,6 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expression, ParseError> {
-        let start = self.peek_span().start();
         match self.peek().clone() {
             // ── Literals ──
             Token::NullKw => { self.advance(); Ok(Expression::Literal(Literal::Null)) }
@@ -1096,23 +1100,15 @@ impl Parser {
                 self.advance();
                 Ok(Expression::Wildcard)
             }
-            // ── Identifier-based primaries ──
-            Token::Ident(_) => self.parse_ident_primary(),
-            // ── Keywords that can be used as function names ──
             Token::Case => self.parse_case_expression(),
-            Token::Ident(s) if s.eq_ignore_ascii_case("REDUCE") => {
-                self.advance();
-                self.parse_reduce_expression(start)
-            }
-            Token::Ident(s) if s.eq_ignore_ascii_case("ALL") => self.parse_quantifier(QuantifierKind::All),
-            Token::Ident(s) if s.eq_ignore_ascii_case("ANY") => self.parse_quantifier(QuantifierKind::Any),
-            Token::Ident(s) if s.eq_ignore_ascii_case("NONE") => self.parse_quantifier(QuantifierKind::None),
-            Token::Ident(s) if s.eq_ignore_ascii_case("SINGLE") => self.parse_quantifier(QuantifierKind::Single),
-            Token::Ident(s) if s.eq_ignore_ascii_case("EXISTS") => self.parse_exists(start),
-            Token::Ident(s) if s.eq_ignore_ascii_case("shortestPath")
-                || s.eq_ignore_ascii_case("allShortestPaths") => {
-                self.parse_ident_primary()
-            }
+            // ── Identifier-based primaries ──
+            //
+            // Every identifier (including the keyword-like names REDUCE, ALL,
+            // ANY, NONE, SINGLE, EXISTS, shortestPath, allShortestPaths) is
+            // routed through `parse_ident_primary`, which dispatches on the
+            // identifier text. Keeping a single `Token::Ident` arm avoids the
+            // unreachable guarded arms that a catch-all would otherwise shadow.
+            Token::Ident(_) => self.parse_ident_primary(),
             other => Err(self.error(&format!("unexpected token in expression: {:?}", other))),
         }
     }
@@ -1468,10 +1464,10 @@ impl Parser {
             // the regex operator by recognising `=` followed by Error("~").
             Token::Error(s) if s == "~" => {
                 // peek-1 should be `=`.
-                if self.pos > 0 {
-                    if matches!(&self.tokens[self.pos - 1].token, Token::Eq) {
-                        // Already consumed `=`; we need to detect this differently.
-                    }
+                if self.pos > 0
+                    && matches!(&self.tokens[self.pos - 1].token, Token::Eq)
+                {
+                    // Already consumed `=`; we need to detect this differently.
                 }
                 None
             }

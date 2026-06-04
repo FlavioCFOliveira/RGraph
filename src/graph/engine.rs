@@ -475,42 +475,42 @@ impl GraphStorageEngine {
                 };
 
                 // Try to decode as NodeRecord (32 bytes).
-                if bytes.len() == NodeRecord::SIZE {
-                    if let Some(node) = NodeRecord::decode(bytes).filter(|n| n.node_id != 0) {
-                        // Seed the id allocator regardless of deletion state.
-                        self.id_allocator.observe(node.node_id);
-                        page_has_nodes = true;
-                        if node.flags & node_flags::DELETED == 0 {
-                            let slot_ref = SlotRef::new(page_id as u32, slot_idx as u8);
-                            let value = slot_ref.raw.to_be_bytes().to_vec();
-                            let _ = self
-                                .node_index
-                                .insert(&node_id_key(node.node_id as u128), &value);
-                            let _ = self.label_index.insert(
-                                &label_index_key(node.label_id as u64, node.node_id as u128),
-                                &value,
-                            );
-                        }
+                if bytes.len() == NodeRecord::SIZE
+                    && let Some(node) = NodeRecord::decode(bytes).filter(|n| n.node_id != 0)
+                {
+                    // Seed the id allocator regardless of deletion state.
+                    self.id_allocator.observe(node.node_id);
+                    page_has_nodes = true;
+                    if node.flags & node_flags::DELETED == 0 {
+                        let slot_ref = SlotRef::new(page_id as u32, slot_idx as u8);
+                        let value = slot_ref.raw.to_be_bytes().to_vec();
+                        let _ = self
+                            .node_index
+                            .insert(&node_id_key(node.node_id as u128), &value);
+                        let _ = self.label_index.insert(
+                            &label_index_key(node.label_id as u64, node.node_id as u128),
+                            &value,
+                        );
                     }
                 }
 
                 // Try to decode as EdgeRecord (64 bytes).
-                if bytes.len() == EdgeRecord::SIZE {
-                    if let Some(edge) = EdgeRecord::decode(bytes).filter(|e| e.edge_id != 0) {
-                        // Seed the id allocator regardless of deletion state.
-                        self.id_allocator.observe(edge.edge_id);
-                        page_has_edges = true;
-                        if edge.flags & edge_flags::DELETED == 0 {
-                            let slot_ref = SlotRef::new(page_id as u32, slot_idx as u8);
-                            let value = slot_ref.raw.to_be_bytes().to_vec();
-                            let _ = self
-                                .edge_index
-                                .insert(&edge_id_key(edge.edge_id as u128), &value);
-                            let _ = self.type_index.insert(
-                                &type_index_key(edge.type_id as u64, edge.edge_id as u128),
-                                &value,
-                            );
-                        }
+                if bytes.len() == EdgeRecord::SIZE
+                    && let Some(edge) = EdgeRecord::decode(bytes).filter(|e| e.edge_id != 0)
+                {
+                    // Seed the id allocator regardless of deletion state.
+                    self.id_allocator.observe(edge.edge_id);
+                    page_has_edges = true;
+                    if edge.flags & edge_flags::DELETED == 0 {
+                        let slot_ref = SlotRef::new(page_id as u32, slot_idx as u8);
+                        let value = slot_ref.raw.to_be_bytes().to_vec();
+                        let _ = self
+                            .edge_index
+                            .insert(&edge_id_key(edge.edge_id as u128), &value);
+                        let _ = self.type_index.insert(
+                            &type_index_key(edge.type_id as u64, edge.edge_id as u128),
+                            &value,
+                        );
                     }
                 }
             }
@@ -1098,10 +1098,10 @@ impl GraphStorageEngine {
         for (_key, value) in entries {
             let slot_ref = decode_slot_ref(&value).ok_or(StorageError::IndexError)?;
             let record = Self::read_record(&self.page_manager, slot_ref, fs)?;
-            if let Some(node) = record.and_then(|b| NodeRecord::decode(&b)) {
-                if node.flags & node_flags::DELETED == 0 {
-                    results.push(node);
-                }
+            if let Some(node) = record.and_then(|b| NodeRecord::decode(&b))
+                && node.flags & node_flags::DELETED == 0
+            {
+                results.push(node);
             }
         }
         Ok(results)
@@ -1119,10 +1119,10 @@ impl GraphStorageEngine {
         for (_key, value) in entries {
             let slot_ref = decode_slot_ref(&value).ok_or(StorageError::IndexError)?;
             let record = Self::read_record(&self.page_manager, slot_ref, fs)?;
-            if let Some(edge) = record.and_then(|b| EdgeRecord::decode(&b)) {
-                if edge.flags & edge_flags::DELETED == 0 {
-                    results.push(edge);
-                }
+            if let Some(edge) = record.and_then(|b| EdgeRecord::decode(&b))
+                && edge.flags & edge_flags::DELETED == 0
+            {
+                results.push(edge);
             }
         }
         Ok(results)
@@ -1469,12 +1469,12 @@ impl GraphStorageEngine {
         let mut results = Vec::with_capacity(entries.len());
         for (_key, value) in entries {
             let slot_ref = decode_slot_ref(&value).ok_or(StorageError::IndexError)?;
-            if let Some(record) = Self::read_record(&self.page_manager, slot_ref, fs)? {
-                if let Some(node) = NodeRecord::decode(&record) {
-                    if node.node_id != 0 && node.flags & node_flags::DELETED == 0 {
-                        results.push(node);
-                    }
-                }
+            if let Some(record) = Self::read_record(&self.page_manager, slot_ref, fs)?
+                && let Some(node) = NodeRecord::decode(&record)
+                && node.node_id != 0
+                && node.flags & node_flags::DELETED == 0
+            {
+                results.push(node);
             }
         }
         Ok(results)
@@ -1499,12 +1499,12 @@ impl GraphStorageEngine {
         let mut results = Vec::with_capacity(entries.len());
         for (_key, value) in entries {
             let slot_ref = decode_slot_ref(&value).ok_or(StorageError::IndexError)?;
-            if let Some(record) = Self::read_record(&self.page_manager, slot_ref, fs)? {
-                if let Some(edge) = EdgeRecord::decode(&record) {
-                    if edge.edge_id != 0 && edge.flags & edge_flags::DELETED == 0 {
-                        results.push(edge);
-                    }
-                }
+            if let Some(record) = Self::read_record(&self.page_manager, slot_ref, fs)?
+                && let Some(edge) = EdgeRecord::decode(&record)
+                && edge.edge_id != 0
+                && edge.flags & edge_flags::DELETED == 0
+            {
+                results.push(edge);
             }
         }
         Ok(results)
