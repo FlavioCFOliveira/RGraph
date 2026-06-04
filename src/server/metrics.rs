@@ -5,14 +5,22 @@
 //! both read from the same [`MetricsCollector`] instance.
 
 use prometheus::{
-    gather, histogram_opts, opts, Counter, Gauge, Histogram, TextEncoder,
+    histogram_opts, opts, Counter, Gauge, Histogram, Registry, TextEncoder,
 };
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Central collector for all server metrics.
+///
+/// Every metric handle is registered with a **dedicated, per-server**
+/// [`Registry`] (see [`MetricsCollector::registry`]) rather than the
+/// process-global default registry.  This keeps multiple in-process server
+/// instances (and tests) isolated from one another and avoids the
+/// "already registered" failures that the shared default registry produces.
 pub struct MetricsCollector {
+    /// The per-server Prometheus registry that owns all the metrics below.
+    registry: Registry,
     /// Total number of queries executed.
     pub queries_total: Counter,
     /// Total number of failed queries.
@@ -21,66 +29,158 @@ pub struct MetricsCollector {
     pub query_latency: Histogram,
     /// Number of active connections.
     pub active_connections: Gauge,
-    /// Total number of transactions.
+    /// Total number of connections opened over the server's lifetime.
+    pub connections_opened: Counter,
+    /// Total number of connections closed over the server's lifetime.
+    pub connections_closed: Counter,
+    /// Total number of transactions begun.
     pub transactions_total: Counter,
+    /// Total number of transactions committed.
+    pub transactions_committed: Counter,
+    /// Total number of transactions aborted (rollback or conflict).
+    pub transactions_aborted: Counter,
+    /// Total buffer-pool cache hits.
+    pub cache_hits: Counter,
+    /// Total buffer-pool cache misses.
+    pub cache_misses: Counter,
     /// Buffer-pool hit rate (0.0–1.0).
     pub cache_hit_rate: Gauge,
 }
 
 impl MetricsCollector {
-    /// Create a new collector and register all metrics with the global registry.
+    /// Create a new collector backed by a fresh per-server [`Registry`].
     pub fn new() -> Arc<Self> {
+        let registry = Registry::new();
+
         let queries_total = Counter::with_opts(opts!(
             "rgraph_queries_total",
             "Total number of Cypher queries received"
         ))
-        .expect("metric construction");
-        let _ = prometheus::register(Box::new(queries_total.clone()));
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(queries_total.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
 
         let queries_failed = Counter::with_opts(opts!(
             "rgraph_queries_failed_total",
             "Total number of Cypher queries that returned an error"
         ))
-        .expect("metric construction");
-        let _ = prometheus::register(Box::new(queries_failed.clone()));
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(queries_failed.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
 
         let query_latency = Histogram::with_opts(histogram_opts!(
             "rgraph_query_latency_seconds",
             "Query execution latency",
             vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
         ))
-        .expect("metric construction");
-        let _ = prometheus::register(Box::new(query_latency.clone()));
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(query_latency.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
 
         let active_connections = Gauge::with_opts(opts!(
             "rgraph_active_connections",
             "Number of currently open client connections"
         ))
-        .expect("metric construction");
-        let _ = prometheus::register(Box::new(active_connections.clone()));
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(active_connections.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
+
+        let connections_opened = Counter::with_opts(opts!(
+            "rgraph_connections_opened_total",
+            "Total number of client connections accepted"
+        ))
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(connections_opened.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
+
+        let connections_closed = Counter::with_opts(opts!(
+            "rgraph_connections_closed_total",
+            "Total number of client connections closed"
+        ))
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(connections_closed.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
 
         let transactions_total = Counter::with_opts(opts!(
             "rgraph_transactions_total",
             "Total number of transactions begun"
         ))
-        .expect("metric construction");
-        let _ = prometheus::register(Box::new(transactions_total.clone()));
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(transactions_total.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
+
+        let transactions_committed = Counter::with_opts(opts!(
+            "rgraph_transactions_committed_total",
+            "Total number of transactions committed"
+        ))
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(transactions_committed.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
+
+        let transactions_aborted = Counter::with_opts(opts!(
+            "rgraph_transactions_aborted_total",
+            "Total number of transactions aborted (rollback or conflict)"
+        ))
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(transactions_aborted.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
+
+        let cache_hits = Counter::with_opts(opts!(
+            "rgraph_cache_hits_total",
+            "Total number of buffer-pool cache hits"
+        ))
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(cache_hits.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
+
+        let cache_misses = Counter::with_opts(opts!(
+            "rgraph_cache_misses_total",
+            "Total number of buffer-pool cache misses"
+        ))
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(cache_misses.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
 
         let cache_hit_rate = Gauge::with_opts(opts!(
             "rgraph_cache_hit_rate",
             "Buffer pool cache hit rate (0.0–1.0)"
         ))
-        .expect("metric construction");
-        let _ = prometheus::register(Box::new(cache_hit_rate.clone()));
+        .expect("INVARIANT: static metric opts are valid");
+        registry
+            .register(Box::new(cache_hit_rate.clone()))
+            .expect("INVARIANT: fresh registry has no name collisions");
 
         Arc::new(Self {
+            registry,
             queries_total,
             queries_failed,
             query_latency,
             active_connections,
+            connections_opened,
+            connections_closed,
             transactions_total,
+            transactions_committed,
+            transactions_aborted,
+            cache_hits,
+            cache_misses,
             cache_hit_rate,
         })
+    }
+
+    /// Borrow the per-server registry (e.g. to gather or expose it elsewhere).
+    pub fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     /// Record a query latency observation.
@@ -94,6 +194,33 @@ impl MetricsCollector {
     /// Record a failed query.
     pub fn observe_query_failed(&self) {
         self.queries_failed.inc();
+    }
+
+    /// Record that a transaction was begun.
+    pub fn observe_transaction_begun(&self) {
+        self.transactions_total.inc();
+    }
+
+    /// Record that a transaction committed successfully.
+    pub fn observe_transaction_committed(&self) {
+        self.transactions_committed.inc();
+    }
+
+    /// Record that a transaction aborted (explicit rollback or conflict).
+    pub fn observe_transaction_aborted(&self) {
+        self.transactions_aborted.inc();
+    }
+
+    /// Record that a client connection was opened.
+    pub fn observe_connection_opened(&self) {
+        self.connections_opened.inc();
+        self.active_connections.inc();
+    }
+
+    /// Record that a client connection was closed.
+    pub fn observe_connection_closed(&self) {
+        self.connections_closed.inc();
+        self.active_connections.dec();
     }
 
     /// Update the active connection gauge.
@@ -112,33 +239,54 @@ impl MetricsCollector {
         self.cache_hit_rate.set(rate.clamp(0.0, 1.0));
     }
 
-    /// Render all metrics in Prometheus text exposition format.
-    pub fn render_prometheus(&self) -> String {
+    /// Record the absolute buffer-pool hit/miss counts and refresh the derived
+    /// hit-rate gauge.
+    ///
+    /// The supplied totals are cumulative since pool creation; the counters are
+    /// advanced by the delta against their current value so repeated calls do
+    /// not double-count.
+    pub fn record_cache_stats(&self, total_hits: u64, total_misses: u64) {
+        let prev_hits = self.cache_hits.get() as u64;
+        let prev_misses = self.cache_misses.get() as u64;
+        if total_hits > prev_hits {
+            self.cache_hits.inc_by((total_hits - prev_hits) as f64);
+        }
+        if total_misses > prev_misses {
+            self.cache_misses.inc_by((total_misses - prev_misses) as f64);
+        }
+        let total = total_hits + total_misses;
+        if total > 0 {
+            self.cache_hit_rate
+                .set((total_hits as f64 / total as f64).clamp(0.0, 1.0));
+        }
+    }
+
+    /// Render all metrics in Prometheus text exposition format from this
+    /// server's dedicated registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`std::fmt::Error`] if encoding fails (this is effectively
+    /// unreachable for in-memory string encoding but is propagated rather than
+    /// panicked to keep the serving path panic-free).
+    pub fn render_prometheus(&self) -> Result<String, std::fmt::Error> {
         let encoder = TextEncoder::new();
-        let families = gather();
+        let families = self.registry.gather();
         let mut buffer = String::new();
-        encoder.encode_utf8(&families, &mut buffer).unwrap();
-        buffer
+        encoder
+            .encode_utf8(&families, &mut buffer)
+            .map_err(|_| std::fmt::Error)?;
+        Ok(buffer)
     }
 }
 
 impl Default for MetricsCollector {
     fn default() -> Self {
-        // Used only for tests; the real instance is created via `Arc::new(MetricsCollector::new())`.
-        let queries_total = Counter::with_opts(opts!("test_queries", "test")).unwrap();
-        let queries_failed = Counter::with_opts(opts!("test_failed", "test")).unwrap();
-        let query_latency = Histogram::with_opts(histogram_opts!("test_latency", "test", vec![])).unwrap();
-        let active_connections = Gauge::with_opts(opts!("test_conns", "test")).unwrap();
-        let transactions_total = Counter::with_opts(opts!("test_txns", "test")).unwrap();
-        let cache_hit_rate = Gauge::with_opts(opts!("test_cache", "test")).unwrap();
-        Self {
-            queries_total,
-            queries_failed,
-            query_latency,
-            active_connections,
-            transactions_total,
-            cache_hit_rate,
-        }
+        // Build a standalone collector with its own registry, then unwrap the
+        // Arc so callers that want an owned value (mostly tests) can have one.
+        Arc::try_unwrap(MetricsCollector::new())
+            .map_err(|_| ())
+            .expect("INVARIANT: freshly created Arc has a unique owner")
     }
 }
 
@@ -167,15 +315,21 @@ impl HealthService {
 }
 
 /// HTTP handler that serves `/metrics` in Prometheus text format.
+///
+/// Prefer [`MetricsCollector::render_prometheus`] for the per-server registry;
+/// this helper renders the process-global default registry and is retained for
+/// any non-server metrics that may still register there.
 pub struct MetricsExporter;
 
 impl MetricsExporter {
     /// Render the global Prometheus registry as a UTF-8 string.
+    ///
+    /// Returns an empty string if encoding fails rather than panicking.
     pub fn export() -> String {
         let encoder = TextEncoder::new();
-        let families = gather();
+        let families = prometheus::gather();
         let mut buffer = String::new();
-        encoder.encode_utf8(&families, &mut buffer).unwrap();
+        let _ = encoder.encode_utf8(&families, &mut buffer);
         buffer
     }
 }

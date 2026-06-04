@@ -1,20 +1,21 @@
-//! gRPC service handlers (Task 51).
+//! gRPC service handlers.
 //!
-//! Implements `CypherQuery`, `TransactionManager`
-//! and `Health` services using [`tonic`].
+//! Implements the `CypherQuery`, `TransactionManager` and `Health` services
+//! using [`tonic`].
 //!
-//! The query evaluator is intentionally minimal: it handles `RETURN` with
-//! literals and arithmetic so that the acceptance criterion "a basic query
-/// RPC executes a RETURN statement end-to-end" is satisfied.  Full execution
-/// (MATCH, CREATE, etc.) depends on Sprint 21 (Query Execution Engine).
+//! `CypherQuery::Execute` routes each request through the full Sprint C query
+//! pipeline (parse → semantic analyse → plan → physical execute) against the
+//! shared graph engine.  `TransactionManager` is backed by the engine's MVCC
+//! [`TransactionManager`](crate::txn::manager::TransactionManager): `Begin`
+//! allocates a real snapshot-bearing transaction tracked server-side by its
+//! `tx_id`, and `Commit`/`Rollback` finalise it through the engine's WAL.
 
-use crate::cypher::ast::{
-    BinaryOperator, Clause, ComparisonOperator, Expression, Literal, Statement, UnaryOperator,
-};
-use crate::cypher::parser::parse;
+use crate::cypher::value::Value as CypherValue;
+use crate::graph::property::OrderedF64;
 use crate::error::RGraphError;
-use crate::server::storage::AsyncGraphEngine;
+use crate::server::storage::{AsyncGraphEngine, CypherResult};
 use crate::server::metrics::MetricsCollector;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, warn};
@@ -32,6 +33,123 @@ use proto::{
 };
 
 // ------------------------------------------------------------------
+// Error mapping: RGraphError → gRPC error payloads
+// ------------------------------------------------------------------
+
+/// A short, stable machine-readable label for an [`RGraphError`] variant,
+/// embedded in [`ErrorPayload::code`] so clients can branch on the class of
+/// failure without parsing the human-readable message.
+fn error_code_label(e: &RGraphError) -> &'static str {
+    match e {
+        RGraphError::Syntax(_) => "SYNTAX",
+        RGraphError::Semantic(_) => "SEMANTIC",
+        RGraphError::Type(_) => "TYPE",
+        RGraphError::Argument(_) => "ARGUMENT",
+        RGraphError::NotFound(_) => "NOT_FOUND",
+        RGraphError::AlreadyExists(_) => "ALREADY_EXISTS",
+        RGraphError::Io(_) => "IO",
+        RGraphError::Corruption(_) => "CORRUPTION",
+        RGraphError::Index(_) => "INDEX",
+        RGraphError::Storage(_) => "STORAGE",
+        RGraphError::Transaction(_) => "TRANSACTION",
+        RGraphError::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
+        RGraphError::Internal(_) => "INTERNAL",
+    }
+}
+
+// ------------------------------------------------------------------
+// Value conversion: Cypher Value <-> proto Value
+// ------------------------------------------------------------------
+
+/// Convert a runtime Cypher [`CypherValue`] into the wire [`ProtoValue`].
+fn cypher_to_proto(value: CypherValue) -> ProtoValue {
+    use proto::value::Kind;
+    let kind = match value {
+        CypherValue::Null => Kind::Null(proto::Null {}),
+        CypherValue::Boolean(b) => Kind::Boolean(b),
+        CypherValue::Integer(i) => Kind::Integer(i),
+        CypherValue::Float(f) => Kind::Float(f.0),
+        CypherValue::String(s) => Kind::String(s),
+        CypherValue::List(items) => Kind::List(proto::ListValue {
+            values: items.into_iter().map(cypher_to_proto).collect(),
+        }),
+        CypherValue::Map(entries) => Kind::Map(proto::MapValue {
+            entries: entries
+                .into_iter()
+                .map(|(k, v)| (k, cypher_to_proto(v)))
+                .collect(),
+        }),
+        CypherValue::Node(node) => Kind::Node(proto::NodeValue {
+            node_id: node.id,
+            label: node.labels.first().cloned().unwrap_or_default(),
+            properties: node
+                .properties
+                .into_iter()
+                .map(|(k, v)| (k, cypher_to_proto(v)))
+                .collect(),
+        }),
+        CypherValue::Relationship(rel) => Kind::Relationship(proto::RelationshipValue {
+            edge_id: rel.id,
+            rel_type: rel.rel_type,
+            source_id: rel.source_id,
+            target_id: rel.target_id,
+            properties: rel
+                .properties
+                .into_iter()
+                .map(|(k, v)| (k, cypher_to_proto(v)))
+                .collect(),
+        }),
+        // Paths and points have no dedicated wire representation yet; render
+        // them as their textual form so the result is still observable.
+        other => Kind::String(other.to_string()),
+    };
+    ProtoValue { kind: Some(kind) }
+}
+
+/// Convert a wire [`ProtoValue`] into a runtime Cypher [`CypherValue`].
+///
+/// Used to translate the `parameters` map that accompanies a query request.
+/// Node/relationship wire values are not valid query parameters and map to
+/// [`CypherValue::Null`].
+fn proto_to_cypher(value: ProtoValue) -> CypherValue {
+    use proto::value::Kind;
+    match value.kind {
+        None | Some(Kind::Null(_)) => CypherValue::Null,
+        Some(Kind::Boolean(b)) => CypherValue::Boolean(b),
+        Some(Kind::Integer(i)) => CypherValue::Integer(i),
+        Some(Kind::Float(f)) => CypherValue::Float(OrderedF64(f)),
+        Some(Kind::String(s)) => CypherValue::String(s),
+        Some(Kind::Bytes(b)) => {
+            // No first-class byte value; expose as a string of the UTF-8 lossy form.
+            CypherValue::String(String::from_utf8_lossy(&b).into_owned())
+        }
+        Some(Kind::List(list)) => {
+            CypherValue::List(list.values.into_iter().map(proto_to_cypher).collect())
+        }
+        Some(Kind::Map(map)) => CypherValue::Map(
+            map.entries
+                .into_iter()
+                .map(|(k, v)| (k, proto_to_cypher(v)))
+                .collect(),
+        ),
+        Some(Kind::Node(_)) | Some(Kind::Relationship(_)) => CypherValue::Null,
+    }
+}
+
+/// Convert a [`CypherResult`] into a wire [`ResultSet`].
+fn result_to_proto(result: CypherResult) -> ResultSet {
+    let columns = result.columns;
+    let rows = result
+        .rows
+        .into_iter()
+        .map(|row| Row {
+            values: row.into_iter().map(cypher_to_proto).collect(),
+        })
+        .collect();
+    ResultSet { columns, rows }
+}
+
+// ------------------------------------------------------------------
 // Cypher query service
 // ------------------------------------------------------------------
 
@@ -43,239 +161,6 @@ pub struct CypherQueryService {
 impl CypherQueryService {
     pub fn new(engine: Arc<dyn AsyncGraphEngine>, metrics: Arc<MetricsCollector>) -> Self {
         Self { engine, metrics }
-    }
-
-    /// Minimal evaluator for `RETURN` statements with literals and arithmetic.
-    fn evaluate_return(statement: &Statement) -> Result<ResultSet, RGraphError> {
-        let mut columns = Vec::new();
-        let mut row_values = Vec::new();
-
-        for clause in &statement.clauses {
-            if let Clause::Return(ret) = clause {
-                for proj in &ret.projections {
-                    columns.push(proj.alias.clone().unwrap_or_else(|| "column".into()));
-                    let val = Self::eval_expression(&proj.expression)?;
-                    row_values.push(val);
-                }
-            }
-        }
-
-        let row = Row { values: row_values };
-        Ok(ResultSet {
-            columns,
-            rows: vec![row],
-        })
-    }
-
-    fn eval_expression(expr: &Expression) -> Result<ProtoValue, RGraphError> {
-        match expr {
-            Expression::Literal(Literal::Integer(i)) => Ok(ProtoValue {
-                kind: Some(proto::value::Kind::Integer(*i)),
-            }),
-            Expression::Literal(Literal::String(s)) => Ok(ProtoValue {
-                kind: Some(proto::value::Kind::String(s.clone())),
-            }),
-            Expression::Literal(Literal::Float(f)) => Ok(ProtoValue {
-                kind: Some(proto::value::Kind::Float(*f)),
-            }),
-            Expression::Literal(Literal::Boolean(b)) => Ok(ProtoValue {
-                kind: Some(proto::value::Kind::Boolean(*b)),
-            }),
-            Expression::Literal(Literal::Null) => Ok(ProtoValue {
-                kind: Some(proto::value::Kind::Null(proto::Null {})),
-            }),
-            // Temporal literals — represent as string values.
-            Expression::Literal(Literal::Date(s))
-            | Expression::Literal(Literal::Time(s))
-            | Expression::Literal(Literal::LocalTime(s))
-            | Expression::Literal(Literal::DateTime(s))
-            | Expression::Literal(Literal::LocalDateTime(s))
-            | Expression::Literal(Literal::Duration(s)) => Ok(ProtoValue {
-                kind: Some(proto::value::Kind::String(s.clone())),
-            }),
-            Expression::BinaryOp { op, left, right, .. } => {
-                let lhs = Self::eval_expression(left)?;
-                let rhs = Self::eval_expression(right)?;
-                Self::eval_binary_op(lhs, op, rhs)
-            }
-            Expression::Comparison { op, left, right, .. } => {
-                let lhs = Self::eval_expression(left)?;
-                let rhs = Self::eval_expression(right)?;
-                Self::eval_comparison(lhs, op, rhs)
-            }
-            Expression::UnaryOp { op, expr, .. } => {
-                let val = Self::eval_expression(expr)?;
-                Self::eval_unary_op(op, val)
-            }
-            Expression::Variable(name) => Err(RGraphError::Semantic(format!(
-                "variable '{}' not bound (execution engine not yet implemented)",
-                name
-            ))),
-            Expression::PropertyAccess { base: _, property, .. } => Err(RGraphError::Semantic(format!(
-                "property access .{} not supported (execution engine not yet implemented)",
-                property
-            ))),
-            Expression::List(items) => {
-                let mut values = Vec::new();
-                for item in items {
-                    values.push(Self::eval_expression(item)?);
-                }
-                Ok(ProtoValue {
-                    kind: Some(proto::value::Kind::List(proto::ListValue { values })),
-                })
-            }
-            Expression::Map(entries) => {
-                let mut map = std::collections::HashMap::new();
-                for (k, v) in entries {
-                    map.insert(k.clone(), Self::eval_expression(v)?);
-                }
-                Ok(ProtoValue {
-                    kind: Some(proto::value::Kind::Map(proto::MapValue { entries: map })),
-                })
-            }
-            Expression::IsNull(_) | Expression::IsNotNull(_) => Err(RGraphError::Semantic(
-                "IS NULL / IS NOT NULL not yet implemented".into(),
-            )),
-            Expression::Wildcard => Err(RGraphError::Semantic(
-                "Wildcard * not yet implemented in gRPC evaluator".into(),
-            )),
-            Expression::And { .. }
-            | Expression::Or { .. }
-            | Expression::Xor { .. }
-            | Expression::StartsWith { .. }
-            | Expression::EndsWith { .. }
-            | Expression::Contains { .. }
-            | Expression::In { .. }
-            | Expression::Regex { .. } => Err(RGraphError::Semantic(
-                "Logical and string operators not yet implemented in gRPC evaluator".into(),
-            )),
-            Expression::FunctionCall { .. } => Err(RGraphError::Semantic(
-                "Function calls not yet implemented in gRPC evaluator".into(),
-            )),
-            // New expression types — return informative errors.
-            Expression::Not { .. }
-            | Expression::Case { .. }
-            | Expression::ListComprehension { .. }
-            | Expression::PatternComprehension { .. }
-            | Expression::Reduce { .. }
-            | Expression::Quantifier { .. }
-            | Expression::Exists { .. } => Err(RGraphError::Semantic(
-                "Complex expressions not yet supported in gRPC evaluator".into(),
-            )),
-            Expression::Parameter(name) => Err(RGraphError::Semantic(format!(
-                "parameter '${name}' not supported in gRPC evaluator (no parameter map)"
-            ))),
-            Expression::DynamicPropertyAccess { .. } => Err(RGraphError::Semantic(
-                "dynamic property access not yet supported in gRPC evaluator".into(),
-            )),
-            Expression::Slice { .. } => Err(RGraphError::Semantic(
-                "slice expressions not yet supported in gRPC evaluator".into(),
-            )),
-        }
-    }
-
-    fn eval_binary_op(
-        lhs: ProtoValue,
-        op: &BinaryOperator,
-        rhs: ProtoValue,
-    ) -> Result<ProtoValue, RGraphError> {
-        use proto::value::Kind;
-        let l = lhs.kind.ok_or_else(|| RGraphError::Type("empty lhs".into()))?;
-        let r = rhs.kind.ok_or_else(|| RGraphError::Type("empty rhs".into()))?;
-
-        match (l, r) {
-            (Kind::Integer(a), Kind::Integer(b)) => {
-                let res = match op {
-                    BinaryOperator::Add | BinaryOperator::Concat => a + b,
-                    BinaryOperator::Sub => a - b,
-                    BinaryOperator::Mul => a * b,
-                    BinaryOperator::Div => a / b,
-                    BinaryOperator::Mod => a % b,
-                    BinaryOperator::Pow => a.pow(b as u32),
-                };
-                Ok(ProtoValue { kind: Some(Kind::Integer(res)) })
-            }
-            (Kind::Float(a), Kind::Float(b)) => {
-                let res = match op {
-                    BinaryOperator::Add => a + b,
-                    BinaryOperator::Sub => a - b,
-                    BinaryOperator::Mul => a * b,
-                    BinaryOperator::Div => a / b,
-                    _ => return Err(RGraphError::Type("unsupported float op".into())),
-                };
-                Ok(ProtoValue { kind: Some(Kind::Float(res)) })
-            }
-            (Kind::String(a), Kind::String(b)) => {
-                let res = match op {
-                    BinaryOperator::Add => format!("{}{}", a, b),
-                    _ => return Err(RGraphError::Type("unsupported string op".into())),
-                };
-                Ok(ProtoValue { kind: Some(Kind::String(res)) })
-            }
-            _ => Err(RGraphError::Type(format!(
-                "type mismatch in binary expression"
-            ))),
-        }
-    }
-
-    fn eval_comparison(
-        lhs: ProtoValue,
-        op: &ComparisonOperator,
-        rhs: ProtoValue,
-    ) -> Result<ProtoValue, RGraphError> {
-        use proto::value::Kind;
-        let l = lhs.kind.ok_or_else(|| RGraphError::Type("empty lhs".into()))?;
-        let r = rhs.kind.ok_or_else(|| RGraphError::Type("empty rhs".into()))?;
-
-        let res = match (l, r) {
-            (Kind::Integer(a), Kind::Integer(b)) => match op {
-                ComparisonOperator::Eq => a == b,
-                ComparisonOperator::Ne => a != b,
-                ComparisonOperator::Lt => a < b,
-                ComparisonOperator::Le => a <= b,
-                ComparisonOperator::Gt => a > b,
-                ComparisonOperator::Ge => a >= b,
-            },
-            (Kind::Float(a), Kind::Float(b)) => match op {
-                ComparisonOperator::Eq => a == b,
-                ComparisonOperator::Ne => a != b,
-                ComparisonOperator::Lt => a < b,
-                ComparisonOperator::Le => a <= b,
-                ComparisonOperator::Gt => a > b,
-                ComparisonOperator::Ge => a >= b,
-            },
-            (Kind::String(a), Kind::String(b)) => match op {
-                ComparisonOperator::Eq => a == b,
-                ComparisonOperator::Ne => a != b,
-                _ => return Err(RGraphError::Type("unsupported string comparison".into())),
-            },
-            (Kind::Boolean(a), Kind::Boolean(b)) => match op {
-                ComparisonOperator::Eq => a == b,
-                ComparisonOperator::Ne => a != b,
-                _ => return Err(RGraphError::Type("unsupported bool comparison".into())),
-            },
-            _ => return Err(RGraphError::Type("type mismatch in comparison".into())),
-        };
-        Ok(ProtoValue {
-            kind: Some(Kind::Boolean(res)),
-        })
-    }
-
-    fn eval_unary_op(op: &UnaryOperator, val: ProtoValue) -> Result<ProtoValue, RGraphError> {
-        use proto::value::Kind;
-        let v = val.kind.ok_or_else(|| RGraphError::Type("empty operand".into()))?;
-        match (op, v) {
-            (UnaryOperator::Neg, Kind::Integer(i)) => Ok(ProtoValue {
-                kind: Some(Kind::Integer(-i)),
-            }),
-            (UnaryOperator::Neg, Kind::Float(f)) => Ok(ProtoValue {
-                kind: Some(Kind::Float(-f)),
-            }),
-            (UnaryOperator::Not, Kind::Boolean(b)) => Ok(ProtoValue {
-                kind: Some(Kind::Boolean(!b)),
-            }),
-            _ => Err(RGraphError::Type(format!("unsupported unary op: {:?}", op))),
-        }
     }
 }
 
@@ -289,38 +174,32 @@ impl proto::cypher_query_server::CypherQuery for CypherQueryService {
         let start = std::time::Instant::now();
         debug!("execute query: {}", req.query);
 
-        let result = async {
-            let statement = parse(&req.query)?;
+        // Translate the wire parameter map into runtime Cypher values.
+        let parameters: HashMap<String, CypherValue> = req
+            .parameters
+            .into_iter()
+            .map(|(k, v)| (k, proto_to_cypher(v)))
+            .collect();
 
-            // For Sprint 23 we only support RETURN (minimal evaluator).
-            if statement.clauses.iter().any(|c| matches!(c, Clause::Match(_))) {
-                return Err(RGraphError::Semantic(
-                    "MATCH not yet implemented (Sprint 21)".into(),
-                ));
-            }
-            if statement.clauses.iter().any(|c| matches!(c, Clause::Create(_))) {
-                return Err(RGraphError::Semantic(
-                    "CREATE not yet implemented (Sprint 21)".into(),
-                ));
-            }
-
-            let result_set = Self::evaluate_return(&statement)?;
-            Ok(QueryResponse {
-                result: Some(proto::query_response::Result::ResultSet(result_set)),
-            })
-        }
-        .await;
+        // Route through the real Sprint C pipeline against the shared engine.
+        let result = self.engine.execute_cypher(req.query, parameters).await;
 
         let latency = start.elapsed();
         self.metrics.observe_query_latency(latency);
 
         match result {
-            Ok(resp) => Ok(Response::new(resp)),
+            Ok(cypher_result) => {
+                let result_set = result_to_proto(cypher_result);
+                Ok(Response::new(QueryResponse {
+                    result: Some(proto::query_response::Result::ResultSet(result_set)),
+                }))
+            }
             Err(e) => {
                 warn!("query execution failed: {}", e);
+                self.metrics.observe_query_failed();
                 Ok(Response::new(QueryResponse {
                     result: Some(proto::query_response::Result::Error(ErrorPayload {
-                        code: "RGraphError".into(),
+                        code: error_code_label(&e).into(),
                         message: e.to_string(),
                     })),
                 }))
@@ -377,36 +256,98 @@ impl proto::cypher_query_server::CypherQuery for CypherQueryService {
 // Transaction service
 // ------------------------------------------------------------------
 
-pub struct TransactionService;
+/// gRPC transaction service backed by the engine's MVCC
+/// [`TransactionManager`](crate::txn::manager::TransactionManager).
+///
+/// Each `Begin` allocates a real transaction (and snapshot) tracked
+/// server-side by its `tx_id`; `Commit`/`Rollback` finalise it through the
+/// engine's WAL so durability and isolation are honoured.
+pub struct TransactionService {
+    engine: Arc<dyn AsyncGraphEngine>,
+    metrics: Arc<MetricsCollector>,
+}
+
+impl TransactionService {
+    pub fn new(engine: Arc<dyn AsyncGraphEngine>, metrics: Arc<MetricsCollector>) -> Self {
+        Self { engine, metrics }
+    }
+}
 
 #[tonic::async_trait]
 impl proto::transaction_manager_server::TransactionManager for TransactionService {
     async fn begin(
         &self,
-        _request: Request<BeginRequest>,
+        request: Request<BeginRequest>,
     ) -> Result<Response<BeginResponse>, Status> {
-        // Sprint 23: stub — full MVCC integration is part of Sprint 21/22.
-        Ok(Response::new(BeginResponse {
-            result: Some(proto::begin_response::Result::TxId(0)),
-        }))
+        let req = request.into_inner();
+        match self.engine.begin_txn(req.read_only).await {
+            Ok(txid) => {
+                self.metrics.observe_transaction_begun();
+                Ok(Response::new(BeginResponse {
+                    result: Some(proto::begin_response::Result::TxId(txid)),
+                }))
+            }
+            Err(e) => {
+                warn!("begin transaction failed: {}", e);
+                Ok(Response::new(BeginResponse {
+                    result: Some(proto::begin_response::Result::Error(ErrorPayload {
+                        code: error_code_label(&e).into(),
+                        message: e.to_string(),
+                    })),
+                }))
+            }
+        }
     }
 
     async fn commit(
         &self,
-        _request: Request<CommitRequest>,
+        request: Request<CommitRequest>,
     ) -> Result<Response<CommitResponse>, Status> {
-        Ok(Response::new(CommitResponse {
-            result: Some(proto::commit_response::Result::Ok(true)),
-        }))
+        let req = request.into_inner();
+        match self.engine.commit_txn(req.tx_id).await {
+            Ok(()) => {
+                self.metrics.observe_transaction_committed();
+                Ok(Response::new(CommitResponse {
+                    result: Some(proto::commit_response::Result::Ok(true)),
+                }))
+            }
+            Err(RGraphError::NotFound(msg)) => Err(Status::not_found(msg)),
+            Err(e) => {
+                warn!("commit transaction failed: {}", e);
+                self.metrics.observe_transaction_aborted();
+                Ok(Response::new(CommitResponse {
+                    result: Some(proto::commit_response::Result::Error(ErrorPayload {
+                        code: error_code_label(&e).into(),
+                        message: e.to_string(),
+                    })),
+                }))
+            }
+        }
     }
 
     async fn rollback(
         &self,
-        _request: Request<RollbackRequest>,
+        request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
-        Ok(Response::new(RollbackResponse {
-            result: Some(proto::rollback_response::Result::Ok(true)),
-        }))
+        let req = request.into_inner();
+        match self.engine.rollback_txn(req.tx_id).await {
+            Ok(()) => {
+                self.metrics.observe_transaction_aborted();
+                Ok(Response::new(RollbackResponse {
+                    result: Some(proto::rollback_response::Result::Ok(true)),
+                }))
+            }
+            Err(RGraphError::NotFound(msg)) => Err(Status::not_found(msg)),
+            Err(e) => {
+                warn!("rollback transaction failed: {}", e);
+                Ok(Response::new(RollbackResponse {
+                    result: Some(proto::rollback_response::Result::Error(ErrorPayload {
+                        code: error_code_label(&e).into(),
+                        message: e.to_string(),
+                    })),
+                }))
+            }
+        }
     }
 }
 
@@ -414,7 +355,15 @@ impl proto::transaction_manager_server::TransactionManager for TransactionServic
 // Health service
 // ------------------------------------------------------------------
 
-pub struct HealthServiceImpl;
+pub struct HealthServiceImpl {
+    metrics: Arc<MetricsCollector>,
+}
+
+impl HealthServiceImpl {
+    pub fn new(metrics: Arc<MetricsCollector>) -> Self {
+        Self { metrics }
+    }
+}
 
 #[tonic::async_trait]
 impl proto::health_server::Health for HealthServiceImpl {
@@ -438,14 +387,13 @@ impl proto::health_server::Health for HealthServiceImpl {
         &self,
         _request: Request<MetricsRequest>,
     ) -> Result<Response<MetricsResponse>, Status> {
-        
-        let encoder = prometheus::TextEncoder::new();
-        let metric_families = prometheus::gather();
-        let mut buffer = String::new();
-        encoder.encode_utf8(&metric_families, &mut buffer).unwrap();
-        Ok(Response::new(MetricsResponse {
-            prometheus_text: buffer,
-        }))
+        // Render this server's dedicated registry; fall back to an empty body
+        // on the (effectively unreachable) encode failure rather than panicking.
+        let prometheus_text = self
+            .metrics
+            .render_prometheus()
+            .map_err(|e| Status::internal(format!("metrics encode failed: {e}")))?;
+        Ok(Response::new(MetricsResponse { prometheus_text }))
     }
 }
 
@@ -462,12 +410,13 @@ impl GraphGrpcServer {
         metrics: Arc<MetricsCollector>,
     ) -> tonic::transport::server::Router {
         let cypher = proto::cypher_query_server::CypherQueryServer::new(CypherQueryService::new(
-            engine, metrics,
+            engine.clone(),
+            metrics.clone(),
         ));
         let tx = proto::transaction_manager_server::TransactionManagerServer::new(
-            TransactionService,
+            TransactionService::new(engine, metrics.clone()),
         );
-        let health = proto::health_server::HealthServer::new(HealthServiceImpl);
+        let health = proto::health_server::HealthServer::new(HealthServiceImpl::new(metrics));
 
         tonic::transport::Server::builder()
             .add_service(cypher)
@@ -479,49 +428,185 @@ impl GraphGrpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::storage::GraphEngineAdapter;
+    use proto::cypher_query_server::CypherQuery;
+    use proto::transaction_manager_server::TransactionManager as _;
 
-    #[test]
-    fn evaluate_return_literal_integer() {
-        let stmt = parse("RETURN 42").unwrap();
-        let result = CypherQueryService::evaluate_return(&stmt).unwrap();
-        assert_eq!(result.columns, vec!["column"]);
-        assert_eq!(result.rows.len(), 1);
-        assert_eq!(
-            result.rows[0].values[0].kind,
-            Some(proto::value::Kind::Integer(42))
-        );
+    /// Build a [`CypherQueryService`] backed by a fresh on-disk engine.
+    fn cypher_service() -> (tempfile::TempDir, CypherQueryService) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rgraph.db");
+        let engine: Arc<dyn AsyncGraphEngine> =
+            Arc::new(GraphEngineAdapter::init(db).expect("init engine"));
+        let metrics = MetricsCollector::new();
+        (dir, CypherQueryService::new(engine, metrics))
+    }
+
+    fn run_query(svc: &CypherQueryService, query: &str) -> QueryResponse {
+        let resp = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(svc.execute(Request::new(QueryRequest {
+                query: query.to_string(),
+                parameters: HashMap::new(),
+            })))
+            .unwrap();
+        resp.into_inner()
     }
 
     #[test]
-    fn evaluate_return_arithmetic() {
-        let stmt = parse("RETURN 1 + 2 AS sum").unwrap();
-        let result = CypherQueryService::evaluate_return(&stmt).unwrap();
-        assert_eq!(result.columns, vec!["sum"]);
-        assert_eq!(
-            result.rows[0].values[0].kind,
-            Some(proto::value::Kind::Integer(3))
-        );
+    fn execute_return_literal_through_pipeline() {
+        let (_dir, svc) = cypher_service();
+        let resp = run_query(&svc, "RETURN 42 AS answer");
+        match resp.result {
+            Some(proto::query_response::Result::ResultSet(rs)) => {
+                assert_eq!(rs.columns, vec!["answer"]);
+                assert_eq!(rs.rows.len(), 1);
+                assert_eq!(
+                    rs.rows[0].values[0].kind,
+                    Some(proto::value::Kind::Integer(42))
+                );
+            }
+            other => panic!("expected result set, got {other:?}"),
+        }
     }
 
     #[test]
-    fn evaluate_return_string_concat() {
-        let stmt = parse("RETURN 'hello' + 'world' AS greeting").unwrap();
-        let result = CypherQueryService::evaluate_return(&stmt).unwrap();
-        assert_eq!(result.columns, vec!["greeting"]);
-        assert_eq!(
-            result.rows[0].values[0].kind,
-            Some(proto::value::Kind::String("helloworld".into()))
-        );
+    fn execute_match_returns_seeded_rows() {
+        let (_dir, svc) = cypher_service();
+        // Seed three nodes via the real pipeline (CREATE), then MATCH them back.
+        let _ = run_query(&svc, "CREATE (:Person {name: 'Alice'})");
+        let _ = run_query(&svc, "CREATE (:Person {name: 'Bob'})");
+        let _ = run_query(&svc, "CREATE (:Person {name: 'Carol'})");
+
+        let resp = run_query(&svc, "MATCH (n) RETURN n");
+        match resp.result {
+            Some(proto::query_response::Result::ResultSet(rs)) => {
+                assert_eq!(
+                    rs.rows.len(),
+                    3,
+                    "expected 3 seeded nodes, got {}",
+                    rs.rows.len()
+                );
+            }
+            other => panic!("expected result set, got {other:?}"),
+        }
     }
 
     #[test]
-    fn evaluate_return_boolean_comparison() {
-        let stmt = parse("RETURN 1 = 1 AS eq").unwrap();
-        let result = CypherQueryService::evaluate_return(&stmt).unwrap();
-        assert_eq!(result.columns, vec!["eq"]);
-        assert_eq!(
-            result.rows[0].values[0].kind,
-            Some(proto::value::Kind::Boolean(true))
+    fn execute_syntax_error_returns_error_payload() {
+        let (_dir, svc) = cypher_service();
+        let resp = run_query(&svc, "RETURN ((((");
+        match resp.result {
+            Some(proto::query_response::Result::Error(err)) => {
+                assert_eq!(err.code, "SYNTAX");
+            }
+            other => panic!("expected error payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parameters_are_threaded_into_execution() {
+        let (_dir, svc) = cypher_service();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut params = HashMap::new();
+        params.insert(
+            "x".to_string(),
+            ProtoValue {
+                kind: Some(proto::value::Kind::Integer(7)),
+            },
         );
+        let resp = rt
+            .block_on(svc.execute(Request::new(QueryRequest {
+                query: "RETURN $x AS x".to_string(),
+                parameters: params,
+            })))
+            .unwrap()
+            .into_inner();
+        match resp.result {
+            Some(proto::query_response::Result::ResultSet(rs)) => {
+                assert_eq!(
+                    rs.rows[0].values[0].kind,
+                    Some(proto::value::Kind::Integer(7))
+                );
+            }
+            other => panic!("expected result set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transaction_begin_commit_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rgraph.db");
+        let engine: Arc<dyn AsyncGraphEngine> =
+            Arc::new(GraphEngineAdapter::init(db).expect("init engine"));
+        let metrics = MetricsCollector::new();
+        let svc = TransactionService::new(engine, metrics);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // Begin → returns a non-zero tx id.
+        let begin = rt
+            .block_on(svc.begin(Request::new(BeginRequest { read_only: false })))
+            .unwrap()
+            .into_inner();
+        let txid = match begin.result {
+            Some(proto::begin_response::Result::TxId(id)) => id,
+            other => panic!("expected tx id, got {other:?}"),
+        };
+        assert!(txid > 0, "tx id must be non-zero");
+
+        // Commit → ok.
+        let commit = rt
+            .block_on(svc.commit(Request::new(CommitRequest { tx_id: txid })))
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            commit.result,
+            Some(proto::commit_response::Result::Ok(true))
+        ));
+    }
+
+    #[test]
+    fn transaction_rollback_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rgraph.db");
+        let engine: Arc<dyn AsyncGraphEngine> =
+            Arc::new(GraphEngineAdapter::init(db).expect("init engine"));
+        let metrics = MetricsCollector::new();
+        let svc = TransactionService::new(engine, metrics);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let begin = rt
+            .block_on(svc.begin(Request::new(BeginRequest { read_only: false })))
+            .unwrap()
+            .into_inner();
+        let txid = match begin.result {
+            Some(proto::begin_response::Result::TxId(id)) => id,
+            other => panic!("expected tx id, got {other:?}"),
+        };
+
+        let rollback = rt
+            .block_on(svc.rollback(Request::new(RollbackRequest { tx_id: txid })))
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            rollback.result,
+            Some(proto::rollback_response::Result::Ok(true))
+        ));
+    }
+
+    #[test]
+    fn commit_unknown_tx_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rgraph.db");
+        let engine: Arc<dyn AsyncGraphEngine> =
+            Arc::new(GraphEngineAdapter::init(db).expect("init engine"));
+        let metrics = MetricsCollector::new();
+        let svc = TransactionService::new(engine, metrics);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let err = rt
+            .block_on(svc.commit(Request::new(CommitRequest { tx_id: 999_999 })))
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 }

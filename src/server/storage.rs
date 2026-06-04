@@ -156,8 +156,61 @@ pub trait AsyncGraphEngine: Send + Sync {
         payload: Vec<u8>,
     ) -> Result<Vec<Node>, RGraphError>;
 
+    /// Execute a Cypher query through the full Sprint C pipeline
+    /// (`parse → semantic analyse → plan → physical execute`).
+    ///
+    /// `parameters` carries the named parameter bindings (`$name → value`)
+    /// that accompany the query.  The returned [`CypherResult`] contains the
+    /// ordered column names and the materialised rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a syntax/semantic/type/storage error if any stage of the
+    /// pipeline fails.
+    async fn execute_cypher(
+        &self,
+        query: String,
+        parameters: std::collections::HashMap<String, crate::cypher::value::Value>,
+    ) -> Result<CypherResult, RGraphError>;
+
+    /// Begin a new MVCC transaction and return its server-tracked id.
+    ///
+    /// The transaction is registered in a server-side map keyed by its
+    /// `tx_id`; subsequent [`commit_txn`](AsyncGraphEngine::commit_txn) /
+    /// [`rollback_txn`](AsyncGraphEngine::rollback_txn) calls reference it by
+    /// that id.  `read_only` selects a snapshot-only isolation level when set.
+    async fn begin_txn(&self, read_only: bool) -> Result<u64, RGraphError>;
+
+    /// Commit the transaction previously registered under `tx_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RGraphError::NotFound`] if `tx_id` is unknown, and a
+    /// [`RGraphError::Transaction`] if the commit is rejected (e.g. an SSI
+    /// or write-write conflict) or the WAL flush fails.
+    async fn commit_txn(&self, tx_id: u64) -> Result<(), RGraphError>;
+
+    /// Roll back the transaction previously registered under `tx_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RGraphError::NotFound`] if `tx_id` is unknown.
+    async fn rollback_txn(&self, tx_id: u64) -> Result<(), RGraphError>;
+
     /// Flush all durable state to disk.
     async fn sync(&self) -> Result<(), RGraphError>;
+}
+
+/// Result of executing a Cypher query through [`AsyncGraphEngine::execute_cypher`].
+///
+/// Mirrors [`crate::cypher::executor::QueryResult`] but lives in the server
+/// layer so the gRPC handler does not depend on the executor's row shape.
+#[derive(Debug, Clone)]
+pub struct CypherResult {
+    /// Column names in RETURN order.
+    pub columns: Vec<String>,
+    /// Result rows; each row aligns positionally with `columns`.
+    pub rows: Vec<Vec<crate::cypher::value::Value>>,
 }
 
 // ------------------------------------------------------------------
@@ -359,6 +412,13 @@ pub struct GraphEngineAdapter {
     inner: Arc<RwLock<Graph>>,
     #[allow(dead_code)]
     fs: PosixFileSystem,
+    /// Server-side registry of open MVCC transactions keyed by `tx_id`.
+    ///
+    /// Entries are inserted by [`begin_txn`](AsyncGraphEngine::begin_txn) and
+    /// removed by `commit_txn` / `rollback_txn`.  A [`std::sync::Mutex`] is
+    /// used (rather than the Tokio variant) because the guard is only ever
+    /// held inside `spawn_blocking` closures, never across an `.await`.
+    open_txns: Arc<std::sync::Mutex<std::collections::HashMap<u64, crate::txn::manager::Transaction>>>,
 }
 
 impl GraphEngineAdapter {
@@ -367,7 +427,16 @@ impl GraphEngineAdapter {
         Self {
             inner: Arc::new(RwLock::new(graph)),
             fs: PosixFileSystem::new(false),
+            open_txns: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Return a clone of the shared graph handle.
+    ///
+    /// Exposed so other server components (e.g. health checks, metrics
+    /// collectors) can observe the same engine instance.
+    pub fn graph_handle(&self) -> Arc<RwLock<Graph>> {
+        self.inner.clone()
     }
 
     /// Initialise a new graph engine at `path`.
@@ -535,6 +604,118 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         .map_err(|e| RGraphError::Internal(e.to_string()))?
     }
 
+    async fn execute_cypher(
+        &self,
+        query: String,
+        parameters: std::collections::HashMap<String, crate::cypher::value::Value>,
+    ) -> Result<CypherResult, RGraphError> {
+        use crate::cypher::parser::parse;
+        use crate::cypher::physical::{execute_plan, ExecutionContext};
+        use crate::cypher::planner::plan;
+        use crate::cypher::semantic::analyse;
+
+        let inner = self.inner.clone();
+        let fs = PosixFileSystem::new(false);
+        tokio::task::spawn_blocking(move || {
+            // Parse → semantic analyse → plan are CPU-only; do them first so we
+            // surface syntax/semantic errors before acquiring the write lock.
+            let stmt = parse(&query).map_err(|e| RGraphError::Syntax(e.to_string()))?;
+            analyse(&stmt).map_err(RGraphError::from)?;
+            let logical_plan = plan(&stmt).map_err(RGraphError::from)?;
+
+            // Take the exclusive write lock for the duration of execution so the
+            // engine pointer handed to the execution context is unaliased.
+            let mut guard = inner.blocking_write();
+            let engine = guard.engine_mut();
+            let mut ctx = ExecutionContext::new_with_write(engine, &fs);
+            ctx.parameters = parameters;
+
+            let result = execute_plan(&logical_plan, &ctx).map_err(RGraphError::from)?;
+            Ok(CypherResult {
+                columns: result.columns,
+                rows: result.rows,
+            })
+        })
+        .await
+        .map_err(|e| RGraphError::Internal(e.to_string()))?
+    }
+
+    async fn begin_txn(&self, read_only: bool) -> Result<u64, RGraphError> {
+        use crate::txn::manager::IsolationLevel;
+
+        let inner = self.inner.clone();
+        let open_txns = self.open_txns.clone();
+        tokio::task::spawn_blocking(move || {
+            // Begin against the engine's own transaction manager so the new
+            // transaction shares the global MVCC state used by writes.
+            let guard = inner.blocking_read();
+            let level = if read_only {
+                IsolationLevel::RepeatableRead
+            } else {
+                IsolationLevel::Serializable
+            };
+            let tx = guard.engine().txn_manager.begin_with_isolation(level);
+            let txid = tx.txid;
+            drop(guard);
+
+            open_txns
+                .lock()
+                .map_err(|_| RGraphError::Internal("transaction registry poisoned".into()))?
+                .insert(txid, tx);
+            Ok(txid)
+        })
+        .await
+        .map_err(|e| RGraphError::Internal(e.to_string()))?
+    }
+
+    async fn commit_txn(&self, tx_id: u64) -> Result<(), RGraphError> {
+        let inner = self.inner.clone();
+        let open_txns = self.open_txns.clone();
+        let fs = PosixFileSystem::new(false);
+        tokio::task::spawn_blocking(move || {
+            // Remove the transaction from the registry up front; whatever the
+            // outcome, the id is consumed.
+            let mut tx = open_txns
+                .lock()
+                .map_err(|_| RGraphError::Internal("transaction registry poisoned".into()))?
+                .remove(&tx_id)
+                .ok_or_else(|| RGraphError::NotFound(format!("transaction {tx_id} not found")))?;
+
+            let mut guard = inner.blocking_write();
+            let engine = guard.engine_mut();
+            // SAFETY of borrow: the txn_manager is cloneable (Arc-backed) so we
+            // can take an owned handle and still borrow the WAL mutably.
+            let manager = engine.txn_manager.clone();
+            manager
+                .commit(&mut tx, &mut engine.wal_writer, &fs)
+                .map_err(into_tx_rgraph_err)
+        })
+        .await
+        .map_err(|e| RGraphError::Internal(e.to_string()))?
+    }
+
+    async fn rollback_txn(&self, tx_id: u64) -> Result<(), RGraphError> {
+        let inner = self.inner.clone();
+        let open_txns = self.open_txns.clone();
+        let fs = PosixFileSystem::new(false);
+        tokio::task::spawn_blocking(move || {
+            let mut tx = open_txns
+                .lock()
+                .map_err(|_| RGraphError::Internal("transaction registry poisoned".into()))?
+                .remove(&tx_id)
+                .ok_or_else(|| RGraphError::NotFound(format!("transaction {tx_id} not found")))?;
+
+            let mut guard = inner.blocking_write();
+            let engine = guard.engine_mut();
+            let manager = engine.txn_manager.clone();
+            manager
+                .rollback(&mut tx, &mut engine.wal_writer, &fs)
+                .map_err(into_tx_rgraph_err)
+        })
+        .await
+        .map_err(|e| RGraphError::Internal(e.to_string()))?
+    }
+
     async fn sync(&self) -> Result<(), RGraphError> {
         let inner = self.inner.clone();
         let fs = PosixFileSystem::new(false);
@@ -544,6 +725,30 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         })
         .await
         .map_err(|e| RGraphError::Internal(e.to_string()))?
+    }
+}
+
+/// Convert a [`TxError`](crate::txn::manager::TxError) into [`RGraphError`].
+fn into_tx_rgraph_err(e: crate::txn::manager::TxError) -> RGraphError {
+    use crate::txn::manager::TxError;
+    match e {
+        TxError::WalFlush(io) => RGraphError::Io(format!("WAL flush failed: {io}")),
+        TxError::WoundWait(id) => {
+            RGraphError::Transaction(format!("transaction {id} wounded — retry"))
+        }
+        TxError::NotActive(id, status) => {
+            RGraphError::Transaction(format!("transaction {id} not active (status {status:?})"))
+        }
+        TxError::AlreadyFinalised(id) => {
+            RGraphError::Transaction(format!("transaction {id} already finalised"))
+        }
+        TxError::IndexMutation(msg) => RGraphError::Index(msg),
+        TxError::PhantomConflict(id) => {
+            RGraphError::Transaction(format!("transaction {id} aborted — phantom/rw-conflict"))
+        }
+        TxError::WriteConflict(id, res) => RGraphError::Transaction(format!(
+            "transaction {id} aborted — write-write conflict on resource {res}"
+        )),
     }
 }
 

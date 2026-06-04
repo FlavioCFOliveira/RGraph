@@ -413,7 +413,7 @@ impl PhysicalOperator for FilterOp {
             match self.input.next_row(ctx)? {
                 None => return Ok(None),
                 Some(row) => {
-                    let eval_ctx = row_to_eval_context(&row);
+                    let eval_ctx = row_to_eval_context(&row, ctx);
                     match evaluate(&self.predicate, &eval_ctx) {
                         Ok(Value::Boolean(true)) => return Ok(Some(row)),
                         Ok(Value::Boolean(false)) => continue,
@@ -459,7 +459,7 @@ impl PhysicalOperator for ProjectOp {
         match self.input.next_row(ctx)? {
             None => Ok(None),
             Some(row) => {
-                let eval_ctx = row_to_eval_context(&row);
+                let eval_ctx = row_to_eval_context(&row, ctx);
                 let pairs = eval_projections(&self.projections, &eval_ctx)
                     .map_err(|e| ExecError::Eval(e.to_string()))?;
                 let mut out = empty_row();
@@ -515,8 +515,8 @@ impl PhysicalOperator for SortOp {
                 let asc = order_item.ascending;
                 let expr = order_item.expression.clone();
                 rows.sort_by(|a, b| {
-                    let ctx_a = row_to_eval_context(a);
-                    let ctx_b = row_to_eval_context(b);
+                    let ctx_a = row_to_eval_context(a, ctx);
+                    let ctx_b = row_to_eval_context(b, ctx);
                     let va = evaluate(&expr, &ctx_a).unwrap_or(Value::Null);
                     let vb = evaluate(&expr, &ctx_b).unwrap_or(Value::Null);
                     compare_values(&va, &vb, asc)
@@ -565,7 +565,7 @@ impl PhysicalOperator for SkipOp {
         ctx: &ExecutionContext,
     ) -> Result<Option<Row>, ExecError> {
         if self.skip_count.is_none() {
-            let eval_ctx = EvalContext::new();
+            let eval_ctx = eval_context_with_params(ctx);
             let val = evaluate(&self.expression, &eval_ctx)
                 .map_err(|e| ExecError::Eval(e.to_string()))?;
             self.skip_count = val.as_integer().map(|v| v as u64);
@@ -612,7 +612,7 @@ impl PhysicalOperator for LimitOp {
         ctx: &ExecutionContext,
     ) -> Result<Option<Row>, ExecError> {
         if self.limit_count.is_none() {
-            let eval_ctx = EvalContext::new();
+            let eval_ctx = eval_context_with_params(ctx);
             let val = evaluate(&self.expression, &eval_ctx)
                 .map_err(|e| ExecError::Eval(e.to_string()))?;
             self.limit_count = val.as_integer().map(|v| v as u64);
@@ -673,7 +673,7 @@ impl CreateOp {
         let engine = unsafe { ctx.engine_mut() };
 
         // We need a row eval context for property expression evaluation.
-        let eval_ctx = row_to_eval_context(row);
+        let eval_ctx = row_to_eval_context(row, ctx);
 
         // We need to collect created node ids so relationships can reference them.
         // Process pattern elements in sequence.
@@ -764,7 +764,7 @@ impl CreateOp {
                         .to(tgt_id)
                         .rel_type(type_id);
 
-                    let eval_ctx2 = row_to_eval_context(row);
+                    let eval_ctx2 = row_to_eval_context(row, ctx);
                     for (k, v_expr) in &rel.properties {
                         match evaluate(v_expr, &eval_ctx2) {
                             Ok(val) => {
@@ -1243,7 +1243,7 @@ impl PhysicalOperator for UnwindOp {
             let Some(input_row) = self.input.next_row(ctx)? else {
                 return Ok(None);
             };
-            let eval_ctx = row_to_eval_context(&input_row);
+            let eval_ctx = row_to_eval_context(&input_row, ctx);
             let list_val = evaluate(&self.expression, &eval_ctx)
                 .map_err(|e| ExecError::Eval(e.to_string()))?;
             self.pending.clear();
@@ -1292,7 +1292,7 @@ impl PhysicalOperator for DeleteOp {
         use crate::cypher::interpreter::evaluate;
         // Process each input row and delete the targeted entities.
         while let Some(row) = self.input.next_row(ctx)? {
-            let eval_ctx = row_to_eval_context(&row);
+            let eval_ctx = row_to_eval_context(&row, ctx);
             // SAFETY: single-threaded execution; exclusive engine access.
             let engine = unsafe { ctx.engine_mut() };
             for expr in &self.expressions {
@@ -1358,7 +1358,7 @@ impl PhysicalOperator for SetOp {
         match self.input.next_row(ctx)? {
             None => Ok(None),
             Some(mut row) => {
-                let eval_ctx = row_to_eval_context(&row);
+                let eval_ctx = row_to_eval_context(&row, ctx);
                 for item in &self.items {
                     match item {
                         SetItem::Property { target, value } => {
@@ -1609,7 +1609,7 @@ impl PhysicalOperator for AggregateOp {
 
             // Consume all input rows and partition by grouping keys.
             while let Some(row) = self.input.next_row(ctx)? {
-                let eval_ctx = row_to_eval_context(&row);
+                let eval_ctx = row_to_eval_context(&row, ctx);
                 let key: Vec<Value> = self
                     .grouping_keys
                     .iter()
@@ -1632,7 +1632,7 @@ impl PhysicalOperator for AggregateOp {
                 }
                 // Compute each aggregate.
                 for agg in &self.aggregations {
-                    let val = compute_aggregate(&agg.function, &agg.argument, &rows, agg.distinct)?;
+                    let val = compute_aggregate(&agg.function, &agg.argument, &rows, agg.distinct, ctx)?;
                     result_row.insert(agg.alias.clone(), val);
                 }
                 out.push(result_row);
@@ -1660,6 +1660,7 @@ fn compute_aggregate(
     arg: &Expression,
     rows: &[Row],
     distinct: bool,
+    exec_ctx: &ExecutionContext,
 ) -> Result<Value, ExecError> {
     use crate::cypher::plan::AggregateFunction;
 
@@ -1674,7 +1675,7 @@ fn compute_aggregate(
         }
     } else {
         for row in rows {
-            let eval_ctx = row_to_eval_context(row);
+            let eval_ctx = row_to_eval_context(row, exec_ctx);
             match evaluate(arg, &eval_ctx) {
                 Ok(v) => values.push(v),
                 Err(_) => {} // skip rows where argument evaluates to error
@@ -1833,11 +1834,26 @@ fn value_to_property(val: &Value) -> Option<crate::graph::property::Property> {
     }
 }
 
-/// Build an [`EvalContext`] from a physical row.
-pub(crate) fn row_to_eval_context(row: &Row) -> EvalContext {
-    let mut ctx = EvalContext::new();
+/// Build an [`EvalContext`] from a physical row and the surrounding execution
+/// context.
+///
+/// The query-level parameter bindings carried by [`ExecutionContext`] are
+/// copied into the [`EvalContext`] so that `$param` references resolve during
+/// expression evaluation.
+pub(crate) fn row_to_eval_context(row: &Row, exec_ctx: &ExecutionContext) -> EvalContext {
+    let mut ctx = eval_context_with_params(exec_ctx);
     for (k, v) in row {
         ctx = ctx.bind(k.clone(), v.clone());
+    }
+    ctx
+}
+
+/// Build an empty [`EvalContext`] pre-seeded with the execution context's
+/// query parameters.
+pub(crate) fn eval_context_with_params(exec_ctx: &ExecutionContext) -> EvalContext {
+    let mut ctx = EvalContext::new();
+    for (k, v) in &exec_ctx.parameters {
+        ctx = ctx.bind_parameter(k.clone(), v.clone());
     }
     ctx
 }
