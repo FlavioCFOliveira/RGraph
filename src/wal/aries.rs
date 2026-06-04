@@ -219,19 +219,54 @@ impl<'a> AriesRecovery<'a> {
         wal_dir: &Path,
     ) -> io::Result<Vec<WalRecord>> {
         let mut all_records = Vec::new();
+        let archive_dir = wal_dir.join("wal-archive");
 
-        // Enumerate segment files by probing sequentially until a gap is found.
-        for seg_id in 0u64..=u32::MAX as u64 {
-            let seg_path = wal_dir.join(format!("wal-{:09}", seg_id));
-            if !fs.exists(&seg_path) {
-                // First missing segment — stop scanning.
-                break;
-            }
-            let mut seg_records = self.load_single_segment(fs, &seg_path, seg_id as u32)?;
+        // Records below the checkpoint are already durably applied (and may have
+        // been archived), so start scanning at the checkpoint's segment.
+        let start_seg = self.checkpoint_lsn >> 32;
+        let highest = Self::highest_segment_id(fs, wal_dir);
+
+        for seg_id in start_seg..=highest {
+            let live = wal_dir.join(format!("wal-{:09}", seg_id));
+            // A still-needed segment (above the checkpoint) may have been moved to
+            // the archive by retention-based archiving, so consult `wal-archive/`
+            // when it is missing from the live directory.  Do NOT stop at the gap
+            // between the archive and the live window — later live segments must
+            // still be read (M23).
+            let path = if fs.exists(&live) {
+                live
+            } else {
+                let archived = archive_dir.join(format!("wal-{:09}", seg_id));
+                if fs.exists(&archived) {
+                    archived
+                } else {
+                    continue;
+                }
+            };
+            let mut seg_records = self.load_single_segment(fs, &path, seg_id as u32)?;
             all_records.append(&mut seg_records);
         }
 
         Ok(all_records)
+    }
+
+    /// Highest segment id present across the live WAL directory AND the archive.
+    /// The archive holds a contiguous low range `[0, cutoff]` and the live
+    /// directory the contiguous high range `[cutoff+1, current]`, so the union is
+    /// contiguous and a simple scan finds the true maximum (M23).
+    fn highest_segment_id(fs: &dyn FileSystem, wal_dir: &Path) -> u64 {
+        let archive_dir = wal_dir.join("wal-archive");
+        let mut max_id = 0u64;
+        for id in 0u64..=u32::MAX as u64 {
+            let live = wal_dir.join(format!("wal-{:09}", id));
+            let archived = archive_dir.join(format!("wal-{:09}", id));
+            if fs.exists(&live) || fs.exists(&archived) {
+                max_id = id;
+            } else if id > max_id {
+                break;
+            }
+        }
+        max_id
     }
 
     /// Read one WAL segment file and decode all valid records.
@@ -1201,6 +1236,47 @@ mod tests {
         );
         let count = recovery.redo(&records, &att, &dpt, &fs).unwrap();
         assert_eq!(count, 0, "page is already up-to-date; REDO must be a no-op");
+    }
+
+    #[test]
+    fn load_all_segments_reads_archived_and_live_across_the_gap() {
+        // Regression gate for finding M23 (2026-06-04): recovery must not stop at
+        // the gap left by retention-based archiving, and must consult
+        // `wal-archive/` for still-needed segments above the checkpoint.
+        use crate::io::posix::PosixFileSystem;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let wal_dir = dir.path().join("wal");
+        let archive_dir = wal_dir.join("wal-archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let data_path = dir.path().join("data.db");
+
+        let write_seg = |path: &std::path::Path, txid: u64| {
+            let bytes = WalRecord::new(RecordType::Begin, txid, 0, 0, vec![]).encode();
+            let handle = fs.open(path, true).unwrap();
+            handle.write_at(&bytes, 0).unwrap();
+            handle.sync_data().unwrap();
+        };
+
+        // Segments 0,1 archived (contiguous low range); 2,3 live (contiguous high
+        // range).  The live directory therefore has a "gap" at ids 0 and 1.
+        write_seg(&archive_dir.join("wal-000000000"), 10);
+        write_seg(&archive_dir.join("wal-000000001"), 11);
+        write_seg(&wal_dir.join("wal-000000002"), 12);
+        write_seg(&wal_dir.join("wal-000000003"), 13);
+
+        // Checkpoint into segment 1: recovery must read segments 1 (from the
+        // archive), 2 and 3 (live), but not segment 0 (below the checkpoint).
+        let checkpoint_lsn = (1u64 << 32) | 1;
+        let recovery = AriesRecovery::new(&fs, &wal_dir, &data_path, checkpoint_lsn);
+        let records = recovery.load_all_segments(&fs, &wal_dir).unwrap();
+        let txids: Vec<u64> = records.iter().map(|r| r.txid).collect();
+
+        assert!(txids.contains(&11), "must read archived segment 1 above the checkpoint");
+        assert!(txids.contains(&12), "must read live segment 2 past the archiving gap");
+        assert!(txids.contains(&13), "must read live segment 3");
+        assert!(!txids.contains(&10), "must not read segment 0 (below the checkpoint)");
     }
 
     #[test]
