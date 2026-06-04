@@ -381,6 +381,14 @@ impl WalWriter {
     /// After `sync_data()` succeeds, advances the shared `durable_lsn`
     /// watermark to `current_lsn`.  The buffer-pool flusher reads this
     /// watermark to enforce WAL-before-data ordering.
+    ///
+    /// The write always appends at the *physical* end of the segment file
+    /// (`handle.len()`), which is correct for an append-only log.  Note that this
+    /// physical byte position is NOT byte-equal to the LSN's intra-segment offset
+    /// — the LSN offset includes the segment-0 null sentinel and excludes
+    /// rotation descriptor blocks.  An LSN is a logical identifier; consumers
+    /// must scan/decode sequentially and filter by LSN rather than seek by it
+    /// (finding L9; see [`crate::wal::recovery::recover`]).
     pub fn flush(&mut self, _fs: &dyn FileSystem) -> io::Result<()> {
         if self.buffered == 0 {
             return Ok(());

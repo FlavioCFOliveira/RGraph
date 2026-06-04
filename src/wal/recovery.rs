@@ -4,11 +4,17 @@ use crate::wal::record::{RecordType, WalRecord};
 use std::io;
 use std::path::Path;
 
-/// Scan WAL from `start_lsn`, validate every record, and invoke
-/// `replay` for each page-level record.  Returns the LSN of the last
+/// Scan a WAL segment, validate every record, and invoke `replay` for each
+/// page-level record whose LSN is `>= start_lsn`.  Returns the LSN of the last
 /// valid record, or `None` if the WAL is empty.
 ///
-/// Invalid records cause a truncation at that point.
+/// The scan always starts at the *physical* beginning of the segment.  An LSN is
+/// a logical identifier, **not** a byte offset — the intra-segment offset
+/// includes the segment-0 null sentinel and excludes rotation descriptor blocks,
+/// so it is not byte-equal to the file position.  Records are therefore filtered
+/// by `lsn >= start_lsn` rather than by seeking to `start_lsn` bytes (finding L9).
+///
+/// A torn (partial) trailing record causes a truncation at that point.
 pub fn recover<F>(
     fs: &dyn FileSystem,
     wal_path: &Path,
@@ -29,31 +35,35 @@ where
     let mut buf = vec![0u8; len as usize];
     handle.read_at(&mut buf, 0)?;
 
-    let mut offset = start_lsn as usize;
+    // Decode from the physical start of the segment; the LSN is a logical
+    // identifier, not a byte offset (L9), so records are filtered by LSN below.
+    let mut offset = 0usize;
     let mut last_valid_lsn: Option<u64> = None;
 
     while offset < buf.len() {
         match WalRecord::decode(&buf, offset) {
             Some((rec, size)) => {
                 let lsn = rec.lsn;
-                match rec.record_type {
-                    RecordType::PageInsert
-                    | RecordType::PageUpdate
-                    | RecordType::PageFree
-                    | RecordType::BitmapUpdate
-                        if rec.payload.len() >= 8 =>
-                    {
-                        // Payload: first 8 bytes = page_id, rest = after-image.
-                        let page_id = u64::from_be_bytes([
-                            rec.payload[0], rec.payload[1], rec.payload[2], rec.payload[3],
-                            rec.payload[4], rec.payload[5], rec.payload[6], rec.payload[7],
-                        ]);
-                        let after_image = &rec.payload[8..];
-                        replay(page_id, after_image, lsn)?;
-                    }
-                    _ => {
-                        // Transactional / checkpoint records: nothing to replay at
-                        // page level in redo-only recovery.
+                if lsn >= start_lsn {
+                    match rec.record_type {
+                        RecordType::PageInsert
+                        | RecordType::PageUpdate
+                        | RecordType::PageFree
+                        | RecordType::BitmapUpdate
+                            if rec.payload.len() >= 8 =>
+                        {
+                            // Payload: first 8 bytes = page_id, rest = after-image.
+                            let page_id = u64::from_be_bytes([
+                                rec.payload[0], rec.payload[1], rec.payload[2], rec.payload[3],
+                                rec.payload[4], rec.payload[5], rec.payload[6], rec.payload[7],
+                            ]);
+                            let after_image = &rec.payload[8..];
+                            replay(page_id, after_image, lsn)?;
+                        }
+                        _ => {
+                            // Transactional / checkpoint records: nothing to replay
+                            // at page level in redo-only recovery.
+                        }
                     }
                 }
                 last_valid_lsn = Some(lsn);
@@ -170,6 +180,52 @@ mod tests {
         handle.read_at(&mut buf, 2 * PAGE_SIZE as u64).unwrap();
         let page = crate::storage::page::SlottedPage::new(buf);
         assert_eq!(page.read(idx).unwrap(), b"recovered");
+    }
+
+    #[test]
+    fn recover_filters_by_lsn_not_byte_offset() {
+        // Regression gate for finding L9 (2026-06-04): `start_lsn` is an LSN, not
+        // a byte offset.  recover() must scan from the physical start and replay
+        // only records with lsn >= start_lsn — never seek to `start_lsn` bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let wal_path = dir.path().join("wal-000000000");
+
+        let mut rec1 = {
+            let mut payload = 11u64.to_be_bytes().to_vec();
+            payload.extend_from_slice(&[1u8; 8]);
+            WalRecord::new(RecordType::PageUpdate, 1, 0, 0, payload)
+        };
+        rec1.set_lsn(5);
+        let mut rec2 = {
+            let mut payload = 22u64.to_be_bytes().to_vec();
+            payload.extend_from_slice(&[2u8; 8]);
+            WalRecord::new(RecordType::PageUpdate, 1, 0, 0, payload)
+        };
+        rec2.set_lsn(9);
+
+        let mut bytes = rec1.encode();
+        bytes.extend_from_slice(&rec2.encode());
+        let handle = fs.open(&wal_path, true).unwrap();
+        handle.write_at(&bytes, 0).unwrap();
+        handle.sync_data().unwrap();
+
+        // start_lsn = 9: only the lsn=9 record (page 22) must be replayed; the
+        // lsn=5 record is below the start LSN.  (If `start_lsn` were used as a
+        // byte offset, the scan would seek into the middle of rec1 and replay
+        // nothing.)
+        let mut replayed: Vec<(PageId, u64)> = Vec::new();
+        let last = recover(&fs, &wal_path, 9, |pid, _img, lsn| {
+            replayed.push((pid, lsn));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            replayed,
+            vec![(22, 9)],
+            "only the record with lsn >= start_lsn is replayed"
+        );
+        assert_eq!(last, Some(9), "last valid lsn is the highest record's");
     }
 
     #[test]
