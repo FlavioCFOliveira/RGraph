@@ -36,6 +36,17 @@ use std::sync::{Arc, Mutex};
 /// in-memory and buffer-pool modes, unlike a global parent-pointer scan.
 type DescendPath = Vec<(PageId, usize)>;
 
+/// Stable key for the tree's structural latch.
+///
+/// Writers take this key exclusively for the full duration of a mutation
+/// (insert/delete, including any split/merge); readers and cursors take it
+/// shared.  A **fixed** key — never the live root id — is essential: a root
+/// split changes the root page id, and if the latch were keyed on the live root
+/// a reader could latch the new id while a writer still held the old one, losing
+/// mutual exclusion.  Page id `0` is the superblock and is never a B+ tree page,
+/// so it is safe to reuse as this latch table key.
+const STRUCTURE_LATCH_KEY: PageId = 0;
+
 /// Configuration knobs for a B+ tree.
 #[derive(Debug, Clone)]
 pub struct BPlusTreeConfig {
@@ -235,7 +246,20 @@ impl BPlusTree {
     }
 
     /// Search for `key` and return `(page_id, slot)` of the leaf entry.
+    ///
+    /// Pessimistic: takes a shared latch on the structural-mutation latch
+    /// (keyed on the root page id) so that no writer can be mid-split while the
+    /// descent runs, then descends and probes the leaf.  Holding the shared
+    /// latch for the whole descent is correct because writers serialise on the
+    /// same key with an exclusive latch.
     pub fn search(&self, key: &CompositeKey) -> Option<(PageId, u16)> {
+        let _guard = self.latch_mgr.latch(STRUCTURE_LATCH_KEY, LatchMode::Shared);
+        self.search_unlatched(key)
+    }
+
+    /// Descend and probe without taking a latch.  Callers that already hold the
+    /// structural latch (or have validated a version snapshot) use this.
+    fn search_unlatched(&self, key: &CompositeKey) -> Option<(PageId, u16)> {
         let root = self.get_page(self.root_page_id.load(Ordering::Relaxed))?;
         let (leaf_id, _) = self.find_leaf(root, key)?;
         let leaf = self.get_page(leaf_id)?;
@@ -248,67 +272,54 @@ impl BPlusTree {
         None
     }
 
-    /// Optimistic search without acquiring latches.
+    /// Optimistic search that takes no latch on the happy path.
     ///
-    /// Records the LSN of every page visited.  After reaching the leaf,
-    /// re-reads each page in the path and verifies its LSN has not changed.
-    /// If validation fails, retries up to `config.optimistic_retry` times,
-    /// then falls back to pessimistic [`search`].
+    /// Writers serialise on an exclusive structural latch keyed on the root
+    /// page id, and the latch manager bumps that key's **version** on every
+    /// exclusive release (every possible mutation).  An optimistic reader
+    /// therefore:
+    ///
+    /// 1. snapshots the version (`Acquire`-ordered via the table mutex) and
+    ///    confirms no writer is currently mid-mutation,
+    /// 2. performs an unlatched descent + leaf probe,
+    /// 3. re-reads the version and confirms it is unchanged.
+    ///
+    /// If the version moved (a writer ran during the read) or a writer was in
+    /// flight, the snapshot may be torn, so the reader retries up to
+    /// `config.optimistic_retry` times and finally falls back to the
+    /// pessimistic, shared-latched [`Self::search`].
     pub fn optimistic_search(&self, key: &CompositeKey) -> Option<(PageId, u16)> {
         let max_retry = self.config.optimistic_retry;
         for _ in 0..=max_retry {
-            let root_id = self.root_page_id.load(Ordering::Relaxed);
-            let root = match self.get_page(root_id) {
-                Some(p) => p,
-                None => return self.search(key),
-            };
-            let root_lsn = root.page_lsn();
-
-            let (leaf_id, path) = match self.find_leaf(root, key) {
-                Some(r) => r,
-                None => return self.search(key),
-            };
-            let _leaf_lsn = path.last().map(|p| p.1).unwrap_or(0);
-
-            // Validation: re-read every page in the path and check LSN.
-            let mut valid = true;
-            if self.get_page(root_id).map(|p| p.page_lsn()) != Some(root_lsn) {
-                valid = false;
-            }
-            for &(page_id, expected_lsn) in &path {
-                if self.get_page(page_id).map(|p| p.page_lsn()) != Some(expected_lsn) {
-                    valid = false;
-                    break;
-                }
-            }
-
-            if !valid {
+            // (1) Snapshot version; bail if a writer holds the latch right now.
+            if self.latch_mgr.is_write_latched(STRUCTURE_LATCH_KEY) {
                 std::thread::yield_now();
                 continue;
             }
+            let v_before = self.latch_mgr.version(STRUCTURE_LATCH_KEY);
 
-            let leaf = match self.get_page(leaf_id) {
-                Some(p) => p,
-                None => return self.search(key),
-            };
-            let slot = Self::leaf_lower_bound(&leaf, key);
-            if let Some(k) = Self::leaf_key(&leaf, slot)
-                && k.as_slice() == key.as_slice()
-            {
-                return Some((leaf_id, slot));
+            // (2) Unlatched read.
+            let result = self.search_unlatched(key);
+
+            // (3) Re-validate: the version must be unchanged and no writer may
+            // have held the latch exclusively during the read.  The structural
+            // latch key is stable across root splits, so no re-derivation is
+            // needed.
+            let v_after = self.latch_mgr.version(STRUCTURE_LATCH_KEY);
+            if v_before == v_after && !self.latch_mgr.is_write_latched(STRUCTURE_LATCH_KEY) {
+                return result;
             }
-            return None;
+            std::thread::yield_now();
         }
-        // Fallback to pessimistic search after exhausting retries.
+        // Fall back to a pessimistic, shared-latched search.
         self.search(key)
     }
 
     /// Insert `key` -> `value` into the tree.
     pub fn insert(&self, key: &CompositeKey, value: &[u8]) -> Result<(), BTreeError> {
-        let guard = self.latch_mgr.latch(
-            self.root_page_id.load(Ordering::Relaxed),
-            LatchMode::Exclusive,
-        );
+        let guard = self
+            .latch_mgr
+            .latch(STRUCTURE_LATCH_KEY, LatchMode::Exclusive);
         let result = self.insert_locked(key, value);
         drop(guard);
         result
@@ -325,7 +336,7 @@ impl BPlusTree {
     pub fn insert_batch(&self, entries: &[(CompositeKey, Vec<u8>)]) -> Result<(), BTreeError> {
         let guard = self
             .latch_mgr
-            .latch(self.root_page_id.load(Ordering::Relaxed), LatchMode::Exclusive);
+            .latch(STRUCTURE_LATCH_KEY, LatchMode::Exclusive);
         for (key, value) in entries {
             self.insert_locked(key, value)?;
         }
@@ -376,7 +387,7 @@ impl BPlusTree {
 
         let guard = self
             .latch_mgr
-            .latch(self.root_page_id.load(Ordering::Relaxed), LatchMode::Exclusive);
+            .latch(STRUCTURE_LATCH_KEY, LatchMode::Exclusive);
         let mut insert_result = Ok(());
         for (key, value) in entries {
             if let Err(e) = self.insert_locked(key, value) {
@@ -433,7 +444,10 @@ impl BPlusTree {
             // In pool mode probe ids up to the next allocation watermark.
             let next = *self.next_page_id.lock().unwrap();
             (1..next)
-                .filter(|&pid| self.get_page(pid).is_some_and(|p| p.is_leaf() || p.is_branch()))
+                .filter(|&pid| {
+                    self.get_page(pid)
+                        .is_some_and(|p| p.is_leaf() || p.is_branch())
+                })
                 .collect()
         } else {
             self.all_page_ids()
@@ -519,10 +533,9 @@ impl BPlusTree {
 
     /// Delete `key` from the tree. Returns true if the key was found.
     pub fn delete(&self, key: &CompositeKey) -> Result<bool, BTreeError> {
-        let guard = self.latch_mgr.latch(
-            self.root_page_id.load(Ordering::Relaxed),
-            LatchMode::Exclusive,
-        );
+        let guard = self
+            .latch_mgr
+            .latch(STRUCTURE_LATCH_KEY, LatchMode::Exclusive);
         let root_id = self.root_page_id.load(Ordering::Relaxed);
         let root = self.get_page(root_id).ok_or(BTreeError::MissingRoot)?;
         let (leaf_id, mut leaf, path) = self
@@ -679,6 +692,8 @@ impl BPlusTree {
         start: &CompositeKey,
         end: &CompositeKey,
     ) -> Vec<(CompositeKey, Vec<u8>)> {
+        // Hold a shared latch for the whole scan so the leaf chain is stable.
+        let _guard = self.latch_mgr.latch(STRUCTURE_LATCH_KEY, LatchMode::Shared);
         let mut results = Vec::new();
         let root = match self.get_page(self.root_page_id.load(Ordering::Relaxed)) {
             Some(p) => p,
@@ -730,11 +745,14 @@ impl BPlusTree {
         from: &CompositeKey,
         to: Option<CompositeKey>,
     ) -> Option<crate::index::cursor::BTreeRangeCursor<'a>> {
+        // Hold a shared latch for the cursor's lifetime so writers cannot split
+        // or merge the leaf chain while the scan is in progress.
+        let latch = self.latch_mgr.latch(STRUCTURE_LATCH_KEY, LatchMode::Shared);
         let root = self.get_page(self.root_page_id.load(Ordering::Relaxed))?;
         let (leaf_id, _) = self.find_leaf(root, from)?;
         let leaf = self.get_page(leaf_id)?;
         Some(crate::index::cursor::BTreeRangeCursor::new(
-            self, leaf_id, leaf, from, to,
+            self, leaf_id, leaf, from, to, latch,
         ))
     }
 
@@ -745,11 +763,7 @@ impl BPlusTree {
     /// Named per the index API contract; it borrows `&self` and returns an
     /// owned range rather than consuming the tree.
     #[allow(clippy::wrong_self_convention)]
-    pub fn into_range(
-        &self,
-        from: &CompositeKey,
-        to: &CompositeKey,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub fn into_range(&self, from: &CompositeKey, to: &CompositeKey) -> Vec<(Vec<u8>, Vec<u8>)> {
         match self.cursor_from(from, Some(to.clone())) {
             Some(cursor) => cursor.collect_range(),
             None => Vec::new(),
@@ -1761,13 +1775,19 @@ mod tests {
             .collect();
         tree.insert_batch(&entries).unwrap();
         for i in 1u128..=1000 {
-            assert!(tree.search(&node_id_key(i)).is_some(), "batch key {i} missing");
+            assert!(
+                tree.search(&node_id_key(i)).is_some(),
+                "batch key {i} missing"
+            );
         }
         // The batch built a multi-level tree.
         let root = tree
             .get_page(tree.root_page_id.load(Ordering::Relaxed))
             .unwrap();
-        assert!(root.is_branch(), "1000-key batch must produce a branch root");
+        assert!(
+            root.is_branch(),
+            "1000-key batch must produce a branch root"
+        );
     }
 
     #[test]
@@ -1813,6 +1833,166 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_inserts_no_lost_updates() {
+        // Many writer threads insert disjoint key ranges concurrently while
+        // reader threads search.  No insert may be lost and the test must not
+        // deadlock (it completes within the harness timeout).
+        use std::sync::Arc;
+        use std::thread;
+
+        let tree = Arc::new(BPlusTree::new(BPlusTreeConfig::default()));
+        let n_writers = 8u128;
+        let per_writer = 500u128;
+
+        let mut handles = Vec::new();
+        for w in 0..n_writers {
+            let t = Arc::clone(&tree);
+            handles.push(thread::spawn(move || {
+                // Disjoint, interleaved key ranges: key = i * n_writers + w + 1.
+                for i in 0..per_writer {
+                    let key = i * n_writers + w + 1;
+                    t.insert(&node_id_key(key), &key.to_be_bytes()).unwrap();
+                }
+            }));
+        }
+        // Concurrent readers (must never deadlock or panic).
+        for _ in 0..4 {
+            let t = Arc::clone(&tree);
+            handles.push(thread::spawn(move || {
+                for _ in 0..2000 {
+                    let _ = t.optimistic_search(&node_id_key(1));
+                    let _ = t.search(&node_id_key(2));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("no thread should panic or deadlock");
+        }
+
+        // Every inserted key must be present — no lost updates.
+        let total = n_writers * per_writer;
+        for key in 1..=total {
+            assert!(
+                tree.search(&node_id_key(key)).is_some(),
+                "lost update: key {key} missing after concurrent inserts"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_insert_delete_search_consistency() {
+        // Writers and deleters operate on disjoint key spaces so the final
+        // membership is deterministic; readers run throughout.  Verifies no
+        // deadlock and a consistent final state.
+        use std::sync::Arc;
+        use std::thread;
+
+        let tree = Arc::new(BPlusTree::new(BPlusTreeConfig::default()));
+        // Pre-seed keys 1..=2000 so deleters have something to remove.
+        for k in 1u128..=2000 {
+            tree.insert(&node_id_key(k), &k.to_be_bytes()).unwrap();
+        }
+
+        let mut handles = Vec::new();
+        // Deleters remove disjoint strides of odd keys in [1, 2000].
+        for d in 0..4u128 {
+            let t = Arc::clone(&tree);
+            handles.push(thread::spawn(move || {
+                let mut k = 1 + 2 * d; // distinct odd starts
+                while k <= 2000 {
+                    let _ = t.delete(&node_id_key(k));
+                    k += 8;
+                }
+            }));
+        }
+        // Writers add fresh keys in [3000, 5000).
+        for w in 0..4u128 {
+            let t = Arc::clone(&tree);
+            handles.push(thread::spawn(move || {
+                let mut k = 3000 + w;
+                while k < 5000 {
+                    t.insert(&node_id_key(k), &k.to_be_bytes()).unwrap();
+                    k += 4;
+                }
+            }));
+        }
+        // Readers.
+        for _ in 0..4 {
+            let t = Arc::clone(&tree);
+            handles.push(thread::spawn(move || {
+                for k in 1u128..=2000 {
+                    let _ = t.optimistic_search(&node_id_key(k));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("no thread should deadlock or panic");
+        }
+
+        // Even keys in [1,2000] were never deleted and must remain; all the
+        // [3000,5000) writes must be present.
+        for k in (2u128..=2000).step_by(2) {
+            assert!(
+                tree.search(&node_id_key(k)).is_some(),
+                "even key {k} must survive (it was never deleted)"
+            );
+        }
+        for w in 0..4u128 {
+            let mut k = 3000 + w;
+            while k < 5000 {
+                assert!(
+                    tree.search(&node_id_key(k)).is_some(),
+                    "concurrently-written key {k} missing"
+                );
+                k += 4;
+            }
+        }
+    }
+
+    #[test]
+    fn optimistic_reads_stay_sound_under_concurrent_writes() {
+        // A reader repeatedly optimistic-searches a stable key while writers
+        // churn other keys.  The stable key must never spuriously disappear.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+
+        let tree = Arc::new(BPlusTree::new(BPlusTreeConfig::default()));
+        tree.insert(&node_id_key(u128::MAX), b"sentinel").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut handles = Vec::new();
+        for w in 0..6u128 {
+            let t = Arc::clone(&tree);
+            let s = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                let mut k = w + 1;
+                while !s.load(Ordering::Relaxed) {
+                    let _ = t.insert(&node_id_key(k), &k.to_be_bytes());
+                    let _ = t.delete(&node_id_key(k));
+                    k += 6;
+                    if k > 3000 {
+                        k = w + 1;
+                    }
+                }
+            }));
+        }
+
+        // Reader: the sentinel must always be observable via optimistic search.
+        let t = Arc::clone(&tree);
+        for _ in 0..10_000 {
+            assert!(
+                t.optimistic_search(&node_id_key(u128::MAX)).is_some(),
+                "optimistic read lost the stable sentinel key"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().expect("writer must not deadlock or panic");
+        }
+    }
+
+    #[test]
     fn logged_index_batch_survives_crash_and_replay() {
         // Task 172: a WAL-logged index mutation must be recoverable after a
         // crash that loses the data file's index pages.  We write the batch
@@ -1848,8 +2028,7 @@ mod tests {
         }
 
         let pool = Arc::new(BufferPool::new(32, data_path.clone()));
-        let tree =
-            BPlusTree::new(BPlusTreeConfig::default()).with_pool(pool.clone(), fs.clone());
+        let tree = BPlusTree::new(BPlusTreeConfig::default()).with_pool(pool.clone(), fs.clone());
 
         // WAL-logged batch.
         let mut wal = WalWriter::open(wal_dir.clone(), fs.as_ref()).unwrap();
@@ -1887,13 +2066,11 @@ mod tests {
         let recovery = AriesRecovery::new(fs.as_ref(), &wal_dir, &data_path, 0);
         let records = recovery.load_all_segments(fs.as_ref(), &wal_dir).unwrap();
         assert!(
-            records
-                .iter()
-                .any(|r| matches!(
-                    r.record_type,
-                    crate::wal::record::RecordType::IndexPageInsert
-                        | crate::wal::record::RecordType::IndexPageUpdate
-                )),
+            records.iter().any(|r| matches!(
+                r.record_type,
+                crate::wal::record::RecordType::IndexPageInsert
+                    | crate::wal::record::RecordType::IndexPageUpdate
+            )),
             "WAL must contain physical index-page records"
         );
         let mut wal2 = WalWriter::open(wal_dir.clone(), fs.as_ref()).unwrap();

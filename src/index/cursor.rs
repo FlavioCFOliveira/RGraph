@@ -25,11 +25,7 @@ pub struct BTreeCursor<'a> {
 
 impl<'a> BTreeCursor<'a> {
     /// Position at the first key >= `key` in the given leaf page.
-    pub fn seek(
-        latch_mgr: &'a LatchCoupling,
-        page: BTreePage,
-        key: &CompositeKey,
-    ) -> Self {
+    pub fn seek(latch_mgr: &'a LatchCoupling, page: BTreePage, key: &CompositeKey) -> Self {
         let slot = Self::lower_bound(&page, key);
         Self {
             latch_mgr,
@@ -177,6 +173,11 @@ impl<'a> BTreeRangeScan<'a> {
 /// holds a reference to the [`BPlusTree`] and reloads the next sibling leaf when
 /// the current one is exhausted, so a range scan correctly spans many leaves.
 ///
+/// While alive the cursor holds a **shared latch** on the tree's structural
+/// latch, so concurrent writers (which take the matching exclusive latch) cannot
+/// split or merge pages out from under an in-progress scan.  The latch is
+/// released when the cursor is dropped.
+///
 /// Construct it with [`BPlusTree::cursor_from`] / [`BPlusTree::into_range`].
 pub struct BTreeRangeCursor<'a> {
     tree: &'a crate::index::btree::BPlusTree,
@@ -185,6 +186,8 @@ pub struct BTreeRangeCursor<'a> {
     current_slot: u16,
     /// Exclusive upper bound; `None` means scan to the end.
     end_key: Option<CompositeKey>,
+    /// Shared latch held for the cursor's lifetime (read isolation).
+    _latch: crate::index::latch::LatchGuard<'a>,
 }
 
 impl<'a> BTreeRangeCursor<'a> {
@@ -195,6 +198,7 @@ impl<'a> BTreeRangeCursor<'a> {
         leaf: BTreePage,
         from: &CompositeKey,
         end_key: Option<CompositeKey>,
+        latch: crate::index::latch::LatchGuard<'a>,
     ) -> Self {
         let slot = BTreeCursor::lower_bound(&leaf, from);
         Self {
@@ -203,6 +207,7 @@ impl<'a> BTreeRangeCursor<'a> {
             current_leaf: leaf,
             current_slot: slot,
             end_key,
+            _latch: latch,
         }
     }
 
@@ -460,7 +465,11 @@ mod tests {
         let from = node_id_key(1);
         let to = node_id_key(n + 1);
         let results = tree.into_range(&from, &to);
-        assert_eq!(results.len() as u128, n, "cursor must visit every key across leaves");
+        assert_eq!(
+            results.len() as u128,
+            n,
+            "cursor must visit every key across leaves"
+        );
         // Keys must be returned in ascending order.
         for w in results.windows(2) {
             assert!(w[0].0 < w[1].0, "range cursor must yield sorted keys");
