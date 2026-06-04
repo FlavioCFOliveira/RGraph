@@ -2,12 +2,13 @@ use crate::buffer::frame::{Frame, FrameDescriptor, FrameId, FrameState};
 use crate::buffer::NumaTopology;
 use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::page::{PageId, PAGE_SIZE};
+use crate::wal::doublewrite::DoubleWriteBuffer;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Number of shards in the page-to-frame mapping table.
 pub const SHARD_COUNT: usize = 256;
@@ -120,6 +121,12 @@ pub struct BufferPool {
     pub misses: AtomicU64,
     /// Eviction counter.
     pub evictions: AtomicU64,
+    /// Optional double-write buffer for torn-page protection.
+    ///
+    /// When set, every single-frame flush stages the page through the
+    /// double-write buffer before the in-place write so that partial writes
+    /// can be detected and repaired on restart.
+    doublewrite: Option<Arc<DoubleWriteBuffer>>,
 }
 
 // SAFETY: The buffer pool is Sync because each frame is independently
@@ -171,12 +178,27 @@ impl BufferPool {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            doublewrite: None,
         }
     }
 
     /// Which shard owns this page id?
     fn shard_index(page_id: PageId) -> usize {
         (page_id as usize).wrapping_mul(0x9E3779B97F4A7C15) % SHARD_COUNT
+    }
+
+    /// Attach a [`DoubleWriteBuffer`] to this pool.
+    ///
+    /// Once set, every [`flush_single_frame`] call stages the page through the
+    /// double-write buffer before the final in-place write, providing torn-page
+    /// protection.
+    pub fn set_doublewrite(&mut self, dw: Arc<DoubleWriteBuffer>) {
+        self.doublewrite = Some(dw);
+    }
+
+    /// Return the attached double-write buffer, if any.
+    pub fn doublewrite(&self) -> Option<&Arc<DoubleWriteBuffer>> {
+        self.doublewrite.as_ref()
     }
 
     /// Shared access to a frame (safe because the caller holds a guard).
@@ -466,6 +488,12 @@ impl BufferPool {
     }
 
     /// Write a single dirty frame back to disk.
+    ///
+    /// If a [`DoubleWriteBuffer`] is attached, the page is staged there first
+    /// and the DW buffer is cleared after the final write succeeds.  This
+    /// ensures that a crash between the DW write and the in-place write can be
+    /// detected and repaired by [`DoubleWriteBuffer::recover_torn_pages`] on
+    /// the next startup.
     pub fn flush_single_frame(
         &self,
         fs: &dyn FileSystem,
@@ -483,14 +511,28 @@ impl BufferPool {
             return Ok(()); // another thread is already flushing it
         }
 
-        let offset = page_id * PAGE_SIZE as u64;
-        let handle = fs.open(&self.data_path, false)?;
-
-        // Update checksum on the frame buffer before writing.
+        // Update checksum on the frame buffer before any write.
         let frame_mut = self.frame_mut(frame_id);
         crate::storage::page::SlottedPage::update_checksum_bytes(&mut frame_mut.buf);
+
+        // Stage through the double-write buffer if one is attached, providing
+        // torn-page protection for this single-frame flush.
+        if let Some(dw) = &self.doublewrite {
+            let pages: Vec<(u64, &[u8])> = vec![(page_id, &frame_mut.buf[..])];
+            dw.write_batch(&pages, fs)?;
+        }
+
+        let offset = page_id * PAGE_SIZE as u64;
+        let handle = fs.open(&self.data_path, false)?;
         handle.write_at(&frame_mut.buf, offset)?;
         handle.sync_data()?;
+
+        // DW buffer can now be cleared: the in-place write completed durably.
+        if let Some(dw) = &self.doublewrite {
+            // Non-fatal: if clear fails we simply leave the DW entry; recovery
+            // will verify checksums and skip pages that are already intact.
+            let _ = dw.clear(fs);
+        }
 
         frame_mut.desc.dirty.store(false, Ordering::Release);
         frame_mut.desc.state.store(FrameState::Clean as u8, Ordering::Release);

@@ -3,6 +3,7 @@ use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::bitmap::{BitmapPage, FreeListCache, PAGES_PER_BITMAP};
 use crate::storage::meta::{Superblock, encode_superblock};
 use crate::storage::page::{PAGE_SIZE, PageId};
+use crate::wal::doublewrite::DoubleWriteBuffer;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -52,6 +53,11 @@ pub struct PageManager {
     /// reference avoids a reference cycle between `PageManager` and `BufferPool`
     /// (the pool is owned by the engine, which also owns the page manager).
     pool: Weak<BufferPool>,
+    /// Optional double-write buffer for torn-page protection on the direct
+    /// (no-pool) write path.  When a pool is attached, the pool owns the DW
+    /// buffer and handles staging in its flush path; this field is only used
+    /// when writing directly to disk without the pool.
+    doublewrite: Option<Arc<DoubleWriteBuffer>>,
 }
 
 impl std::fmt::Debug for PageManager {
@@ -105,6 +111,7 @@ impl PageManager {
             free_cache: FreeListCache::new(Self::CACHE_BATCH),
             data_handle: Some(handle),
             pool: Weak::new(),
+            doublewrite: None,
         })
     }
 
@@ -148,6 +155,7 @@ impl PageManager {
             free_cache: FreeListCache::new(Self::CACHE_BATCH),
             data_handle: Some(handle),
             pool: Weak::new(),
+            doublewrite: None,
         };
         pm.rebuild_cache();
         Ok(pm)
@@ -167,6 +175,28 @@ impl PageManager {
     /// if a pool is currently attached and alive, or `None` otherwise.
     pub fn buffer_pool(&self) -> Option<Arc<BufferPool>> {
         self.pool.upgrade()
+    }
+
+    /// Attach a [`DoubleWriteBuffer`] for torn-page protection on the direct
+    /// (no-pool) write path.
+    ///
+    /// When a buffer pool is in use the pool's own DW staging handles
+    /// protection; this setter is relevant for the pool-less path only.
+    pub fn set_doublewrite(&mut self, dw: Arc<DoubleWriteBuffer>) {
+        self.doublewrite = Some(dw);
+    }
+
+    /// Run torn-page recovery from the doublewrite buffer.
+    ///
+    /// Must be called on every open before any write is issued to ensure that
+    /// partially-written pages from the previous session are repaired.
+    /// Returns the number of pages restored.
+    pub fn recover_torn_pages(&self, fs: &dyn FileSystem) -> io::Result<usize> {
+        if let Some(dw) = &self.doublewrite {
+            dw.recover_torn_pages(&self.data_path, fs)
+        } else {
+            Ok(0)
+        }
     }
 
     /// Allocate a new page id.
@@ -307,8 +337,22 @@ impl PageManager {
             handle.set_len(required_len)?;
             handle.sync_all()?;
         }
+
+        // Stage through double-write buffer before the final write.
+        if let Some(dw) = &self.doublewrite {
+            let pages: Vec<(u64, &[u8])> = vec![(page_id, &buf[..])];
+            dw.write_batch(&pages, fs)?;
+        }
+
         handle.write_at(buf, offset)?;
-        handle.sync_data()
+        handle.sync_data()?;
+
+        // Clear the DW buffer after the in-place write succeeded.
+        if let Some(dw) = &self.doublewrite {
+            let _ = dw.clear(fs);
+        }
+
+        Ok(())
     }
 
     /// Persist the current superblock to both copies atomically.
@@ -578,6 +622,87 @@ mod tests {
         assert!(
             pm.bitmaps[0].is_set(allocated_pid),
             "previously allocated page must be set in restored bitmap"
+        );
+    }
+
+    /// Task 152 acceptance criterion: torn-write fault injection.
+    ///
+    /// Scenario:
+    ///   1. Initialise a `PageManager` with a `DoubleWriteBuffer` attached.
+    ///   2. Write a page with known data — the DW write and in-place write both
+    ///      succeed normally.
+    ///   3. Simulate a torn write by manually corrupting the in-place location
+    ///      on disk (as if the machine crashed mid-write).
+    ///   4. Call `recover_torn_pages()`.
+    ///   5. Verify the in-place copy has been restored from the DW image.
+    #[test]
+    fn doublewrite_recover_torn_page() {
+        use crate::io::posix::PosixFileSystem;
+        use crate::storage::page::{PAGE_SIZE, PageType, SlottedPage};
+        use crate::wal::doublewrite::DoubleWriteBuffer;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let data_path = dir.path().join(PageManager::DATA_FILE);
+        let dw_path = dir.path().join("test.dw");
+
+        // Initialise the page manager and attach a DW buffer.
+        let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32, &fs).unwrap();
+        pm.sync_superblock(&fs).unwrap();
+        pm.sync_bitmap(&fs).unwrap();
+        let dw = Arc::new(DoubleWriteBuffer::open(dw_path, &fs).unwrap());
+        pm.set_doublewrite(dw.clone());
+
+        // Allocate a page and write a known sentinel.
+        let pid = pm.allocate_page();
+        let mut page = SlottedPage::init(pid, PageType::SlottedData);
+        page.buf[SlottedPage::HEADER_SIZE] = 0xDE;
+        page.buf[SlottedPage::HEADER_SIZE + 1] = 0xAD;
+        page.update_checksum();
+        pm.write_page(&fs, pid, &mut page.buf).unwrap();
+
+        // At this point the DW buffer was cleared by write_page (normal path).
+        // Re-stage the page manually to simulate a state where the DW buffer
+        // holds a good copy but the in-place location is corrupt (torn write).
+        let pages: Vec<(u64, &[u8])> = vec![(pid, &page.buf[..])];
+        dw.write_batch(&pages, &fs).unwrap();
+
+        // Corrupt the in-place page on disk (simulate a torn write).
+        let handle = fs.open(&data_path, false).unwrap();
+        let corrupt_offset = pid * PAGE_SIZE as u64;
+        let corrupt_buf = vec![0xFFu8; PAGE_SIZE];
+        handle.write_at(&corrupt_buf, corrupt_offset).unwrap();
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        // Verify that the in-place copy is now bad.
+        let handle = fs.open(&data_path, false).unwrap();
+        let mut check_buf = crate::io::AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut check_buf, corrupt_offset).unwrap();
+        drop(handle);
+        assert!(
+            !SlottedPage::verify_checksum_bytes(&check_buf),
+            "the in-place copy must be corrupt before recovery"
+        );
+
+        // Run torn-page recovery.
+        let restored = pm.recover_torn_pages(&fs).unwrap();
+        assert_eq!(restored, 1, "exactly one torn page must be restored");
+
+        // Verify the in-place copy matches the original good page.
+        let handle = fs.open(&data_path, false).unwrap();
+        let mut recovered_buf = crate::io::AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut recovered_buf, corrupt_offset).unwrap();
+        drop(handle);
+        assert_eq!(
+            &recovered_buf[..],
+            &page.buf[..],
+            "restored page must match the original doublewrite copy"
+        );
+        assert!(
+            SlottedPage::verify_checksum_bytes(&recovered_buf),
+            "restored page must have a valid checksum"
         );
     }
 }

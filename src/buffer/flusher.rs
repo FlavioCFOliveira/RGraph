@@ -101,9 +101,12 @@ impl Flusher {
     /// 1. Gather pending writes, skipping frames whose `rec_lsn` exceeds
     ///    `durable` (WAL-before-data ordering — defer until WAL catches up).
     /// 2. Sort by `page_id` (disk offset).
-    /// 3. Group adjacent pages into merged extents up to [`MAX_BATCH_BYTES`].
-    /// 4. Write each extent via vectored I/O.
-    /// 5. Update frame descriptors (mark clean, clear rec_lsn).
+    /// 3. If a [`DoubleWriteBuffer`] is attached, stage ALL pending pages in a
+    ///    single `write_batch()` call before any in-place write is issued.
+    /// 4. Group adjacent pages into merged extents up to [`MAX_BATCH_BYTES`].
+    /// 5. Write each extent via vectored I/O.
+    /// 6. Clear the double-write buffer after all extents succeed.
+    /// 7. Update frame descriptors (mark clean, clear rec_lsn).
     fn flush_batch(
         pool: &BufferPool,
         fs: &dyn FileSystem,
@@ -141,6 +144,37 @@ impl Flusher {
         // Sort by page_id (disk order).
         pending.sort_by_key(|p| p.page_id);
 
+        // Update checksums for all pending frames so the DW copy is consistent.
+        for p in &pending {
+            let frame_mut = pool.frame_mut(p.fid);
+            crate::storage::page::SlottedPage::update_checksum_bytes(&mut frame_mut.buf);
+        }
+
+        // Stage ALL pending pages in one doublewrite batch before any in-place
+        // write.  If we crash between the DW sync and the data writes, recovery
+        // can restore any partially-written page from the DW copy.
+        if let Some(dw) = pool.doublewrite() {
+            let pages: Vec<(u64, &[u8])> = pending
+                .iter()
+                .map(|p| {
+                    let frame = pool.frame(p.fid);
+                    (p.page_id, &frame.buf[..])
+                })
+                .collect();
+            if let Err(e) = dw.write_batch(&pages, fs) {
+                eprintln!("flusher doublewrite staging failed: {}", e);
+                // Release inflight locks so frames can be retried.
+                for p in &pending {
+                    let frame = pool.frame(p.fid);
+                    frame.desc.io_inflight.store(false, Ordering::Release);
+                }
+                return;
+            }
+        }
+
+        // Track whether all extents succeeded so we know whether to clear DW.
+        let mut all_extents_ok = true;
+
         // Group adjacent pages into extents and write each extent.
         let mut group_start = 0;
         while group_start < pending.len() {
@@ -160,6 +194,7 @@ impl Flusher {
                     extent[0].page_id,
                     extent.last().unwrap().page_id,
                     e);
+                all_extents_ok = false;
                 // Mark frames as no longer inflight so they can be retried.
                 for p in extent {
                     let frame = pool.frame(p.fid);
@@ -177,6 +212,14 @@ impl Flusher {
             }
 
             group_start = group_end;
+        }
+
+        // Clear the double-write buffer only after all in-place writes succeeded.
+        // If any extent failed, leave the DW entry so recovery can repair it.
+        // Non-fatal: a clear failure just means the DW entry persists until
+        // the next successful flush clears it.
+        if all_extents_ok {
+            let _ = pool.doublewrite().map(|dw| dw.clear(fs));
         }
     }
 

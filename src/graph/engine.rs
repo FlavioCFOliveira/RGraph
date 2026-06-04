@@ -17,10 +17,12 @@ use crate::storage::manager::num_bitmap_pages;
 use crate::storage::meta::load_superblock;
 use crate::storage::page::{PAGE_SIZE, PageId, PageType, SlottedPage};
 use crate::wal::aries::AriesRecovery;
+use crate::wal::doublewrite::DoubleWriteBuffer;
 use crate::wal::record::{RecordType, WalRecord};
 use crate::wal::writer::WalWriter;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Monotonically-increasing graph-entity id allocator.
@@ -230,6 +232,12 @@ impl GraphStorageEngine {
         // Write bitmap page.
         pm.sync_bitmap(fs)?;
 
+        // Initialise the double-write buffer alongside the data file.
+        // The DW file lives next to the data file so it survives across restarts.
+        let dw_path = data_path.with_extension("dw");
+        let dw = Arc::new(DoubleWriteBuffer::open(dw_path, fs)?);
+        pm.set_doublewrite(dw);
+
         // Initialise WAL with a buffered filesystem (WAL does not use O_DIRECT).
         let wal_dir = data_path.parent().unwrap().join("wal");
         let wal_fs = crate::io::posix::PosixFileSystem::new(false);
@@ -283,6 +291,20 @@ impl GraphStorageEngine {
         drop(handle);
 
         let mut pm = PageManager::open_multi(data_path.clone(), sb, bitmap_bufs, fs)?;
+
+        // Open the double-write buffer and run torn-page recovery before any
+        // WAL-based REDO.  This ensures that pages partially overwritten by the
+        // previous session are restored to a coherent state before ARIES reads
+        // them.
+        let dw_path = data_path.with_extension("dw");
+        let dw = Arc::new(DoubleWriteBuffer::open(dw_path, fs)?);
+        pm.set_doublewrite(dw);
+        let torn = pm.recover_torn_pages(fs)?;
+        if torn > 0 {
+            // Non-fatal: ARIES will REDO any operations that updated these pages
+            // after they were last written to the DW buffer.
+            eprintln!("DoubleWriteBuffer: restored {} torn page(s) before ARIES recovery", torn);
+        }
 
         // Run full ARIES recovery (ANALYSIS → REDO → UNDO) using a buffered
         // filesystem.  WAL does not use O_DIRECT; only data pages do.

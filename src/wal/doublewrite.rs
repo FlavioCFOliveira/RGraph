@@ -43,6 +43,7 @@ const ENTRY_SIZE: usize = 8 + PAGE_SIZE; // page_id (8) + image (PAGE_SIZE)
 ///
 /// Create with [`DoubleWriteBuffer::open`].  The file is created if it does
 /// not exist.
+#[derive(Debug)]
 pub struct DoubleWriteBuffer {
     /// Path of the doublewrite file.
     path: PathBuf,
