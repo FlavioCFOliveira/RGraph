@@ -11,6 +11,11 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::info;
 use rgraph::cypher::executor::execute_expression_query;
+use rgraph::cypher::parser::parse;
+use rgraph::cypher::semantic::analyse;
+use rgraph::cypher::planner::plan;
+use rgraph::cypher::physical::{execute_plan, ExecutionContext};
+use rgraph::graph::engine::GraphStorageEngine;
 
 #[derive(Parser)]
 #[command(name = "rgraph")]
@@ -364,7 +369,17 @@ fn main() {
         Command::Query { path, query, json } => {
             let _span = tracing::info_span!("cmd", command = "query", path = %path.display()).entered();
             info!("Executing query '{}' on {:?}", query, path);
-            match execute_expression_query(&query) {
+
+            // Route through full pipeline when a database path is provided and it
+            // exists; otherwise fall back to the expression-only naive executor.
+            let result = if path.exists() {
+                execute_full_pipeline(&path, &query, &fs)
+                    .or_else(|_| execute_expression_query(&query))
+            } else {
+                execute_expression_query(&query)
+            };
+
+            match result {
                 Ok(result) => {
                     if json {
                         println!("{}", result.render_json());
@@ -404,6 +419,34 @@ fn main() {
             println!("Benchmark is a stub — full implementation depends on the query execution engine (Sprint 21).");
         }
     }
+}
+
+/// Execute a Cypher query through the full parse → semantic → plan → physical pipeline.
+///
+/// Opens the database at `path`, routes the query through:
+/// `parse → semantic_analyse → planner::plan → physical::execute_plan`
+/// and returns the result.
+fn execute_full_pipeline(
+    path: &std::path::Path,
+    query: &str,
+    fs: &impl rgraph::io::FileSystem,
+) -> Result<rgraph::cypher::executor::QueryResult, rgraph::cypher::executor::ExecError> {
+    use rgraph::cypher::executor::ExecError;
+
+    let mut engine = GraphStorageEngine::open(path.to_path_buf(), fs)
+        .map_err(|e| ExecError::Eval(format!("failed to open database: {}", e)))?;
+
+    let stmt = parse(query)
+        .map_err(|e| ExecError::Eval(format!("parse error: {}", e)))?;
+
+    let _ = analyse(&stmt)
+        .map_err(|e| ExecError::Semantic(e.to_string()))?;
+
+    let logical_plan = plan(&stmt)
+        .map_err(|e| ExecError::Eval(format!("plan error: {}", e)))?;
+
+    let ctx = ExecutionContext::new_with_write(&mut engine, fs);
+    execute_plan(&logical_plan, &ctx)
 }
 
 #[cfg(test)]

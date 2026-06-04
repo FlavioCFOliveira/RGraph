@@ -42,6 +42,14 @@ impl Graph {
         Self { engine }
     }
 
+    /// Create a `GraphMut` borrowing a `&mut GraphStorageEngine`.
+    ///
+    /// Useful when you do not own the engine but need graph-level mutation
+    /// (e.g. inside the physical execution engine).
+    pub fn new_ref(engine: &mut GraphStorageEngine) -> GraphMut<'_> {
+        GraphMut { engine }
+    }
+
     /// Return a mutable reference to the underlying engine.
     pub fn engine_mut(&mut self) -> &mut GraphStorageEngine {
         &mut self.engine
@@ -395,6 +403,166 @@ impl Graph {
         }
         Ok(nodes)
     }
+}
+
+// ------------------------------------------------------------------
+// GraphMut — graph mutation via borrowed engine reference
+// ------------------------------------------------------------------
+
+/// Graph-level mutation operations backed by a borrowed `&mut GraphStorageEngine`.
+///
+/// This is the borrowed counterpart of [`Graph`].  The physical execution
+/// engine uses `GraphMut` to create and delete nodes/relationships without
+/// taking ownership of the engine.
+pub struct GraphMut<'a> {
+    engine: &'a mut GraphStorageEngine,
+}
+
+impl<'a> GraphMut<'a> {
+    /// Insert a node into the graph (same semantics as [`Graph::create_node`]).
+    pub fn create_node(
+        &mut self,
+        builder: NodeBuilder,
+        fs: &dyn FileSystem,
+    ) -> Result<(SlotRef, u64), StorageError> {
+        let (mut record, properties) = builder.into_parts();
+        let id = self.engine.id_allocator.allocate();
+        record.node_id = id;
+        let slot = self.engine.put_node(&record, fs)?;
+        attach_properties_to_node_engine(self.engine, id, slot, properties, fs)?;
+        Ok((slot, id))
+    }
+
+    /// Insert a relationship into the graph.
+    pub fn create_relationship(
+        &mut self,
+        builder: RelationshipBuilder,
+        fs: &dyn FileSystem,
+    ) -> Result<(SlotRef, u64), StorageError> {
+        let (mut record, properties) = builder.into_parts().map_err(|e| {
+            StorageError::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e.to_string(),
+            ))
+        })?;
+        let id = self.engine.id_allocator.allocate();
+        record.edge_id = id;
+
+        let source_slot = self.engine.lookup_node_slot(record.source_id)?
+            .ok_or(StorageError::NotFound)?;
+        let target_slot = self.engine.lookup_node_slot(record.target_id)?
+            .ok_or(StorageError::NotFound)?;
+        record.source_node = source_slot;
+        record.target_node = target_slot;
+
+        let slot = self.engine.put_edge(&record, fs)?;
+        attach_properties_to_edge_engine(self.engine, id, slot, properties, fs)?;
+        Ok((slot, id))
+    }
+
+    /// Delete a node (tombstone).
+    pub fn delete_node(&mut self, node_id: u64, fs: &dyn FileSystem) -> Result<(), StorageError> {
+        self.engine.delete_node(node_id, fs)
+    }
+
+    /// Delete an edge (tombstone).
+    pub fn delete_edge(&mut self, edge_id: u64, fs: &dyn FileSystem) -> Result<(), StorageError> {
+        self.engine.delete_edge(edge_id, fs)
+    }
+
+    /// Read a node with its properties.
+    pub fn get_node(&self, node_id: u64, fs: &dyn FileSystem) -> Result<Option<Node>, StorageError> {
+        let record = self.engine.get_node(node_id, fs)?;
+        match record {
+            Some(r) if r.flags & node_flags::DELETED == 0 => {
+                let properties = read_property_chain_engine(self.engine, r.first_property, fs)?;
+                Ok(Some(Node { node_id: r.node_id, label_id: r.label_id, properties }))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// Shared engine-level property helpers (free functions)
+// ------------------------------------------------------------------
+
+fn attach_properties_to_node_engine(
+    engine: &mut GraphStorageEngine,
+    node_id: u64,
+    _slot: SlotRef,
+    properties: HashMap<String, Property>,
+    fs: &dyn FileSystem,
+) -> Result<(), StorageError> {
+    if properties.is_empty() {
+        return Ok(());
+    }
+    let mut entries: Vec<(String, Property)> = properties.into_iter().collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let mut next_slot = SlotRef::NULL;
+    for (key, value) in entries.into_iter().rev() {
+        let (vtype, payload) = value.to_value_type_payload()
+            .unwrap_or((ValueType::Null, Vec::new()));
+        let mut prop = PropertyRecord::inline(&key, 0, vtype, payload.clone());
+        prop.next_property = next_slot;
+        let prop_slot = engine.put_property(&prop, fs)?;
+        next_slot = prop_slot;
+        let _ = engine.insert_property_index(node_id as u128, 0, vtype, &payload, prop_slot);
+    }
+    engine.attach_property_to_node(node_id, next_slot, fs)?;
+    Ok(())
+}
+
+fn attach_properties_to_edge_engine(
+    engine: &mut GraphStorageEngine,
+    edge_id: u64,
+    _slot: SlotRef,
+    properties: HashMap<String, Property>,
+    fs: &dyn FileSystem,
+) -> Result<(), StorageError> {
+    if properties.is_empty() {
+        return Ok(());
+    }
+    let mut entries: Vec<(String, Property)> = properties.into_iter().collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let mut next_slot = SlotRef::NULL;
+    for (key, value) in entries.into_iter().rev() {
+        let (vtype, payload) = value.to_value_type_payload()
+            .unwrap_or((ValueType::Null, Vec::new()));
+        let mut prop = PropertyRecord::inline(&key, 0, vtype, payload.clone());
+        prop.next_property = next_slot;
+        let prop_slot = engine.put_property(&prop, fs)?;
+        next_slot = prop_slot;
+        let _ = engine.insert_property_index(edge_id as u128, 0, vtype, &payload, prop_slot);
+    }
+    engine.attach_property_to_edge(edge_id, next_slot, fs)?;
+    Ok(())
+}
+
+pub fn read_property_chain_engine(
+    engine: &GraphStorageEngine,
+    head: SlotRef,
+    fs: &dyn FileSystem,
+) -> Result<HashMap<String, Property>, StorageError> {
+    let mut map = HashMap::new();
+    let mut current = head;
+    let mut depth = 0usize;
+    const MAX_CHAIN_DEPTH: usize = 4096;
+    while !current.is_null() && depth < MAX_CHAIN_DEPTH {
+        let prop_opt = engine.get_property(current, fs)?;
+        let prop = match prop_opt {
+            Some(p) => p,
+            None => break,
+        };
+        let value_type = crate::graph::record::ValueType::from_u8(prop.header.value_type);
+        if let Some(vt) = value_type {
+            let property_val = decode_property_value(vt, &prop.payload);
+            map.insert(prop.property_name.clone(), property_val);
+        }
+        current = prop.next_property;
+        depth += 1;
+    }
+    Ok(map)
 }
 
 // ------------------------------------------------------------------

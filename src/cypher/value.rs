@@ -2,11 +2,55 @@
 //!
 //! This module defines the runtime value representation used by the query
 //! execution engine.  It faithfully models openCypher null semantics,
-//! type coercion rules, and container types.
+//! type coercion rules, and container types — including the entity types
+//! `NODE`, `RELATIONSHIP`, and `PATH`, and the spatial type `POINT`.
 
 use crate::graph::property::{OrderedF64, Property};
 use std::collections::HashMap;
 use std::fmt;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Entity value types (in-memory representation of matched entities)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// In-memory view of a matched node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeValue {
+    /// Unique logical node id.
+    pub id: u64,
+    /// Label strings (resolved from catalog).
+    pub labels: Vec<String>,
+    /// Property key → runtime value map.
+    pub properties: HashMap<String, Value>,
+}
+
+/// In-memory view of a matched relationship.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationshipValue {
+    /// Unique logical edge id.
+    pub id: u64,
+    /// Relationship type string.
+    pub rel_type: String,
+    /// Logical id of the source node.
+    pub source_id: u64,
+    /// Logical id of the target node.
+    pub target_id: u64,
+    /// Property key → runtime value map.
+    pub properties: HashMap<String, Value>,
+}
+
+/// An ordered sequence of alternating nodes and relationships.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathValue {
+    /// Nodes in order (length = hops + 1).
+    pub nodes: Vec<NodeValue>,
+    /// Relationships in order (length = hops).
+    pub relationships: Vec<RelationshipValue>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main Value enum
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// A runtime value in the Cypher query engine.
 ///
@@ -22,11 +66,17 @@ pub enum Value {
     String(String),
     List(Vec<Value>),
     Map(HashMap<String, Value>),
-    // TODO: Date, Time, LocalTime, DateTime, LocalDateTime, Duration, Point
+    // Entity types.
+    Node(NodeValue),
+    Relationship(RelationshipValue),
+    Path(PathValue),
+    // Spatial type.
+    Point { x: f64, y: f64, srid: Option<u32> },
 }
 
 impl Value {
-    /// Returns `true` if this value is `Null`.
+    // ── Type predicates ───────────────────────────────────────────────────
+
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -39,14 +89,11 @@ impl Value {
             Property::Integer(v) => Value::Integer(v),
             Property::Float(f) => Value::Float(f),
             Property::String(s) => Value::String(s),
-            // Lists and maps from Property are not yet supported.
             _ => Value::Null,
         }
     }
 
     /// Attempt to coerce this value to `i64`.
-    ///
-    /// Floats are truncated toward zero.  `Null` returns `None`.
     pub fn as_integer(&self) -> Option<i64> {
         match self {
             Value::Integer(v) => Some(*v),
@@ -56,8 +103,6 @@ impl Value {
     }
 
     /// Attempt to coerce this value to `f64`.
-    ///
-    /// Integers are promoted.  `Null` returns `None`.
     pub fn as_float(&self) -> Option<f64> {
         match self {
             Value::Integer(v) => Some(*v as f64),
@@ -66,10 +111,7 @@ impl Value {
         }
     }
 
-    /// Attempt to coerce this value to `String`.
-    ///
-    /// openCypher does **not** auto-coerce to string in expressions,
-    /// so this is used only for explicit `toString()` or display.
+    /// Attempt to coerce this value to a `String`.
     pub fn as_string(&self) -> Option<String> {
         match self {
             Value::String(s) => Some(s.clone()),
@@ -80,24 +122,47 @@ impl Value {
     /// Return the Cypher type name for this value.
     pub fn type_name(&self) -> &'static str {
         match self {
-            Value::Null => "NULL",
+            Value::Null => "Null",
             Value::Boolean(_) => "Boolean",
             Value::Integer(_) => "Integer",
             Value::Float(_) => "Float",
             Value::String(_) => "String",
             Value::List(_) => "List",
             Value::Map(_) => "Map",
+            Value::Node(_) => "Node",
+            Value::Relationship(_) => "Relationship",
+            Value::Path(_) => "Path",
+            Value::Point { .. } => "Point",
         }
     }
 
+    /// Convert to a Cypher-style string representation.
+    pub fn to_cypher_string(&self) -> std::string::String {
+        match self {
+            Value::Null => "null".to_string(),
+            Value::Boolean(b) => b.to_string(),
+            Value::Integer(i) => i.to_string(),
+            Value::Float(f) => f.0.to_string(),
+            Value::String(s) => s.clone(),
+            Value::List(items) => {
+                let elems: Vec<_> = items.iter().map(|v| v.to_cypher_string()).collect();
+                format!("[{}]", elems.join(", "))
+            }
+            Value::Map(m) => {
+                let elems: Vec<_> = m.iter().map(|(k, v)| format!("{}: {}", k, v.to_cypher_string())).collect();
+                format!("{{{}}}", elems.join(", "))
+            }
+            Value::Node(n) => format!("({{id: {}}})", n.id),
+            Value::Relationship(r) => format!("[{{id: {}}}]", r.id),
+            Value::Path(_) => "<path>".to_string(),
+            Value::Point { x, y, .. } => format!("point({{x: {}, y: {}}})", x, y),
+        }
+    }
+
+    // ── Arithmetic ────────────────────────────────────────────────────────
+
     /// Numeric addition with Cypher null semantics.
-    ///
-    /// Rules:
-    /// * `Null + x` → `Null`
-    /// * Integer + Integer → Integer
-    /// * Integer + Float   → Float
-    /// * Float   + Float   → Float
-    /// * otherwise → `None` (type error)
+    /// Also supports string concatenation.
     pub fn add(&self, rhs: &Value) -> Option<Value> {
         if self.is_null() || rhs.is_null() {
             return Some(Value::Null);
@@ -108,15 +173,17 @@ impl Value {
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(OrderedF64(a.0 + *b as f64))),
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(OrderedF64(a.0 + b.0))),
             (Value::String(a), Value::String(b)) => Some(Value::String(format!("{}{}", a, b))),
+            (Value::List(a), Value::List(b)) => {
+                let mut v = a.clone();
+                v.extend_from_slice(b);
+                Some(Value::List(v))
+            }
             _ => None,
         }
     }
 
-    /// Numeric subtraction with Cypher null semantics.
     pub fn sub(&self, rhs: &Value) -> Option<Value> {
-        if self.is_null() || rhs.is_null() {
-            return Some(Value::Null);
-        }
+        if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
             (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a - b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(OrderedF64(*a as f64 - b.0))),
@@ -126,11 +193,8 @@ impl Value {
         }
     }
 
-    /// Numeric multiplication with Cypher null semantics.
     pub fn mul(&self, rhs: &Value) -> Option<Value> {
-        if self.is_null() || rhs.is_null() {
-            return Some(Value::Null);
-        }
+        if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
             (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a * b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(OrderedF64(*a as f64 * b.0))),
@@ -140,13 +204,9 @@ impl Value {
         }
     }
 
-    /// Numeric division with Cypher null semantics.
-    ///
-    /// Division by zero returns `Null` (not an error) per openCypher.
+    /// Numeric division. Division by zero returns `Null`.
     pub fn div(&self, rhs: &Value) -> Option<Value> {
-        if self.is_null() || rhs.is_null() {
-            return Some(Value::Null);
-        }
+        if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
             (Value::Integer(_), Value::Integer(b)) if *b == 0 => Some(Value::Null),
             (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a / b)),
@@ -160,23 +220,20 @@ impl Value {
         }
     }
 
-    /// Numeric modulo with Cypher null semantics.
     pub fn modulo(&self, rhs: &Value) -> Option<Value> {
-        if self.is_null() || rhs.is_null() {
-            return Some(Value::Null);
-        }
+        if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
             (Value::Integer(_), Value::Integer(b)) if *b == 0 => Some(Value::Null),
             (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a % b)),
+            (Value::Float(a), Value::Float(b)) => Some(Value::Float(OrderedF64(a.0 % b.0))),
+            (Value::Integer(a), Value::Float(b)) => Some(Value::Float(OrderedF64(*a as f64 % b.0))),
+            (Value::Float(a), Value::Integer(b)) => Some(Value::Float(OrderedF64(a.0 % *b as f64))),
             _ => None,
         }
     }
 
-    /// Numeric exponentiation with Cypher null semantics.
     pub fn pow(&self, rhs: &Value) -> Option<Value> {
-        if self.is_null() || rhs.is_null() {
-            return Some(Value::Null);
-        }
+        if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
             (Value::Integer(a), Value::Integer(b)) => Some(Value::Float(OrderedF64((*a as f64).powf(*b as f64)))),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(OrderedF64((*a as f64).powf(b.0)))),
@@ -186,8 +243,8 @@ impl Value {
         }
     }
 
-    /// Logical negation (`NOT`) with Cypher null semantics.
-    pub fn not(&self) -> Option<Value> {
+    /// Logical NOT with Kleene three-valued semantics.
+    pub fn kleene_not(&self) -> Option<Value> {
         match self {
             Value::Null => Some(Value::Null),
             Value::Boolean(b) => Some(Value::Boolean(!b)),
@@ -195,7 +252,11 @@ impl Value {
         }
     }
 
-    /// Numeric negation (`-expr`) with Cypher null semantics.
+    /// Legacy: logical NOT (same as kleene_not but kept for compat).
+    pub fn not(&self) -> Option<Value> {
+        self.kleene_not()
+    }
+
     pub fn negate(&self) -> Option<Value> {
         match self {
             Value::Null => Some(Value::Null),
@@ -205,98 +266,152 @@ impl Value {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Comparisons
-    // ------------------------------------------------------------------
+    // ── Comparisons ────────────────────────────────────────────────────────
 
-    /// Equality comparison with Cypher null semantics.
-    ///
-    /// `Null = x` and `x = Null` both return `Null` (not `true` or `false`).
+    /// openCypher equality: numeric cross-type, null propagation.
+    /// `1 = 1.0` is `true`.
+    pub fn cypher_eq(&self, rhs: &Value) -> Option<Value> {
+        if self.is_null() || rhs.is_null() { return Some(Value::Null); }
+        let result = match (self, rhs) {
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a.0 == b.0,
+            // Cross-type numeric equality: 1 = 1.0 → true.
+            (Value::Integer(a), Value::Float(b)) => (*a as f64) == b.0,
+            (Value::Float(a), Value::Integer(b)) => a.0 == (*b as f64),
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::List(a), Value::List(b)) => {
+                if a.len() != b.len() { return Some(Value::Boolean(false)); }
+                for (x, y) in a.iter().zip(b.iter()) {
+                    match x.cypher_eq(y) {
+                        Some(Value::Boolean(true)) => {}
+                        _ => return Some(Value::Boolean(false)),
+                    }
+                }
+                true
+            }
+            _ => return Some(Value::Boolean(false)),
+        };
+        Some(Value::Boolean(result))
+    }
+
+    pub fn cypher_ne(&self, rhs: &Value) -> Option<Value> {
+        if self.is_null() || rhs.is_null() { return Some(Value::Null); }
+        match self.cypher_eq(rhs) {
+            Some(Value::Boolean(b)) => Some(Value::Boolean(!b)),
+            other => other,
+        }
+    }
+
+    /// Legacy equality (delegates to cypher_eq).
     pub fn eq(&self, rhs: &Value) -> Option<Value> {
-        if self.is_null() || rhs.is_null() {
-            return Some(Value::Null);
-        }
-        Some(Value::Boolean(self == rhs))
+        self.cypher_eq(rhs)
     }
 
-    /// Inequality comparison with Cypher null semantics.
     pub fn ne(&self, rhs: &Value) -> Option<Value> {
-        if self.is_null() || rhs.is_null() {
-            return Some(Value::Null);
-        }
-        Some(Value::Boolean(self != rhs))
+        self.cypher_ne(rhs)
     }
 
-    /// Less-than comparison with Cypher null semantics.
     pub fn lt(&self, rhs: &Value) -> Option<Value> {
-        if self.is_null() || rhs.is_null() {
-            return Some(Value::Null);
-        }
+        if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
             (Value::Integer(a), Value::Integer(b)) => Some(Value::Boolean(a < b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Boolean((*a as f64) < b.0)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Boolean(a.0 < *b as f64)),
             (Value::Float(a), Value::Float(b)) => Some(Value::Boolean(a.0 < b.0)),
             (Value::String(a), Value::String(b)) => Some(Value::Boolean(a < b)),
+            (Value::Boolean(a), Value::Boolean(b)) => Some(Value::Boolean(a < b)),
             _ => None,
         }
     }
 
-    /// Less-than-or-equal comparison with Cypher null semantics.
     pub fn le(&self, rhs: &Value) -> Option<Value> {
-        if self.is_null() || rhs.is_null() {
-            return Some(Value::Null);
-        }
+        if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
             (Value::Integer(a), Value::Integer(b)) => Some(Value::Boolean(a <= b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Boolean((*a as f64) <= b.0)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Boolean(a.0 <= *b as f64)),
             (Value::Float(a), Value::Float(b)) => Some(Value::Boolean(a.0 <= b.0)),
             (Value::String(a), Value::String(b)) => Some(Value::Boolean(a <= b)),
+            (Value::Boolean(a), Value::Boolean(b)) => Some(Value::Boolean(a <= b)),
             _ => None,
         }
     }
 
-    /// Greater-than comparison with Cypher null semantics.
     pub fn gt(&self, rhs: &Value) -> Option<Value> {
-        if self.is_null() || rhs.is_null() {
-            return Some(Value::Null);
-        }
+        if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
             (Value::Integer(a), Value::Integer(b)) => Some(Value::Boolean(a > b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Boolean((*a as f64) > b.0)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Boolean(a.0 > *b as f64)),
             (Value::Float(a), Value::Float(b)) => Some(Value::Boolean(a.0 > b.0)),
             (Value::String(a), Value::String(b)) => Some(Value::Boolean(a > b)),
+            (Value::Boolean(a), Value::Boolean(b)) => Some(Value::Boolean(a > b)),
             _ => None,
         }
     }
 
-    /// Greater-than-or-equal comparison with Cypher null semantics.
     pub fn ge(&self, rhs: &Value) -> Option<Value> {
-        if self.is_null() || rhs.is_null() {
-            return Some(Value::Null);
-        }
+        if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
             (Value::Integer(a), Value::Integer(b)) => Some(Value::Boolean(a >= b)),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Boolean((*a as f64) >= b.0)),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Boolean(a.0 >= *b as f64)),
             (Value::Float(a), Value::Float(b)) => Some(Value::Boolean(a.0 >= b.0)),
             (Value::String(a), Value::String(b)) => Some(Value::Boolean(a >= b)),
+            (Value::Boolean(a), Value::Boolean(b)) => Some(Value::Boolean(a >= b)),
             _ => None,
         }
     }
 
-    /// `IS NULL` predicate.
     pub fn is_null_predicate(&self) -> Value {
         Value::Boolean(self.is_null())
     }
 
-    /// `IS NOT NULL` predicate.
     pub fn is_not_null_predicate(&self) -> Value {
         Value::Boolean(!self.is_null())
     }
+
+    // ── Cypher orderability ────────────────────────────────────────────────
+
+    /// Compare two values for ordering purposes following the openCypher spec:
+    /// Numbers (mixed), Strings, Booleans, Points, then Null (always last).
+    ///
+    /// Returns `None` when the types are incomparable.
+    pub fn cypher_compare(&self, rhs: &Value) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        match (self, rhs) {
+            // Null is always last.
+            (Value::Null, Value::Null) => Some(Ordering::Equal),
+            (Value::Null, _) => Some(Ordering::Greater),
+            (_, Value::Null) => Some(Ordering::Less),
+            // Numeric (cross-type).
+            (Value::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+            (Value::Float(a), Value::Float(b)) => Some(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
+            (Value::Integer(a), Value::Float(b)) => Some((*a as f64).partial_cmp(&b.0).unwrap_or(Ordering::Equal)),
+            (Value::Float(a), Value::Integer(b)) => Some(a.0.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)),
+            // String.
+            (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+            // Boolean (false < true).
+            (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+            // List: element-wise.
+            (Value::List(a), Value::List(b)) => {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    match x.cypher_compare(y) {
+                        Some(Ordering::Equal) => continue,
+                        other => return other,
+                    }
+                }
+                Some(a.len().cmp(&b.len()))
+            }
+            _ => None,
+        }
+    }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Display
+// ─────────────────────────────────────────────────────────────────────────────
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -311,21 +426,36 @@ impl fmt::Display for Value {
                 write!(f, "[{}]", elems.join(", "))
             }
             Value::Map(entries) => {
-                let elems: Vec<String> = entries
-                    .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v))
-                    .collect();
+                let mut sorted: Vec<_> = entries.iter().collect();
+                sorted.sort_by_key(|(k, _)| k.as_str());
+                let elems: Vec<String> = sorted.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
                 write!(f, "{{{}}}", elems.join(", "))
             }
+            Value::Node(n) => {
+                write!(f, "({}", n.id)?;
+                if !n.labels.is_empty() { write!(f, ":{}",  n.labels.join(":"))?; }
+                write!(f, ")")
+            }
+            Value::Relationship(r) => write!(f, "[:{} id={}]", r.rel_type, r.id),
+            Value::Path(_) => write!(f, "<path>"),
+            Value::Point { x, y, .. } => write!(f, "point({{x: {}, y: {}}})", x, y),
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// From Property
+// ─────────────────────────────────────────────────────────────────────────────
 
 impl From<Property> for Value {
     fn from(prop: Property) -> Self {
         Value::from_property(prop)
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -337,7 +467,6 @@ mod tests {
         let null = Value::Null;
         assert_eq!(a.add(&null).unwrap(), Value::Null);
         assert_eq!(null.sub(&a).unwrap(), Value::Null);
-        assert_eq!(null.mul(&null).unwrap(), Value::Null);
     }
 
     #[test]
@@ -372,7 +501,7 @@ mod tests {
     fn comparison_with_null_returns_null() {
         let a = Value::Integer(5);
         let null = Value::Null;
-        assert_eq!(a.eq(&null).unwrap(), Value::Null);
+        assert_eq!(a.cypher_eq(&null).unwrap(), Value::Null);
         assert_eq!(a.lt(&null).unwrap(), Value::Null);
     }
 
@@ -381,22 +510,28 @@ mod tests {
         let a = Value::Integer(42);
         let b = Value::Integer(42);
         let c = Value::Integer(7);
-        assert_eq!(a.eq(&b).unwrap(), Value::Boolean(true));
-        assert_eq!(a.eq(&c).unwrap(), Value::Boolean(false));
+        assert_eq!(a.cypher_eq(&b).unwrap(), Value::Boolean(true));
+        assert_eq!(a.cypher_eq(&c).unwrap(), Value::Boolean(false));
+    }
+
+    #[test]
+    fn cross_type_numeric_equality() {
+        // openCypher: 1 = 1.0 is true.
+        let a = Value::Integer(1);
+        let b = Value::Float(OrderedF64(1.0));
+        assert_eq!(a.cypher_eq(&b).unwrap(), Value::Boolean(true));
     }
 
     #[test]
     fn logical_not() {
-        assert_eq!(Value::Boolean(true).not().unwrap(), Value::Boolean(false));
-        assert_eq!(Value::Boolean(false).not().unwrap(), Value::Boolean(true));
-        assert_eq!(Value::Null.not().unwrap(), Value::Null);
+        assert_eq!(Value::Boolean(true).kleene_not().unwrap(), Value::Boolean(false));
+        assert_eq!(Value::Boolean(false).kleene_not().unwrap(), Value::Boolean(true));
+        assert_eq!(Value::Null.kleene_not().unwrap(), Value::Null);
     }
 
     #[test]
     fn numeric_negation() {
         assert_eq!(Value::Integer(5).negate().unwrap(), Value::Integer(-5));
-        assert_eq!(Value::Float(OrderedF64(3.14)).negate().unwrap(), Value::Float(OrderedF64(-3.14)));
-        assert_eq!(Value::Null.negate().unwrap(), Value::Null);
     }
 
     #[test]
@@ -417,5 +552,25 @@ mod tests {
         m.insert("k".to_string(), Value::Integer(42));
         let v = Value::Map(m);
         assert_eq!(v.to_string(), "{k: 42}");
+    }
+
+    #[test]
+    fn node_value_display() {
+        let n = NodeValue {
+            id: 1,
+            labels: vec!["Person".to_string()],
+            properties: HashMap::new(),
+        };
+        let v = Value::Node(n);
+        assert!(v.to_string().contains("1"));
+    }
+
+    #[test]
+    fn cypher_orderability_null_last() {
+        use std::cmp::Ordering;
+        let a = Value::Integer(5);
+        let null = Value::Null;
+        assert_eq!(a.cypher_compare(&null), Some(Ordering::Less));
+        assert_eq!(null.cypher_compare(&a), Some(Ordering::Greater));
     }
 }

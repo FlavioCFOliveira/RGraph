@@ -161,6 +161,11 @@ impl RelationshipBuilder {
         self
     }
 
+    /// Alias for [`type_id`] — set the relationship type id.
+    pub fn rel_type(self, type_id: u32) -> Self {
+        self.type_id(type_id)
+    }
+
     /// Add a property with a value that implements `Into<Property>`.
     pub fn property<K, V>(mut self, key: K, value: V) -> Self
     where

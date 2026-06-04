@@ -1,19 +1,23 @@
 //! Abstract Syntax Tree for openCypher queries.
 //!
-//! The AST is intentionally minimal: it supports the clauses and expressions
-//! required for Sprint 8 (fixed-length MATCH, WHERE, RETURN) and can be
-//! extended later for write clauses, aggregations, and sub-queries.
+//! The AST covers the full openCypher surface area required for Sprint C:
+//! all read clauses (MATCH, OPTIONAL MATCH, WITH, UNWIND, UNION, CALL),
+//! write clauses (CREATE, SET, REMOVE, DELETE, MERGE, FOREACH), and a
+//! complete expression language (CASE, comprehensions, quantifiers, parameters,
+//! temporal/spatial literals, EXISTS{}).
 //!
 //! Every AST node carries an optional [`TextRange`](text_size::TextRange)
-//! representing its source span in the original query text.  Spans are
-//! produced by the parser and consumed by the CST layer (see
-//! [`crate::cypher::syntax`]) for error reporting and IDE features.
+//! representing its source span in the original query text.
 
 use crate::graph::property::{OrderedF64, Property};
 use std::collections::HashMap;
 use text_size::TextRange;
 
-/// A top-level Cypher statement (e.g. a full query).
+// ─────────────────────────────────────────────────────────────────────────────
+// Top-level
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A top-level Cypher statement (may include UNION chains).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statement {
     pub clauses: Vec<Clause>,
@@ -21,10 +25,32 @@ pub struct Statement {
     pub span: Option<TextRange>,
 }
 
+impl Statement {
+    pub fn new() -> Self {
+        Self { clauses: Vec::new(), span: None }
+    }
+
+    pub fn with_clause(mut self, clause: Clause) -> Self {
+        self.clauses.push(clause);
+        self
+    }
+}
+
+impl Default for Statement {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Clauses
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// A single clause in a Cypher statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Clause {
     Match(MatchClause),
+    OptionalMatch(MatchClause),
     Return(ReturnClause),
     Where(WhereClause),
     Create(CreateClause),
@@ -32,13 +58,18 @@ pub enum Clause {
     Set(SetClause),
     Remove(RemoveClause),
     Merge(MergeClause),
+    With(WithClause),
+    Unwind(UnwindClause),
+    Union(UnionClause),
+    Call(CallClause),
+    Foreach(ForeachClause),
 }
 
 impl Clause {
-    /// Return the source span of this clause, if available.
     pub fn span(&self) -> Option<TextRange> {
         match self {
             Clause::Match(c) => c.span,
+            Clause::OptionalMatch(c) => c.span,
             Clause::Return(c) => c.span,
             Clause::Where(c) => c.span,
             Clause::Create(c) => c.span,
@@ -46,20 +77,45 @@ impl Clause {
             Clause::Set(c) => c.span,
             Clause::Remove(c) => c.span,
             Clause::Merge(c) => c.span,
+            Clause::With(c) => c.span,
+            Clause::Unwind(c) => c.span,
+            Clause::Union(c) => c.span,
+            Clause::Call(c) => c.span,
+            Clause::Foreach(c) => c.span,
         }
     }
 }
 
-/// `MATCH (pattern)` clause.
+/// `MATCH (pattern)` clause (also used for OPTIONAL MATCH).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchClause {
-    pub pattern: Pattern,
+    /// One or more comma-separated patterns.
+    pub patterns: Vec<NamedPattern>,
     pub span: Option<TextRange>,
 }
 
-/// `RETURN projection_list` clause.
+// Legacy compat shim: the old field name was `pattern` (single pattern).
+impl MatchClause {
+    /// Convenience getter — returns the first pattern's inner pattern.
+    pub fn pattern(&self) -> &Pattern {
+        &self.patterns[0].pattern
+    }
+}
+
+/// A pattern optionally bound to a path variable: `p = (a)-[r]->(b)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedPattern {
+    /// Optional path variable binding (`p = ...`).
+    pub variable: Option<String>,
+    pub pattern: Pattern,
+}
+
+/// `RETURN projection_list [DISTINCT] [ORDER BY ...] [SKIP n] [LIMIT n]`
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReturnClause {
+    pub distinct: bool,
+    /// When `star` is true the projection list is `*` (all in-scope variables).
+    pub star: bool,
     pub projections: Vec<Projection>,
     pub order_by: Vec<OrderItem>,
     pub skip: Option<Expression>,
@@ -77,11 +133,18 @@ pub struct WhereClause {
 /// `CREATE (pattern)` clause.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateClause {
-    pub pattern: Pattern,
+    pub patterns: Vec<NamedPattern>,
     pub span: Option<TextRange>,
 }
 
-/// `DELETE expression_list` clause (can be DETACH DELETE).
+impl CreateClause {
+    /// Convenience getter — returns the first pattern's inner pattern.
+    pub fn pattern(&self) -> &Pattern {
+        &self.patterns[0].pattern
+    }
+}
+
+/// `DELETE expression_list` (optionally DETACH).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteClause {
     pub expressions: Vec<Expression>,
@@ -89,28 +152,21 @@ pub struct DeleteClause {
     pub span: Option<TextRange>,
 }
 
-/// `SET item_list` clause where each item is `variable.prop = expr` or `variable:Label`.
+/// `SET item_list`
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetClause {
     pub items: Vec<SetItem>,
     pub span: Option<TextRange>,
 }
 
-/// A single item inside a SET clause.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SetItem {
-    Property { target: Box<Expression>, value: Expression },
-    Label { variable: String, labels: Vec<String> },
-}
-
-/// `REMOVE item_list` clause where each item is `variable.prop` or `variable:Label`.
+/// `REMOVE item_list`
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoveClause {
     pub items: Vec<RemoveItem>,
     pub span: Option<TextRange>,
 }
 
-/// `MERGE (pattern)` clause with optional ON CREATE / ON MATCH actions.
+/// `MERGE (pattern) [ON CREATE SET ...] [ON MATCH SET ...]`
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeClause {
     pub pattern: Pattern,
@@ -119,12 +175,85 @@ pub struct MergeClause {
     pub span: Option<TextRange>,
 }
 
+/// `WITH projection_list [WHERE predicate]` — scope barrier and variable rename.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WithClause {
+    pub distinct: bool,
+    pub star: bool,
+    pub projections: Vec<Projection>,
+    pub order_by: Vec<OrderItem>,
+    pub skip: Option<Expression>,
+    pub limit: Option<Expression>,
+    /// Optional WHERE predicate applied after the projection.
+    pub where_: Option<Expression>,
+    pub span: Option<TextRange>,
+}
+
+/// `UNWIND expression AS variable`
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnwindClause {
+    pub expression: Expression,
+    pub variable: String,
+    pub span: Option<TextRange>,
+}
+
+/// `UNION [ALL]` — combine two query parts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionClause {
+    pub all: bool,
+    pub span: Option<TextRange>,
+}
+
+/// `CALL procedure_name(args) YIELD ...` or `CALL { subquery }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallClause {
+    /// None if this is a `CALL { subquery }`.
+    pub procedure: Option<String>,
+    pub args: Vec<Expression>,
+    pub yield_items: Vec<Projection>,
+    /// Subquery body for `CALL { ... }`.
+    pub subquery: Option<Vec<Clause>>,
+    pub span: Option<TextRange>,
+}
+
+/// `FOREACH (variable IN expression | write_clauses...)`
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeachClause {
+    pub variable: String,
+    pub expression: Expression,
+    pub body: Vec<Clause>,
+    pub span: Option<TextRange>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SET / REMOVE items
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single item inside a SET clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetItem {
+    /// `variable.prop = expr`
+    Property { target: Box<Expression>, value: Expression },
+    /// `variable:Label`
+    Label { variable: String, labels: Vec<String> },
+    /// `variable += {map}` — merge properties.
+    Merge { variable: String, value: Expression },
+    /// `variable = {map}` — replace all properties.
+    Replace { variable: String, value: Expression },
+}
+
 /// A single item inside a REMOVE clause.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RemoveItem {
+    /// `variable.prop`
     Property { target: Box<Expression> },
+    /// `variable:Label`
     Label { variable: String, labels: Vec<String> },
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Patterns
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// A pattern is an alternating sequence of nodes and relationships.
 #[derive(Debug, Clone, PartialEq)]
@@ -153,6 +282,7 @@ impl PatternElement {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct NodePattern {
     pub variable: Option<String>,
+    /// Label alternatives: `:A|B` is represented as `vec!["A", "B"]`.
     pub labels: Vec<String>,
     pub properties: HashMap<String, Expression>,
     pub span: Option<TextRange>,
@@ -162,6 +292,7 @@ pub struct NodePattern {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelationshipPattern {
     pub direction: Direction,
+    /// Relationship type alternatives.
     pub types: Vec<String>,
     pub variable: Option<String>,
     pub properties: HashMap<String, Expression>,
@@ -180,8 +311,12 @@ pub enum Direction {
 /// Fixed or variable path length.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathLength {
+    /// Exactly one hop (default).
     Fixed(u32),
-    Variable, // TODO: support min..max
+    /// Variable hops with optional min and max bounds.
+    /// `[*]` → Range(1, None), `[*2]` → Range(2, Some(2)),
+    /// `[*2..5]` → Range(2, Some(5)), `[*..5]` → Range(1, Some(5)).
+    Range(u32, Option<u32>),
 }
 
 impl Default for PathLength {
@@ -190,7 +325,11 @@ impl Default for PathLength {
     }
 }
 
-/// `expression AS alias` in a RETURN clause.
+// ─────────────────────────────────────────────────────────────────────────────
+// Return / WITH body
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `expression AS alias` in a RETURN/WITH clause.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Projection {
     pub expression: Expression,
@@ -206,12 +345,21 @@ pub struct OrderItem {
     pub span: Option<TextRange>,
 }
 
-/// Expressions supported by the Sprint 8 subset.
+// ─────────────────────────────────────────────────────────────────────────────
+// Expressions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// All Cypher expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Literal(Literal),
     Variable(String),
+    Parameter(String),
     PropertyAccess { base: Box<Expression>, property: String, span: Option<TextRange> },
+    /// Dynamic property access: `map[$key]`.
+    DynamicPropertyAccess { base: Box<Expression>, index: Box<Expression>, span: Option<TextRange> },
+    /// Slice: `list[from..to]`.
+    Slice { base: Box<Expression>, from: Option<Box<Expression>>, to: Option<Box<Expression>>, span: Option<TextRange> },
     BinaryOp { op: BinaryOperator, left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
     Comparison { op: ComparisonOperator, left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
     UnaryOp { op: UnaryOperator, expr: Box<Expression>, span: Option<TextRange> },
@@ -219,40 +367,78 @@ pub enum Expression {
     IsNotNull(Box<Expression>),
     List(Vec<Expression>),
     Map(Vec<(String, Expression)>),
-    /// Function call: `name(args...)`.
     FunctionCall {
         name: String,
         args: Vec<Expression>,
         distinct: bool,
         span: Option<TextRange>,
     },
-    /// Boolean AND: `left AND right`.
     And { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
-    /// Boolean OR: `left OR right`.
     Or { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
-    /// Boolean XOR: `left XOR right`.
     Xor { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
-    /// String STARTS WITH: `left STARTS WITH right`.
+    Not { expr: Box<Expression>, span: Option<TextRange> },
     StartsWith { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
-    /// String ENDS WITH: `left ENDS WITH right`.
     EndsWith { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
-    /// String CONTAINS: `left CONTAINS right`.
     Contains { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
-    /// List/map membership: `left IN right`.
     In { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
-    /// Regex match: `left =~ right`.
     Regex { left: Box<Expression>, right: Box<Expression>, span: Option<TextRange> },
-    /// Wildcard `*` used inside `count(*)`.
     Wildcard,
+    /// `CASE subject WHEN ... THEN ... [ELSE ...] END` (simple form).
+    Case {
+        subject: Option<Box<Expression>>,
+        alternatives: Vec<CaseAlternative>,
+        default: Option<Box<Expression>>,
+        span: Option<TextRange>,
+    },
+    /// List comprehension: `[x IN list WHERE pred | expr]`.
+    ListComprehension {
+        variable: String,
+        source: Box<Expression>,
+        filter: Option<Box<Expression>>,
+        projection: Option<Box<Expression>>,
+        span: Option<TextRange>,
+    },
+    /// Pattern comprehension: `[(a)-[r]->(b) | expr]`.
+    PatternComprehension {
+        variable: Option<String>,
+        pattern: Pattern,
+        filter: Option<Box<Expression>>,
+        projection: Box<Expression>,
+        span: Option<TextRange>,
+    },
+    /// `reduce(acc = init, x IN list | expr)`.
+    Reduce {
+        accumulator: String,
+        init: Box<Expression>,
+        variable: String,
+        source: Box<Expression>,
+        body: Box<Expression>,
+        span: Option<TextRange>,
+    },
+    /// Quantifier predicates: `ALL`, `ANY`, `NONE`, `SINGLE`.
+    Quantifier {
+        kind: QuantifierKind,
+        variable: String,
+        source: Box<Expression>,
+        filter: Box<Expression>,
+        span: Option<TextRange>,
+    },
+    /// `EXISTS { subquery }` or `EXISTS pattern`.
+    Exists {
+        subquery: Option<Vec<Clause>>,
+        pattern: Option<Pattern>,
+        span: Option<TextRange>,
+    },
 }
 
 impl Expression {
-    /// Return the source span of this expression, if available.
     pub fn span(&self) -> Option<TextRange> {
         match self {
             Expression::Literal(l) => l.span(),
-            Expression::Variable(_) => None,
+            Expression::Variable(_) | Expression::Parameter(_) => None,
             Expression::PropertyAccess { span, .. } => *span,
+            Expression::DynamicPropertyAccess { span, .. } => *span,
+            Expression::Slice { span, .. } => *span,
             Expression::BinaryOp { span, .. } => *span,
             Expression::Comparison { span, .. } => *span,
             Expression::UnaryOp { span, .. } => *span,
@@ -263,15 +449,42 @@ impl Expression {
             Expression::And { span, .. } => *span,
             Expression::Or { span, .. } => *span,
             Expression::Xor { span, .. } => *span,
+            Expression::Not { span, .. } => *span,
             Expression::StartsWith { span, .. } => *span,
             Expression::EndsWith { span, .. } => *span,
             Expression::Contains { span, .. } => *span,
             Expression::In { span, .. } => *span,
             Expression::Regex { span, .. } => *span,
             Expression::Wildcard => None,
+            Expression::Case { span, .. } => *span,
+            Expression::ListComprehension { span, .. } => *span,
+            Expression::PatternComprehension { span, .. } => *span,
+            Expression::Reduce { span, .. } => *span,
+            Expression::Quantifier { span, .. } => *span,
+            Expression::Exists { span, .. } => *span,
         }
     }
 }
+
+/// CASE alternative: `WHEN condition THEN result`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseAlternative {
+    pub condition: Expression,
+    pub result: Expression,
+}
+
+/// Quantifier predicate kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantifierKind {
+    All,
+    Any,
+    None,
+    Single,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Operators
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Binary arithmetic operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +495,7 @@ pub enum BinaryOperator {
     Div,
     Mod,
     Pow,
+    Concat, // string concatenation (+) — same as Add, used for disambiguation
 }
 
 /// Comparison operators.
@@ -302,7 +516,11 @@ pub enum UnaryOperator {
     Neg,
 }
 
-/// Literal values.
+// ─────────────────────────────────────────────────────────────────────────────
+// Literals
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Literal values (lexer-level).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Null,
@@ -310,11 +528,16 @@ pub enum Literal {
     Integer(i64),
     Float(f64),
     String(String),
-    // TODO: Date, Duration, Point
+    // Temporal literals (the string is the ISO 8601 value).
+    Date(String),
+    Time(String),
+    LocalTime(String),
+    DateTime(String),
+    LocalDateTime(String),
+    Duration(String),
 }
 
 impl Literal {
-    /// Return the source span of this literal, if available.
     pub fn span(&self) -> Option<TextRange> {
         None
     }
@@ -327,32 +550,20 @@ impl Literal {
             Literal::Integer(v) => Property::Integer(*v),
             Literal::Float(v) => Property::Float(OrderedF64(*v)),
             Literal::String(s) => Property::String(s.clone()),
+            // Temporal literals stored as strings in the property layer for now.
+            Literal::Date(s)
+            | Literal::Time(s)
+            | Literal::LocalTime(s)
+            | Literal::DateTime(s)
+            | Literal::LocalDateTime(s)
+            | Literal::Duration(s) => Property::String(s.clone()),
         }
     }
 }
 
-impl Statement {
-    /// Create a new empty statement.
-    pub fn new() -> Self {
-        Self { clauses: Vec::new(), span: None }
-    }
-
-    /// Append a clause.
-    pub fn with_clause(mut self, clause: Clause) -> Self {
-        self.clauses.push(clause);
-        self
-    }
-}
-
-impl Default for Statement {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ------------------------------------------------------------------
-// Display impls for debugging
-// ------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Display implementations
+// ─────────────────────────────────────────────────────────────────────────────
 
 impl std::fmt::Display for Statement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -366,31 +577,46 @@ impl std::fmt::Display for Statement {
 impl std::fmt::Display for Clause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Clause::Match(m) => write!(f, "MATCH {}", m.pattern),
+            Clause::Match(m) | Clause::OptionalMatch(m) => {
+                if matches!(self, Clause::OptionalMatch(_)) {
+                    write!(f, "OPTIONAL ")?;
+                }
+                write!(f, "MATCH ")?;
+                for (i, np) in m.patterns.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    if let Some(v) = &np.variable {
+                        write!(f, "{} = ", v)?;
+                    }
+                    write!(f, "{}", np.pattern)?;
+                }
+                Ok(())
+            }
             Clause::Return(r) => {
                 write!(f, "RETURN ")?;
-                let items: Vec<String> = r.projections.iter().map(|p| p.to_string()).collect();
-                write!(f, "{}", items.join(", "))?;
+                if r.distinct { write!(f, "DISTINCT ")?; }
+                if r.star { write!(f, "*")?; } else {
+                    let items: Vec<String> = r.projections.iter().map(|p| p.to_string()).collect();
+                    write!(f, "{}", items.join(", "))?;
+                }
                 if !r.order_by.is_empty() {
                     let order: Vec<String> = r.order_by.iter().map(|o| o.to_string()).collect();
                     write!(f, " ORDER BY {}", order.join(", "))?;
                 }
-                if let Some(skip) = &r.skip {
-                    write!(f, " SKIP {}", skip)?;
-                }
-                if let Some(limit) = &r.limit {
-                    write!(f, " LIMIT {}", limit)?;
-                }
+                if let Some(skip) = &r.skip { write!(f, " SKIP {}", skip)?; }
+                if let Some(limit) = &r.limit { write!(f, " LIMIT {}", limit)?; }
                 Ok(())
             }
             Clause::Where(w) => write!(f, "WHERE {}", w.predicate),
-            Clause::Create(c) => write!(f, "CREATE {}", c.pattern),
-            Clause::Delete(d) => {
-                if d.detach {
-                    write!(f, "DETACH DELETE ")?;
-                } else {
-                    write!(f, "DELETE ")?;
+            Clause::Create(c) => {
+                write!(f, "CREATE ")?;
+                for (i, np) in c.patterns.iter().enumerate() {
+                    if i > 0 { write!(f, ", ")?; }
+                    write!(f, "{}", np.pattern)?;
                 }
+                Ok(())
+            }
+            Clause::Delete(d) => {
+                if d.detach { write!(f, "DETACH DELETE ")?; } else { write!(f, "DELETE ")?; }
                 let exprs: Vec<String> = d.expressions.iter().map(|e| e.to_string()).collect();
                 write!(f, "{}", exprs.join(", "))
             }
@@ -416,6 +642,30 @@ impl std::fmt::Display for Clause {
                 }
                 Ok(())
             }
+            Clause::With(w) => {
+                write!(f, "WITH ")?;
+                if w.distinct { write!(f, "DISTINCT ")?; }
+                if w.star { write!(f, "*")?; } else {
+                    let items: Vec<String> = w.projections.iter().map(|p| p.to_string()).collect();
+                    write!(f, "{}", items.join(", "))?;
+                }
+                if let Some(pred) = &w.where_ { write!(f, " WHERE {}", pred)?; }
+                Ok(())
+            }
+            Clause::Unwind(u) => write!(f, "UNWIND {} AS {}", u.expression, u.variable),
+            Clause::Union(u) => {
+                if u.all { write!(f, "UNION ALL") } else { write!(f, "UNION") }
+            }
+            Clause::Call(c) => {
+                if let Some(proc) = &c.procedure {
+                    write!(f, "CALL {}", proc)
+                } else {
+                    write!(f, "CALL {{ ... }}")
+                }
+            }
+            Clause::Foreach(fe) => {
+                write!(f, "FOREACH ({} IN {} | ...)", fe.variable, fe.expression)
+            }
         }
     }
 }
@@ -423,9 +673,7 @@ impl std::fmt::Display for Clause {
 impl std::fmt::Display for Pattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for (i, elem) in self.elements.iter().enumerate() {
-            if i > 0 {
-                write!(f, " ")?;
-            }
+            if i > 0 { write!(f, " ")?; }
             write!(f, "{}", elem)?;
         }
         Ok(())
@@ -444,12 +692,8 @@ impl std::fmt::Display for PatternElement {
 impl std::fmt::Display for NodePattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "(")?;
-        if let Some(v) = &self.variable {
-            write!(f, "{}", v)?;
-        }
-        for label in &self.labels {
-            write!(f, ":{}", label)?;
-        }
+        if let Some(v) = &self.variable { write!(f, "{}", v)?; }
+        if !self.labels.is_empty() { write!(f, ":{}", self.labels.join("|"))?; }
         if !self.properties.is_empty() {
             let props: Vec<String> = self.properties.iter()
                 .map(|(k, v)| format!("{}: {}", k, v))
@@ -462,28 +706,23 @@ impl std::fmt::Display for NodePattern {
 
 impl std::fmt::Display for RelationshipPattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _arrow = match self.direction {
-            Direction::Outgoing => "->",
-            Direction::Incoming => "<-",
-            Direction::Both => "-",
-        };
         let left = if self.direction == Direction::Incoming { "<" } else { "" };
         let right = if self.direction == Direction::Outgoing { ">" } else { "" };
-
-        write!(f, "{}{}[:", left, if self.direction == Direction::Both { "" } else { "-" })?;
-        if let Some(v) = &self.variable {
-            write!(f, "{}", v)?;
+        write!(f, "{}-[", left)?;
+        if let Some(v) = &self.variable { write!(f, "{}", v)?; }
+        if !self.types.is_empty() { write!(f, ":{}", self.types.join("|"))?; }
+        match &self.length {
+            PathLength::Fixed(1) => {}
+            PathLength::Fixed(n) => write!(f, "*{}", n)?,
+            PathLength::Range(min, max) => {
+                write!(f, "*")?;
+                if *min > 1 || max.is_some() {
+                    write!(f, "{}", min)?;
+                    if let Some(max) = max { write!(f, "..{}", max)?; } else { write!(f, "..")?; }
+                }
+            }
         }
-        for t in &self.types {
-            write!(f, ":{}", t)?;
-        }
-        if !self.properties.is_empty() {
-            let props: Vec<String> = self.properties.iter()
-                .map(|(k, v)| format!("{}: {}", k, v))
-                .collect();
-            write!(f, " {{{}}}", props.join(", "))?;
-        }
-        write!(f, "]{}", right)
+        write!(f, "]-{}", right)
     }
 }
 
@@ -492,10 +731,20 @@ impl std::fmt::Display for Expression {
         match self {
             Expression::Literal(l) => write!(f, "{}", l),
             Expression::Variable(v) => write!(f, "{}", v),
+            Expression::Parameter(p) => write!(f, "${}", p),
             Expression::PropertyAccess { base, property, .. } => write!(f, "{}.{}", base, property),
+            Expression::DynamicPropertyAccess { base, index, .. } => write!(f, "{}[{}]", base, index),
+            Expression::Slice { base, from, to, .. } => {
+                write!(f, "{}[", base)?;
+                if let Some(fr) = from { write!(f, "{}", fr)?; }
+                write!(f, "..")?;
+                if let Some(t) = to { write!(f, "{}", t)?; }
+                write!(f, "]")
+            }
             Expression::BinaryOp { op, left, right, .. } => write!(f, "({} {} {})", left, op, right),
             Expression::Comparison { op, left, right, .. } => write!(f, "({} {} {})", left, op, right),
             Expression::UnaryOp { op, expr, .. } => write!(f, "{}{}", op, expr),
+            Expression::Not { expr, .. } => write!(f, "(NOT {})", expr),
             Expression::IsNull(e) => write!(f, "{} IS NULL", e),
             Expression::IsNotNull(e) => write!(f, "{} IS NOT NULL", e),
             Expression::List(items) => {
@@ -519,9 +768,48 @@ impl std::fmt::Display for Expression {
             Expression::FunctionCall { name, args, distinct, .. } => {
                 let prefix = if *distinct { "DISTINCT " } else { "" };
                 let elems: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-                write!(f, "{}{}({})", prefix, name, elems.join(", "))
+                write!(f, "{}({}{})", name, prefix, elems.join(", "))
             }
             Expression::Wildcard => write!(f, "*"),
+            Expression::Case { subject, alternatives, default, .. } => {
+                write!(f, "CASE")?;
+                if let Some(s) = subject { write!(f, " {}", s)?; }
+                for alt in alternatives {
+                    write!(f, " WHEN {} THEN {}", alt.condition, alt.result)?;
+                }
+                if let Some(d) = default { write!(f, " ELSE {}", d)?; }
+                write!(f, " END")
+            }
+            Expression::ListComprehension { variable, source, filter, projection, .. } => {
+                write!(f, "[{} IN {}", variable, source)?;
+                if let Some(pred) = filter { write!(f, " WHERE {}", pred)?; }
+                if let Some(proj) = projection { write!(f, " | {}", proj)?; }
+                write!(f, "]")
+            }
+            Expression::PatternComprehension { pattern, projection, .. } => {
+                write!(f, "[{} | {}]", pattern, projection)
+            }
+            Expression::Reduce { accumulator, init, variable, source, body, .. } => {
+                write!(f, "reduce({} = {}, {} IN {} | {})", accumulator, init, variable, source, body)
+            }
+            Expression::Quantifier { kind, variable, source, filter, .. } => {
+                let kw = match kind {
+                    QuantifierKind::All => "all",
+                    QuantifierKind::Any => "any",
+                    QuantifierKind::None => "none",
+                    QuantifierKind::Single => "single",
+                };
+                write!(f, "{}({} IN {} WHERE {})", kw, variable, source, filter)
+            }
+            Expression::Exists { subquery, pattern, .. } => {
+                if subquery.is_some() {
+                    write!(f, "EXISTS {{ ... }}")
+                } else if let Some(p) = pattern {
+                    write!(f, "EXISTS {}", p)
+                } else {
+                    write!(f, "EXISTS")
+                }
+            }
         }
     }
 }
@@ -534,6 +822,12 @@ impl std::fmt::Display for Literal {
             Literal::Integer(v) => write!(f, "{}", v),
             Literal::Float(v) => write!(f, "{}", v),
             Literal::String(s) => write!(f, "'{}'", s),
+            Literal::Date(s) => write!(f, "date('{}')", s),
+            Literal::Time(s) => write!(f, "time('{}')", s),
+            Literal::LocalTime(s) => write!(f, "localtime('{}')", s),
+            Literal::DateTime(s) => write!(f, "datetime('{}')", s),
+            Literal::LocalDateTime(s) => write!(f, "localdatetime('{}')", s),
+            Literal::Duration(s) => write!(f, "duration('{}')", s),
         }
     }
 }
@@ -541,7 +835,7 @@ impl std::fmt::Display for Literal {
 impl std::fmt::Display for BinaryOperator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            BinaryOperator::Add => "+",
+            BinaryOperator::Add | BinaryOperator::Concat => "+",
             BinaryOperator::Sub => "-",
             BinaryOperator::Mul => "*",
             BinaryOperator::Div => "/",
@@ -592,11 +886,11 @@ impl std::fmt::Display for SetItem {
             SetItem::Property { target, value } => write!(f, "{} = {}", target, value),
             SetItem::Label { variable, labels } => {
                 write!(f, "{}", variable)?;
-                for label in labels {
-                    write!(f, ":{}", label)?;
-                }
+                for label in labels { write!(f, ":{}", label)?; }
                 Ok(())
             }
+            SetItem::Merge { variable, value } => write!(f, "{} += {}", variable, value),
+            SetItem::Replace { variable, value } => write!(f, "{} = {}", variable, value),
         }
     }
 }
@@ -607,9 +901,7 @@ impl std::fmt::Display for RemoveItem {
             RemoveItem::Property { target } => write!(f, "{}", target),
             RemoveItem::Label { variable, labels } => {
                 write!(f, "{}", variable)?;
-                for label in labels {
-                    write!(f, ":{}", label)?;
-                }
+                for label in labels { write!(f, ":{}", label)?; }
                 Ok(())
             }
         }
@@ -626,9 +918,9 @@ impl std::fmt::Display for OrderItem {
     }
 }
 
-// ------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
-// ------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -638,31 +930,34 @@ mod tests {
     fn ast_statement_roundtrip() {
         let stmt = Statement::new()
             .with_clause(Clause::Match(MatchClause {
-                pattern: Pattern {
-                    elements: vec![
-                        PatternElement::Node(NodePattern {
-                            variable: Some("n".to_string()),
-                            labels: vec!["Person".to_string()],
-                            properties: HashMap::new(),
-                            span: None,
-                        }),
-                        PatternElement::Relationship(RelationshipPattern {
-                            direction: Direction::Outgoing,
-                            types: vec!["KNOWS".to_string()],
-                            variable: None,
-                            properties: HashMap::new(),
-                            length: PathLength::Fixed(1),
-                            span: None,
-                        }),
-                        PatternElement::Node(NodePattern {
-                            variable: Some("m".to_string()),
-                            labels: vec!["Person".to_string()],
-                            properties: HashMap::new(),
-                            span: None,
-                        }),
-                    ],
-                    span: None,
-                },
+                patterns: vec![NamedPattern {
+                    variable: None,
+                    pattern: Pattern {
+                        elements: vec![
+                            PatternElement::Node(NodePattern {
+                                variable: Some("n".to_string()),
+                                labels: vec!["Person".to_string()],
+                                properties: HashMap::new(),
+                                span: None,
+                            }),
+                            PatternElement::Relationship(RelationshipPattern {
+                                direction: Direction::Outgoing,
+                                types: vec!["KNOWS".to_string()],
+                                variable: None,
+                                properties: HashMap::new(),
+                                length: PathLength::Fixed(1),
+                                span: None,
+                            }),
+                            PatternElement::Node(NodePattern {
+                                variable: Some("m".to_string()),
+                                labels: vec!["Person".to_string()],
+                                properties: HashMap::new(),
+                                span: None,
+                            }),
+                        ],
+                        span: None,
+                    },
+                }],
                 span: None,
             }))
             .with_clause(Clause::Where(WhereClause {
@@ -679,17 +974,11 @@ mod tests {
                 span: None,
             }))
             .with_clause(Clause::Return(ReturnClause {
+                distinct: false,
+                star: false,
                 projections: vec![
-                    Projection {
-                        expression: Expression::Variable("n".to_string()),
-                        alias: None,
-                        span: None,
-                    },
-                    Projection {
-                        expression: Expression::Variable("m".to_string()),
-                        alias: None,
-                        span: None,
-                    },
+                    Projection { expression: Expression::Variable("n".to_string()), alias: None, span: None },
+                    Projection { expression: Expression::Variable("m".to_string()), alias: None, span: None },
                 ],
                 order_by: vec![],
                 skip: None,
@@ -717,5 +1006,70 @@ mod tests {
             span: None,
         };
         assert_eq!(node.to_string(), "(n:Person)");
+    }
+
+    #[test]
+    fn path_length_range_display() {
+        let rel = RelationshipPattern {
+            direction: Direction::Outgoing,
+            types: vec!["KNOWS".to_string()],
+            variable: None,
+            properties: HashMap::new(),
+            length: PathLength::Range(1, Some(3)),
+            span: None,
+        };
+        let s = rel.to_string();
+        assert!(s.contains("*"));
+    }
+
+    #[test]
+    fn with_clause_display() {
+        let clause = Clause::With(WithClause {
+            distinct: false,
+            star: false,
+            projections: vec![
+                Projection { expression: Expression::Variable("n".to_string()), alias: None, span: None },
+            ],
+            order_by: vec![],
+            skip: None,
+            limit: None,
+            where_: None,
+            span: None,
+        });
+        assert!(clause.to_string().starts_with("WITH"));
+    }
+
+    #[test]
+    fn unwind_clause_display() {
+        let clause = Clause::Unwind(UnwindClause {
+            expression: Expression::List(vec![
+                Expression::Literal(Literal::Integer(1)),
+            ]),
+            variable: "x".to_string(),
+            span: None,
+        });
+        assert!(clause.to_string().starts_with("UNWIND"));
+    }
+
+    #[test]
+    fn parameter_expression_display() {
+        let expr = Expression::Parameter("name".to_string());
+        assert_eq!(expr.to_string(), "$name");
+    }
+
+    #[test]
+    fn case_expression_display() {
+        let expr = Expression::Case {
+            subject: None,
+            alternatives: vec![CaseAlternative {
+                condition: Expression::Literal(Literal::Boolean(true)),
+                result: Expression::Literal(Literal::Integer(1)),
+            }],
+            default: Some(Box::new(Expression::Literal(Literal::Integer(0)))),
+            span: None,
+        };
+        assert!(expr.to_string().contains("CASE"));
+        assert!(expr.to_string().contains("WHEN"));
+        assert!(expr.to_string().contains("END"));
     }
 }

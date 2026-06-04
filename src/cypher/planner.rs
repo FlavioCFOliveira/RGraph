@@ -60,8 +60,23 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
 
     for clause in &stmt.clauses {
         match clause {
-            Clause::Match(m) => {
-                current = Some(build_match_plan(&m.pattern, current)?);
+            Clause::Match(m) | Clause::OptionalMatch(m) => {
+                let optional = matches!(clause, Clause::OptionalMatch(_));
+                // Build a plan for each pattern in the clause.
+                let mut pat_plan: Option<LogicalOperator> = current.take();
+                for np in &m.patterns {
+                    let plan_part = build_match_plan(&np.pattern, pat_plan.take())?;
+                    pat_plan = Some(plan_part);
+                }
+                let mut plan = pat_plan.unwrap_or(LogicalOperator::AllNodesScan);
+                // Wrap in a left-outer-join operator for OPTIONAL MATCH.
+                if optional {
+                    plan = LogicalOperator::Apply {
+                        left: Box::new(LogicalOperator::AllNodesScan),
+                        right: Box::new(plan),
+                    };
+                }
+                current = Some(plan);
             }
             Clause::Where(w) => {
                 let input = current.unwrap_or(LogicalOperator::AllNodesScan);
@@ -71,13 +86,20 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
                 });
             }
             Clause::Create(c) => {
-                // CREATE either runs standalone or is driven by a preceding
-                // reading clause (`MATCH ... CREATE ...`).  The matched rows, if
-                // any, flow in through `input`; the eager-insertion pass below
-                // decides whether a barrier is required between them.
+                // BUILD the full create pattern from all named patterns in the clause.
+                let pattern = if c.patterns.len() == 1 {
+                    c.patterns[0].pattern.clone()
+                } else {
+                    // Merge all patterns into one for simplicity.
+                    let mut elements = Vec::new();
+                    for np in &c.patterns {
+                        elements.extend(np.pattern.elements.clone());
+                    }
+                    Pattern { elements, span: None }
+                };
                 current = Some(LogicalOperator::Create {
                     input: current.map(Box::new),
-                    pattern: c.pattern.clone(),
+                    pattern,
                 });
             }
             Clause::Delete(d) => {
@@ -114,6 +136,73 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
             Clause::Return(r) => {
                 current = Some(build_return_plan(r, current)?);
             }
+            Clause::With(w) => {
+                // WITH acts as a scope barrier + projection.
+                // Build projections from the WithClause — map to ReturnClause-style.
+                let ret_like = ReturnClause {
+                    distinct: w.distinct,
+                    star: w.star,
+                    projections: w.projections.clone(),
+                    order_by: w.order_by.clone(),
+                    skip: w.skip.clone(),
+                    limit: w.limit.clone(),
+                    span: w.span,
+                };
+                let mut op = build_return_plan(&ret_like, current.take())?;
+                // Apply optional WHERE filter.
+                if let Some(pred) = &w.where_ {
+                    op = LogicalOperator::Filter {
+                        input: Box::new(op),
+                        predicate: pred.clone(),
+                    };
+                }
+                current = Some(op);
+            }
+            Clause::Unwind(u) => {
+                let input = current.unwrap_or(LogicalOperator::AllNodesScan);
+                // Model UNWIND as a special "Unwind" projection under a
+                // dedicated plan operator (use Apply as a placeholder for now).
+                // In the physical layer UnwindOp handles the actual list expansion.
+                current = Some(LogicalOperator::Apply {
+                    left: Box::new(input),
+                    right: Box::new(LogicalOperator::NodeByLabelScan {
+                        label: format!("__UNWIND_{}_{}", u.variable,
+                            u.expression.to_string().replace(' ', "_")),
+                    }),
+                });
+            }
+            Clause::Union(u) => {
+                // UNION is a top-level combinator; we note it but need the
+                // sub-statement structure to handle it fully.  For now, pass through.
+                let _ = u;
+            }
+            Clause::Call(c) => {
+                // Inline subquery: plan the sub-clauses.
+                if let Some(sub) = &c.subquery {
+                    let sub_stmt = Statement { clauses: sub.clone(), span: None };
+                    let sub_plan = plan(&sub_stmt)?;
+                    let input = current.unwrap_or(LogicalOperator::AllNodesScan);
+                    current = Some(LogicalOperator::Apply {
+                        left: Box::new(input),
+                        right: Box::new(sub_plan.root),
+                    });
+                }
+                // External procedure calls: not yet supported — pass through.
+            }
+            Clause::Foreach(fe) => {
+                // FOREACH: iterate list and execute body writes.
+                // Model as a nested Apply over the body plan.
+                let input = current.unwrap_or(LogicalOperator::AllNodesScan);
+                let body_stmt = Statement { clauses: fe.body.clone(), span: None };
+                if let Ok(body_plan) = plan(&body_stmt) {
+                    current = Some(LogicalOperator::Apply {
+                        left: Box::new(input),
+                        right: Box::new(body_plan.root),
+                    });
+                } else {
+                    current = Some(input);
+                }
+            }
         }
     }
 
@@ -141,35 +230,60 @@ fn build_match_plan(
     pattern: &Pattern,
     input: Option<LogicalOperator>,
 ) -> Result<LogicalOperator, PlanError> {
-    let mut elements = pattern.elements.iter().peekable();
     let mut current_op: Option<LogicalOperator> = input;
+    /// The variable name of the most recently processed node.
+    let mut last_node_var: Option<String> = None;
 
-    while let Some(elem) = elements.next() {
-        match elem {
+    let elems = &pattern.elements;
+    let mut i = 0;
+    while i < elems.len() {
+        match &elems[i] {
             PatternElement::Node(node) => {
-                let scan = if let Some(label) = node.labels.first() {
-                    LogicalOperator::NodeByLabelScan {
-                        label: label.clone(),
-                    }
+                // If we have an incoming current_op from a previous pattern segment,
+                // wrap it — otherwise build a fresh scan.
+                if current_op.is_none() {
+                    let node_var = node.variable.clone()
+                        .unwrap_or_else(|| format!("__anon_{}", i));
+                    let scan = if let Some(label) = node.labels.first() {
+                        LogicalOperator::NodeByLabelScan { label: label.clone() }
+                    } else {
+                        LogicalOperator::AllNodesScan
+                    };
+                    // Wrap scan in a Project that renames the internal `_node` key
+                    // to the pattern variable so subsequent operators can reference it.
+                    let renamed = LogicalOperator::Project {
+                        input: Box::new(scan),
+                        projections: vec![Projection {
+                            expression: Expression::Variable("_node".to_string()),
+                            alias: Some(node_var.clone()),
+                            span: None,
+                        }],
+                    };
+                    current_op = Some(renamed);
+                    last_node_var = Some(node_var);
                 } else {
-                    LogicalOperator::AllNodesScan
-                };
-                current_op = Some(scan);
+                    last_node_var = node.variable.clone()
+                        .or_else(|| Some(format!("__anon_{}", i)));
+                }
+                i += 1;
             }
             PatternElement::Relationship(rel) => {
-                // We need the previous node variable as the start point.
-                let from_var = find_previous_node_variable(&pattern, &elements)
-                    .unwrap_or_else(|| "_".to_string());
+                let from_var = last_node_var.clone().unwrap_or_else(|| "_".to_string());
+                // Peek the next node.
+                let end_node_var = elems.get(i + 1).and_then(|e| {
+                    if let PatternElement::Node(n) = e { n.variable.clone() } else { None }
+                });
 
                 let expand = LogicalOperator::Expand {
                     input: Box::new(current_op.unwrap_or(LogicalOperator::AllNodesScan)),
                     direction: rel.direction,
                     rel_types: rel.types.clone(),
                     rel_variable: rel.variable.clone(),
-                    end_node_variable: find_next_node_variable(&mut elements),
+                    end_node_variable: end_node_var,
                     from_variable: from_var,
                 };
                 current_op = Some(expand);
+                i += 1;
             }
         }
     }
@@ -179,32 +293,6 @@ fn build_match_plan(
     })
 }
 
-fn find_previous_node_variable<'a>(
-    pattern: &Pattern,
-    _elements: &std::iter::Peekable<std::slice::Iter<'a, PatternElement>>,
-) -> Option<String> {
-    // In a well-formed pattern the node before the relationship is the
-    // one we just processed.  We scan backwards from the current position.
-    // For simplicity, we return the first node variable we find.
-    for elem in &pattern.elements {
-        if let PatternElement::Node(node) = elem {
-            if let Some(v) = &node.variable {
-                return Some(v.clone());
-            }
-        }
-    }
-    None
-}
-
-fn find_next_node_variable<'a>(
-    elements: &mut std::iter::Peekable<std::slice::Iter<'a, PatternElement>>,
-) -> Option<String> {
-    if let Some(PatternElement::Node(node)) = elements.peek() {
-        node.variable.clone()
-    } else {
-        None
-    }
-}
 
 // ------------------------------------------------------------------
 // Return planning

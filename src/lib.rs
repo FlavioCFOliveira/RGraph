@@ -1,4 +1,5 @@
 pub mod io;
+pub mod catalog;
 pub mod storage;
 pub mod wal;
 pub mod db;

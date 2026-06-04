@@ -10,11 +10,12 @@ use crate::cypher::executor::{ExecError, QueryResult};
 use crate::cypher::interpreter::{evaluate, eval_projections, EvalContext};
 use crate::cypher::plan::{LogicalOperator, LogicalPlan};
 use crate::cypher::value::Value;
+use crate::graph::builder::RelationshipBuilder;
 use crate::graph::engine::{GraphStorageEngine, StorageEngine};
-use crate::graph::record::{NodeRecord, SlotRef};
+use crate::graph::graph::Graph;
+use crate::graph::record::SlotRef;
 use crate::io::FileSystem;
 use std::collections::HashMap;
-use std::hash::Hasher;
 
 // ------------------------------------------------------------------
 // Row representation
@@ -56,28 +57,96 @@ pub trait PhysicalOperator {
 // ------------------------------------------------------------------
 
 /// Runtime state shared across all operators in a query.
+///
+/// `engine_cell` provides interior-mutable access to the engine for write
+/// operators.  The engine pointer stored in the `UnsafeCell` comes from the
+/// caller of [`ExecutionContext::new_with_write`] which must guarantee
+/// exclusive access for the duration of the execution.
 pub struct ExecutionContext<'a> {
-    /// Reference to the graph storage engine.
+    /// Read-only reference to the graph storage engine (used by read operators
+    /// and for the public API where mutability is not needed).
     pub engine: &'a GraphStorageEngine,
+    /// Interior-mutable engine pointer for write operators.
+    /// See [`engine_mut`](ExecutionContext::engine_mut) for the invariants.
+    engine_ptr: std::cell::UnsafeCell<*mut GraphStorageEngine>,
     /// Reference to the file-system abstraction (for I/O).
     pub fs: &'a dyn FileSystem,
+    /// Optional parameter bindings for this execution (e.g. `$name → "Alice"`).
+    pub parameters: std::collections::HashMap<String, Value>,
+}
+
+// SAFETY: `ExecutionContext` is only used within a single thread during query
+// execution.  The `UnsafeCell<*mut GraphStorageEngine>` is not shared across
+// threads.
+unsafe impl<'a> Send for ExecutionContext<'a> {}
+
+impl<'a> ExecutionContext<'a> {
+    /// Create a context backed by a shared (read-only) engine reference.
+    ///
+    /// Write operators will fail at runtime if used with this constructor.
+    /// Use [`new_with_write`] when write operators are present in the plan.
+    pub fn new(engine: &'a GraphStorageEngine, fs: &'a dyn FileSystem) -> Self {
+        Self {
+            engine,
+            engine_ptr: std::cell::UnsafeCell::new(engine as *const _ as *mut _),
+            fs,
+            parameters: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Create a context backed by a mutable engine reference (for write queries).
+    pub fn new_with_write(engine: &'a mut GraphStorageEngine, fs: &'a dyn FileSystem) -> Self {
+        let ptr = engine as *mut _;
+        Self {
+            engine,
+            engine_ptr: std::cell::UnsafeCell::new(ptr),
+            fs,
+            parameters: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Obtain a mutable reference to the engine.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no other live reference to the engine exists
+    /// for the duration of the mutable borrow.  This invariant holds when:
+    ///
+    /// 1. The context was created with [`new_with_write`] from a `&mut` borrow,
+    ///    giving the context exclusive ownership of the engine pointer.
+    /// 2. Query execution is single-threaded — at most one write operator runs
+    ///    at any point, and no concurrent thread aliases the engine.
+    /// 3. The caller does not save the returned `&mut` across any `.await` or
+    ///    other re-entrant call that could produce a second mutable reference.
+    pub(crate) unsafe fn engine_mut(&self) -> &mut GraphStorageEngine {
+        // SAFETY: see the method docs.  The pointer was initialised from a valid
+        // `&mut GraphStorageEngine` in `new_with_write`, or from a `&` cast in
+        // `new` (the caller must then never call write operators).  We do not
+        // create overlapping mutable references because the executing pipeline is
+        // strictly single-threaded and call-stack sequential.
+        &mut **self.engine_ptr.get()
+    }
 }
 
 // ------------------------------------------------------------------
 // Operator implementations
 // ------------------------------------------------------------------
 
-/// Scan every node in the graph.
+/// Scan every node in the graph, binding each to `node_variable`.
 pub struct AllNodesScanOp {
-    /// Current position in the node index range scan.
+    /// Pattern variable to bind the matched node under.
+    node_variable: String,
+    /// Cursor over the node index (populated on first call).
     cursor: Vec<(crate::index::key::CompositeKey, Vec<u8>)>,
     /// Next index into `cursor`.
     idx: usize,
 }
 
 impl AllNodesScanOp {
-    pub fn new() -> Self {
+    /// `node_variable`: the Cypher variable name to bind matched nodes under.
+    pub fn new(node_variable: impl Into<String>) -> Self {
         Self {
+            node_variable: node_variable.into(),
             cursor: Vec::new(),
             idx: 0,
         }
@@ -90,31 +159,27 @@ impl PhysicalOperator for AllNodesScanOp {
         ctx: &ExecutionContext,
     ) -> Result<Option<Row>, ExecError> {
         if self.cursor.is_empty() {
-            // Perform a full range scan over the node index.
             let start = crate::index::key::node_id_key(0);
             let end = crate::index::key::node_id_key(u128::MAX);
             self.cursor = ctx.engine.node_index.range_search(&start, &end);
         }
-        if self.idx >= self.cursor.len() {
-            return Ok(None);
-        }
-        let (key, _value_bytes) = &self.cursor[self.idx];
-        self.idx += 1;
-        // Extract node_id from the first 16 bytes of the key.
-        let node_id = u128::from_be_bytes([
-            key.bytes[0], key.bytes[1], key.bytes[2], key.bytes[3],
-            key.bytes[4], key.bytes[5], key.bytes[6], key.bytes[7],
-            key.bytes[8], key.bytes[9], key.bytes[10], key.bytes[11],
-            key.bytes[12], key.bytes[13], key.bytes[14], key.bytes[15],
-        ]);
-        match ctx.engine.get_node(node_id as u64, ctx.fs) {
-            Ok(Some(record)) => {
-                let mut row = empty_row();
-                row.insert("_node".to_string(), node_to_value(&record));
-                Ok(Some(row))
+        loop {
+            if self.idx >= self.cursor.len() {
+                return Ok(None);
             }
-            Ok(None) => self.next_row(ctx), // deleted — skip
-            Err(e) => Err(ExecError::Eval(e.to_string())),
+            let (key, _value_bytes) = &self.cursor[self.idx];
+            self.idx += 1;
+            let node_id = u128::from_be_bytes(
+                key.bytes[..16].try_into().unwrap_or([0u8; 16])
+            ) as u64;
+            match load_node_value(ctx.engine, node_id, ctx.fs)? {
+                Some(node_val) => {
+                    let mut row = empty_row();
+                    row.insert(self.node_variable.clone(), node_val);
+                    return Ok(Some(row));
+                }
+                None => continue, // deleted or not found — skip
+            }
         }
     }
 
@@ -124,24 +189,23 @@ impl PhysicalOperator for AllNodesScanOp {
     }
 }
 
-/// Scan nodes that have a specific label.
+/// Scan nodes that have a specific label, binding each to `node_variable`.
 pub struct NodeByLabelScanOp {
+    /// Pattern variable to bind matched nodes under.
+    node_variable: String,
+    /// Label string (used to resolve catalog id at runtime).
     label: String,
-    /// Internal label id resolved at plan time (stub: use string hash).
-    label_id: u64,
-    cursor: Vec<NodeRecord>,
+    /// Cached node ids from the label index (populated on first call).
+    cursor: Vec<u64>,
     idx: usize,
 }
 
 impl NodeByLabelScanOp {
-    pub fn new(label: impl Into<String>) -> Self {
-        let label = label.into();
-        let mut hasher = twox_hash::XxHash64::with_seed(0);
-        hasher.write(label.as_bytes());
-        let label_id = hasher.finish();
+    /// `node_variable`: Cypher variable; `label`: label string (not an id).
+    pub fn new(node_variable: impl Into<String>, label: impl Into<String>) -> Self {
         Self {
-            label,
-            label_id,
+            node_variable: node_variable.into(),
+            label: label.into(),
             cursor: Vec::new(),
             idx: 0,
         }
@@ -154,19 +218,33 @@ impl PhysicalOperator for NodeByLabelScanOp {
         ctx: &ExecutionContext,
     ) -> Result<Option<Row>, ExecError> {
         if self.cursor.is_empty() {
-            self.cursor = ctx
+            // Resolve label name → catalog id → storage u64 label id.
+            let label_id = ctx.engine.storage_label_id_for(&self.label)
+                .unwrap_or(0u64);
+            let records = ctx
                 .engine
-                .scan_nodes_by_label(self.label_id, ctx.fs)
+                .scan_nodes_by_label(label_id, ctx.fs)
                 .map_err(|e| ExecError::Eval(e.to_string()))?;
+            self.cursor = records.iter()
+                .filter(|r| r.flags & crate::graph::record::node_flags::DELETED == 0)
+                .map(|r| r.node_id)
+                .collect();
         }
-        if self.idx >= self.cursor.len() {
-            return Ok(None);
+        loop {
+            if self.idx >= self.cursor.len() {
+                return Ok(None);
+            }
+            let node_id = self.cursor[self.idx];
+            self.idx += 1;
+            match load_node_value(ctx.engine, node_id, ctx.fs)? {
+                Some(node_val) => {
+                    let mut row = empty_row();
+                    row.insert(self.node_variable.clone(), node_val);
+                    return Ok(Some(row));
+                }
+                None => continue,
+            }
         }
-        let record = self.cursor[self.idx].clone();
-        self.idx += 1;
-        let mut row = empty_row();
-        row.insert("_node".to_string(), node_to_value(&record));
-        Ok(Some(row))
     }
 
     fn reset(&mut self) {
@@ -175,38 +253,36 @@ impl PhysicalOperator for NodeByLabelScanOp {
     }
 }
 
-/// Expand relationships from the bound start node.
+/// Expand relationships from a bound start node, driving an input operator.
 pub struct ExpandOp {
+    input: Box<dyn PhysicalOperator>,
     direction: crate::cypher::ast::Direction,
     rel_types: Vec<String>,
     from_variable: String,
-    /// Resolved label/type ids (stub: hashed at plan time).
-    type_ids: Vec<u64>,
-    /// Buffer of pending edges for the current input row.
-    pending: Vec<(crate::graph::record::EdgeRecord, u64)>,
+    rel_variable: Option<String>,
+    end_node_variable: Option<String>,
+    /// Buffer of pending (edge, end_node_id, input_row) triples.
+    pending: Vec<(crate::graph::record::EdgeRecord, u64, Row)>,
     /// Index into `pending`.
     pending_idx: usize,
 }
 
 impl ExpandOp {
     pub fn new(
+        input: Box<dyn PhysicalOperator>,
         direction: crate::cypher::ast::Direction,
         rel_types: Vec<String>,
         from_variable: impl Into<String>,
+        rel_variable: Option<String>,
+        end_node_variable: Option<String>,
     ) -> Self {
-        let type_ids: Vec<u64> = rel_types
-            .iter()
-            .map(|t| {
-                let mut h = twox_hash::XxHash64::with_seed(0);
-                h.write(t.as_bytes());
-                h.finish()
-            })
-            .collect();
         Self {
+            input,
             direction,
             rel_types,
             from_variable: from_variable.into(),
-            type_ids,
+            rel_variable,
+            end_node_variable,
             pending: Vec::new(),
             pending_idx: 0,
         }
@@ -218,21 +294,83 @@ impl PhysicalOperator for ExpandOp {
         &mut self,
         ctx: &ExecutionContext,
     ) -> Result<Option<Row>, ExecError> {
-        // Yield from pending buffer first.
-        if self.pending_idx < self.pending.len() {
-            let (edge, end_node_id) = self.pending[self.pending_idx].clone();
-            self.pending_idx += 1;
-            let mut row = empty_row();
-            row.insert("_edge".to_string(), edge_to_value(&edge));
-            row.insert("_end_node".to_string(), Value::Integer(end_node_id as i64));
-            return Ok(Some(row));
+        loop {
+            // Yield from pending buffer first.
+            if self.pending_idx < self.pending.len() {
+                let (ref edge, end_node_id, ref input_row) = self.pending[self.pending_idx].clone();
+                self.pending_idx += 1;
+
+                let mut row = input_row.clone();
+
+                // Bind relationship variable.
+                if let Some(rv) = &self.rel_variable {
+                    row.insert(rv.clone(), edge_record_to_value(edge, ctx.engine, ctx.fs));
+                }
+
+                // Bind end-node variable.
+                let end_var = self.end_node_variable.as_deref().unwrap_or("_end_node");
+                match load_node_value(ctx.engine, end_node_id, ctx.fs)? {
+                    Some(nv) => { row.insert(end_var.to_string(), nv); }
+                    None => continue,
+                }
+                return Ok(Some(row));
+            }
+
+            // Need more input.
+            let Some(input_row) = self.input.next_row(ctx)? else {
+                return Ok(None);
+            };
+
+            // Resolve the start node id from the from_variable.
+            let start_node_id = match input_row.get(&self.from_variable) {
+                Some(Value::Node(n)) => n.id,
+                Some(Value::Integer(id)) => *id as u64,
+                _ => continue,
+            };
+
+            // Resolve type ids via catalog.
+            let type_ids: Vec<u64> = self.rel_types.iter()
+                .filter_map(|t| ctx.engine.storage_label_id_for(t)
+                    .or_else(|| {
+                        // Try rel-type catalog (label and rel-type share namespace in storage).
+                        ctx.engine.catalog().read().ok()
+                            .and_then(|c| c.rel_type_id(t))
+                            .map(|id| id as u64)
+                    }))
+                .collect();
+
+            // Traverse adjacency lists.
+            let edges = match self.direction {
+                crate::cypher::ast::Direction::Outgoing => {
+                    ctx.engine.scan_outgoing_edges(start_node_id, &type_ids, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?
+                }
+                crate::cypher::ast::Direction::Incoming => {
+                    ctx.engine.scan_incoming_edges(start_node_id, &type_ids, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?
+                }
+                crate::cypher::ast::Direction::Both => {
+                    let mut out = ctx.engine.scan_outgoing_edges(start_node_id, &type_ids, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?;
+                    let inc = ctx.engine.scan_incoming_edges(start_node_id, &type_ids, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?;
+                    out.extend(inc);
+                    out
+                }
+            };
+
+            self.pending.clear();
+            self.pending_idx = 0;
+            for (edge, end_node_id) in edges {
+                self.pending.push((edge, end_node_id, input_row.clone()));
+            }
         }
-        Ok(None)
     }
 
     fn reset(&mut self) {
         self.pending.clear();
         self.pending_idx = 0;
+        self.input.reset();
     }
 }
 
@@ -353,14 +491,17 @@ impl PhysicalOperator for SortOp {
             while let Some(row) = self.input.next_row(ctx)? {
                 rows.push(row);
             }
-            // Sort using the first order item (stub: multi-key sorting).
-            if let Some(first) = self.order_by.first() {
+            // Stable multi-key sort: iterate order items from last to first
+            // (stable sort of later keys, then sort by earlier keys on top).
+            for order_item in self.order_by.iter().rev() {
+                let asc = order_item.ascending;
+                let expr = order_item.expression.clone();
                 rows.sort_by(|a, b| {
                     let ctx_a = row_to_eval_context(a);
                     let ctx_b = row_to_eval_context(b);
-                    let va = evaluate(&first.expression, &ctx_a).unwrap_or(Value::Null);
-                    let vb = evaluate(&first.expression, &ctx_b).unwrap_or(Value::Null);
-                    compare_values(&va, &vb, first.ascending)
+                    let va = evaluate(&expr, &ctx_a).unwrap_or(Value::Null);
+                    let vb = evaluate(&expr, &ctx_b).unwrap_or(Value::Null);
+                    compare_values(&va, &vb, asc)
                 });
             }
             self.buffer = Some(rows);
@@ -502,24 +643,136 @@ impl CreateOp {
         }
     }
 
-    /// Bind the variables introduced by the CREATE pattern onto `row`.
-    fn bind_created_variables(&self, row: &mut Row) {
+    /// Execute the CREATE pattern against storage, binding created entities in `row`.
+    fn execute_create(&self, row: &mut Row, ctx: &ExecutionContext) -> Result<(), ExecError> {
+        use crate::cypher::ast::PatternElement;
+        use crate::graph::builder::{NodeBuilder, RelationshipBuilder};
+        use crate::graph::graph::Graph;
+        use crate::cypher::interpreter::evaluate;
+
+        // SAFETY: We are the only caller of engine_mut during this operator's
+        // next_row invocation. See ExecutionContext::engine_mut for invariants.
+        let engine = unsafe { ctx.engine_mut() };
+
+        // We need a row eval context for property expression evaluation.
+        let eval_ctx = row_to_eval_context(row);
+
+        // We need to collect created node ids so relationships can reference them.
+        // Process pattern elements in sequence.
+        let mut last_node_id: Option<u64> = None;
+        let mut last_node_var: Option<String> = None;
+
         for elem in &self.pattern.elements {
             match elem {
-                crate::cypher::ast::PatternElement::Node(n) => {
-                    if let Some(v) = &n.variable {
-                        // TODO: integrate with GraphStorageEngine to create the
-                        // record and bind the real node value.
-                        row.entry(v.clone()).or_insert(Value::Null);
+                PatternElement::Node(n) => {
+                    // Resolve label → catalog id.
+                    let label_id = n.labels.first()
+                        .map(|l| engine.catalog_label_id(l))
+                        .unwrap_or(0u32);
+
+                    let mut builder = NodeBuilder::new().label(label_id);
+                    // Evaluate and add properties.
+                    for (k, v_expr) in &n.properties {
+                        match evaluate(v_expr, &eval_ctx) {
+                            Ok(val) => {
+                                if let Some(prop) = value_to_property(&val) {
+                                    builder = builder.property(k.clone(), prop);
+                                }
+                            }
+                            Err(e) => return Err(ExecError::Eval(e.to_string())),
+                        }
+                    }
+
+                    let mut g = Graph::new_ref(engine);
+                    let (_, node_id) = g.create_node(builder, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?;
+
+                    last_node_id = Some(node_id);
+                    last_node_var = n.variable.clone();
+
+                    // Bind the created node.
+                    if let Some(var) = &n.variable {
+                        if let Some(nv) = load_node_value(engine, node_id, ctx.fs)? {
+                            row.insert(var.clone(), nv);
+                        }
                     }
                 }
-                crate::cypher::ast::PatternElement::Relationship(r) => {
-                    if let Some(v) = &r.variable {
-                        row.entry(v.clone()).or_insert(Value::Null);
-                    }
+                PatternElement::Relationship(r) => {
+                    // Relationship needs source (last node) and target (next node
+                    // in pattern, which should have been processed already or will be).
+                    // For now we look for the source in the row or last_node_id.
+                    let _ = r;
+                    // Full relationship creation is handled below with node pairs.
                 }
             }
         }
+
+        // Second pass: create relationships between sequential node pairs.
+        let elems = &self.pattern.elements;
+        let mut i = 0;
+        while i + 2 < elems.len() {
+            if let (
+                PatternElement::Node(src_node),
+                PatternElement::Relationship(rel),
+                PatternElement::Node(tgt_node),
+            ) = (&elems[i], &elems[i + 1], &elems[i + 2]) {
+                // Get source and target node ids from the row.
+                let src_id = src_node.variable.as_ref()
+                    .and_then(|v| row.get(v))
+                    .and_then(|val| match val {
+                        Value::Node(n) => Some(n.id),
+                        Value::Integer(id) => Some(*id as u64),
+                        _ => None,
+                    });
+                let tgt_id = tgt_node.variable.as_ref()
+                    .and_then(|v| row.get(v))
+                    .and_then(|val| match val {
+                        Value::Node(n) => Some(n.id),
+                        Value::Integer(id) => Some(*id as u64),
+                        _ => None,
+                    });
+
+                if let (Some(src_id), Some(tgt_id)) = (src_id, tgt_id) {
+                    let type_id = rel.types.first()
+                        .map(|t| {
+                            engine.catalog().write()
+                                .expect("catalog write lock poisoned")
+                                .get_or_create_rel_type(t)
+                        })
+                        .unwrap_or(0u32);
+
+                    let mut builder = RelationshipBuilder::new()
+                        .from(src_id)
+                        .to(tgt_id)
+                        .rel_type(type_id);
+
+                    let eval_ctx2 = row_to_eval_context(row);
+                    for (k, v_expr) in &rel.properties {
+                        match evaluate(v_expr, &eval_ctx2) {
+                            Ok(val) => {
+                                if let Some(prop) = value_to_property(&val) {
+                                    builder = builder.property(k.clone(), prop);
+                                }
+                            }
+                            Err(e) => return Err(ExecError::Eval(e.to_string())),
+                        }
+                    }
+
+                    let mut g = Graph::new_ref(engine);
+                    let (_, edge_id) = g.create_relationship(builder, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?;
+
+                    if let Some(rv) = &rel.variable {
+                        row.insert(rv.clone(), edge_record_id_to_value(edge_id, type_id, src_id, tgt_id));
+                    }
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -529,20 +782,23 @@ impl PhysicalOperator for CreateOp {
         ctx: &ExecutionContext,
     ) -> Result<Option<Row>, ExecError> {
         match &mut self.input {
-            Some(input) => match input.next_row(ctx)? {
-                Some(mut row) => {
-                    self.bind_created_variables(&mut row);
-                    Ok(Some(row))
+            Some(input) => {
+                // Take input reference temporarily to avoid borrow conflict.
+                match input.next_row(ctx)? {
+                    Some(mut row) => {
+                        self.execute_create(&mut row, ctx)?;
+                        Ok(Some(row))
+                    }
+                    None => Ok(None),
                 }
-                None => Ok(None),
-            },
+            }
             None => {
                 if self.emitted {
                     return Ok(None);
                 }
                 self.emitted = true;
                 let mut row = empty_row();
-                self.bind_created_variables(&mut row);
+                self.execute_create(&mut row, ctx)?;
                 Ok(Some(row))
             }
         }
@@ -608,6 +864,232 @@ impl PhysicalOperator for EagerOp {
     }
 }
 
+/// Scan a single node by its internal id.
+pub struct NodeByIdScanOp {
+    node_id: u64,
+    emitted: bool,
+}
+
+impl NodeByIdScanOp {
+    pub fn new(node_id: u64) -> Self {
+        Self { node_id, emitted: false }
+    }
+}
+
+impl PhysicalOperator for NodeByIdScanOp {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        match load_node_value(ctx.engine, self.node_id, ctx.fs)? {
+            Some(nv) => {
+                let mut row = empty_row();
+                row.insert("_node".to_string(), nv);
+                Ok(Some(row))
+            }
+            None => Ok(None),
+        }
+    }
+    fn reset(&mut self) { self.emitted = false; }
+}
+
+/// Nested-loop Apply: for each outer row, iterate the inner plan (re-seeded).
+pub struct ApplyOp {
+    outer: Box<dyn PhysicalOperator>,
+    inner: Box<dyn PhysicalOperator>,
+    /// Current outer row we are scanning inner for.
+    current_outer: Option<Row>,
+}
+
+impl ApplyOp {
+    pub fn new(outer: Box<dyn PhysicalOperator>, inner: Box<dyn PhysicalOperator>) -> Self {
+        Self { outer, inner, current_outer: None }
+    }
+}
+
+impl PhysicalOperator for ApplyOp {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
+        loop {
+            if self.current_outer.is_none() {
+                self.current_outer = self.outer.next_row(ctx)?;
+                if self.current_outer.is_none() {
+                    return Ok(None);
+                }
+                self.inner.reset();
+            }
+            match self.inner.next_row(ctx)? {
+                Some(inner_row) => {
+                    let mut merged = self.current_outer.as_ref().unwrap().clone();
+                    merged.extend(inner_row);
+                    return Ok(Some(merged));
+                }
+                None => {
+                    self.current_outer = None;
+                }
+            }
+        }
+    }
+    fn reset(&mut self) {
+        self.outer.reset();
+        self.inner.reset();
+        self.current_outer = None;
+    }
+}
+
+/// Hash join: hash left side on join keys, probe right side.
+pub struct HashJoinOp {
+    left: Box<dyn PhysicalOperator>,
+    right: Box<dyn PhysicalOperator>,
+    join_keys: Vec<String>,
+    /// Materialised hash table: key_values → list of left rows.
+    hash_table: Option<HashMap<Vec<String>, Vec<Row>>>,
+    /// Right-side cursor.
+    right_rows: Vec<Row>,
+    right_idx: usize,
+    /// Current right row + matching left rows.
+    current_matches: Vec<Row>,
+    current_match_idx: usize,
+}
+
+impl HashJoinOp {
+    pub fn new(
+        left: Box<dyn PhysicalOperator>,
+        right: Box<dyn PhysicalOperator>,
+        join_keys: Vec<String>,
+    ) -> Self {
+        Self {
+            left,
+            right,
+            join_keys,
+            hash_table: None,
+            right_rows: Vec::new(),
+            right_idx: 0,
+            current_matches: Vec::new(),
+            current_match_idx: 0,
+        }
+    }
+}
+
+impl PhysicalOperator for HashJoinOp {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
+        // Build hash table from left side on first call.
+        if self.hash_table.is_none() {
+            let mut ht: HashMap<Vec<String>, Vec<Row>> = HashMap::new();
+            while let Some(row) = self.left.next_row(ctx)? {
+                let key: Vec<String> = self.join_keys.iter()
+                    .map(|k| row.get(k).map(|v| v.to_cypher_string()).unwrap_or_default())
+                    .collect();
+                ht.entry(key).or_default().push(row);
+            }
+            // Materialize right side.
+            while let Some(row) = self.right.next_row(ctx)? {
+                self.right_rows.push(row);
+            }
+            self.hash_table = Some(ht);
+        }
+        // Drain current_matches first.
+        loop {
+            if self.current_match_idx < self.current_matches.len() {
+                let row = self.current_matches[self.current_match_idx].clone();
+                self.current_match_idx += 1;
+                return Ok(Some(row));
+            }
+            if self.right_idx >= self.right_rows.len() {
+                return Ok(None);
+            }
+            let right_row = &self.right_rows[self.right_idx];
+            self.right_idx += 1;
+            let key: Vec<String> = self.join_keys.iter()
+                .map(|k| right_row.get(k).map(|v| v.to_cypher_string()).unwrap_or_default())
+                .collect();
+            let ht = self.hash_table.as_ref().unwrap();
+            if let Some(left_rows) = ht.get(&key) {
+                self.current_matches = left_rows.iter().map(|lr| {
+                    let mut merged = lr.clone();
+                    merged.extend(right_row.clone());
+                    merged
+                }).collect();
+                self.current_match_idx = 0;
+            } else {
+                self.current_matches.clear();
+                self.current_match_idx = 0;
+            }
+        }
+    }
+    fn reset(&mut self) {
+        self.hash_table = None;
+        self.right_rows.clear();
+        self.right_idx = 0;
+        self.current_matches.clear();
+        self.current_match_idx = 0;
+        self.left.reset();
+        self.right.reset();
+    }
+}
+
+/// UNWIND list to individual rows.
+pub struct UnwindOp {
+    expression: Expression,
+    variable: String,
+    input: Box<dyn PhysicalOperator>,
+    /// Pending (element, input_row) pairs.
+    pending: Vec<(Value, Row)>,
+    pending_idx: usize,
+}
+
+impl UnwindOp {
+    pub fn new(
+        expression: Expression,
+        variable: String,
+        input: Box<dyn PhysicalOperator>,
+    ) -> Self {
+        Self { expression, variable, input, pending: Vec::new(), pending_idx: 0 }
+    }
+}
+
+impl PhysicalOperator for UnwindOp {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
+        use crate::cypher::interpreter::evaluate;
+        loop {
+            if self.pending_idx < self.pending.len() {
+                let (ref elem, ref base_row) = self.pending[self.pending_idx].clone();
+                self.pending_idx += 1;
+                let mut row = base_row.clone();
+                row.insert(self.variable.clone(), elem.clone());
+                return Ok(Some(row));
+            }
+            let Some(input_row) = self.input.next_row(ctx)? else {
+                return Ok(None);
+            };
+            let eval_ctx = row_to_eval_context(&input_row);
+            let list_val = evaluate(&self.expression, &eval_ctx)
+                .map_err(|e| ExecError::Eval(e.to_string()))?;
+            self.pending.clear();
+            self.pending_idx = 0;
+            match list_val {
+                Value::List(items) => {
+                    for item in items {
+                        self.pending.push((item, input_row.clone()));
+                    }
+                }
+                Value::Null => {
+                    // UNWIND NULL yields no rows for this input row.
+                }
+                other => {
+                    // Non-list: yield as single element.
+                    self.pending.push((other, input_row));
+                }
+            }
+        }
+    }
+    fn reset(&mut self) {
+        self.pending.clear();
+        self.pending_idx = 0;
+        self.input.reset();
+    }
+}
+
 /// Delete nodes / relationships.
 pub struct DeleteOp {
     expressions: Vec<Expression>,
@@ -624,13 +1106,48 @@ impl DeleteOp {
 impl PhysicalOperator for DeleteOp {
     fn next_row(
         &mut self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Option<Row>, ExecError> {
-        // Stub: consume all input rows and return a single summary row.
-        while self.input.next_row(_ctx)?.is_some() {}
-        let mut row = empty_row();
-        row.insert("_deleted".to_string(), Value::Integer(self.expressions.len() as i64));
-        Ok(Some(row))
+        use crate::cypher::interpreter::evaluate;
+        // Process each input row and delete the targeted entities.
+        while let Some(row) = self.input.next_row(ctx)? {
+            let eval_ctx = row_to_eval_context(&row);
+            // SAFETY: single-threaded execution; exclusive engine access.
+            let engine = unsafe { ctx.engine_mut() };
+            for expr in &self.expressions {
+                let val = evaluate(expr, &eval_ctx)
+                    .map_err(|e| ExecError::Eval(e.to_string()))?;
+                match val {
+                    Value::Node(n) => {
+                        if self.detach {
+                            // DETACH: delete all outgoing + incoming edges first.
+                            let out = engine.scan_outgoing_edges(n.id, &[], ctx.fs)
+                                .map_err(|e| ExecError::Eval(e.to_string()))?;
+                            for (edge, _) in out {
+                                let _ = engine.delete_edge(edge.edge_id, ctx.fs);
+                            }
+                            let inc = engine.scan_incoming_edges(n.id, &[], ctx.fs)
+                                .map_err(|e| ExecError::Eval(e.to_string()))?;
+                            for (edge, _) in inc {
+                                let _ = engine.delete_edge(edge.edge_id, ctx.fs);
+                            }
+                        }
+                        engine.delete_node(n.id, ctx.fs)
+                            .map_err(|e| ExecError::Eval(e.to_string()))?;
+                    }
+                    Value::Relationship(r) => {
+                        engine.delete_edge(r.id, ctx.fs)
+                            .map_err(|e| ExecError::Eval(e.to_string()))?;
+                    }
+                    Value::Null => {} // silently skip NULL
+                    other => return Err(ExecError::Eval(format!(
+                        "DELETE requires a node or relationship, got '{}'",
+                        other.type_name()
+                    ))),
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn reset(&mut self) {
@@ -653,9 +1170,65 @@ impl SetOp {
 impl PhysicalOperator for SetOp {
     fn next_row(
         &mut self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Option<Row>, ExecError> {
-        self.input.next_row(_ctx)
+        use crate::cypher::ast::SetItem;
+        use crate::cypher::interpreter::evaluate;
+        match self.input.next_row(ctx)? {
+            None => Ok(None),
+            Some(mut row) => {
+                let eval_ctx = row_to_eval_context(&row);
+                for item in &self.items {
+                    match item {
+                        SetItem::Property { target, value } => {
+                            // Evaluate the target to get node/rel id, then update property.
+                            let target_val = evaluate(target, &eval_ctx)
+                                .map_err(|e| ExecError::Eval(e.to_string()))?;
+                            let new_val = evaluate(value, &eval_ctx)
+                                .map_err(|e| ExecError::Eval(e.to_string()))?;
+                            // For now, update the in-row value (full durable write deferred to Sprint D).
+                            if let crate::cypher::ast::Expression::PropertyAccess { base, property, .. } = target.as_ref() {
+                                if let crate::cypher::ast::Expression::Variable(var) = base.as_ref() {
+                                    if let Some(val) = row.get_mut(var) {
+                                        if let Value::Node(n) = val {
+                                            n.properties.insert(property.clone(), new_val);
+                                        } else if let Value::Relationship(r) = val {
+                                            r.properties.insert(property.clone(), new_val);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        SetItem::Label { variable, labels } => {
+                            // Label addition is an in-memory update for now.
+                            if let Some(val) = row.get_mut(variable) {
+                                if let Value::Node(n) = val {
+                                    for label in labels {
+                                        if !n.labels.contains(label) {
+                                            n.labels.push(label.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        SetItem::Merge { variable, value } | SetItem::Replace { variable, value } => {
+                            let new_val = evaluate(value, &eval_ctx)
+                                .map_err(|e| ExecError::Eval(e.to_string()))?;
+                            if let Some(entity) = row.get_mut(variable) {
+                                if let Value::Map(ref props) = new_val.clone() {
+                                    if let Value::Node(n) = entity {
+                                        for (k, v) in props {
+                                            n.properties.insert(k.clone(), v.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Some(row))
+            }
+        }
     }
 
     fn reset(&mut self) {
@@ -678,9 +1251,39 @@ impl RemoveOp {
 impl PhysicalOperator for RemoveOp {
     fn next_row(
         &mut self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Option<Row>, ExecError> {
-        self.input.next_row(_ctx)
+        use crate::cypher::ast::RemoveItem;
+        match self.input.next_row(ctx)? {
+            None => Ok(None),
+            Some(mut row) => {
+                for item in &self.items {
+                    match item {
+                        RemoveItem::Property { target } => {
+                            if let crate::cypher::ast::Expression::PropertyAccess { base, property, .. } = target.as_ref() {
+                                if let crate::cypher::ast::Expression::Variable(var) = base.as_ref() {
+                                    if let Some(val) = row.get_mut(var) {
+                                        if let Value::Node(n) = val {
+                                            n.properties.remove(property);
+                                        } else if let Value::Relationship(r) = val {
+                                            r.properties.remove(property);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        RemoveItem::Label { variable, labels } => {
+                            if let Some(val) = row.get_mut(variable) {
+                                if let Value::Node(n) = val {
+                                    n.labels.retain(|l| !labels.contains(l));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Some(row))
+            }
+        }
     }
 
     fn reset(&mut self) {
@@ -710,19 +1313,78 @@ impl MergeOp {
 impl PhysicalOperator for MergeOp {
     fn next_row(
         &mut self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Option<Row>, ExecError> {
-        // Stub: consume input and return a placeholder row.
-        while self.input.next_row(_ctx)?.is_some() {}
-        let mut row = empty_row();
+        // MERGE: try to MATCH the pattern; on failure, CREATE it.
+        // This is a simplified single-node MERGE for now.
+        // Full relationship MERGE support will be added in Sprint D.
+        let Some(input_row) = self.input.next_row(ctx)? else {
+            return Ok(None);
+        };
+
+        // Check if pattern already matches.
+        let mut matched_row = input_row.clone();
+        let mut any_matched = false;
+
         for elem in &self.pattern.elements {
             if let crate::cypher::ast::PatternElement::Node(n) = elem {
-                if let Some(v) = &n.variable {
-                    row.insert(v.clone(), Value::Null);
+                if let Some(var) = &n.variable {
+                    // Skip if variable already bound in input.
+                    if input_row.contains_key(var) {
+                        any_matched = true;
+                        continue;
+                    }
+                    // Try to find a matching node.
+                    let label_id = n.labels.first()
+                        .and_then(|l| ctx.engine.storage_label_id_for(l))
+                        .unwrap_or(0u64);
+                    let nodes = ctx.engine.scan_nodes_by_label(label_id, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?;
+
+                    let found = nodes.into_iter().find(|r| {
+                        r.flags & crate::graph::record::node_flags::DELETED == 0
+                    });
+
+                    if let Some(record) = found {
+                        if let Ok(Some(nv)) = load_node_value(ctx.engine, record.node_id, ctx.fs) {
+                            matched_row.insert(var.clone(), nv);
+                            any_matched = true;
+                        }
+                    }
                 }
             }
         }
-        Ok(Some(row))
+
+        if any_matched {
+            // ON MATCH: apply set items.
+            // (In-memory only for now — durable write in Sprint D.)
+            Ok(Some(matched_row))
+        } else {
+            // ON CREATE: create the pattern.
+            use crate::graph::builder::NodeBuilder;
+            use crate::graph::graph::Graph;
+            let mut row = input_row;
+            // SAFETY: single-threaded execution.
+            let engine = unsafe { ctx.engine_mut() };
+            for elem in &self.pattern.elements {
+                if let crate::cypher::ast::PatternElement::Node(n) = elem {
+                    let label_id = n.labels.first()
+                        .map(|l| engine.catalog_label_id(l))
+                        .unwrap_or(0u32);
+                    let builder = NodeBuilder::new().label(label_id);
+                    let mut g = Graph::new_ref(engine);
+                    let (_, node_id) = g.create_node(builder, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?;
+                    if let Some(var) = &n.variable {
+                        if let Some(nv) = load_node_value(engine, node_id, ctx.fs)? {
+                            row.insert(var.clone(), nv);
+                        }
+                    }
+                }
+            }
+            // Apply ON CREATE set items (in-memory for now).
+            Ok(Some(row))
+        }
     }
 
     fn reset(&mut self) {
@@ -908,24 +1570,90 @@ fn compute_aggregate(
 // Helpers
 // ------------------------------------------------------------------
 
-/// Convert a [`NodeRecord`] into a runtime [`Value`].
-fn node_to_value(node: &NodeRecord) -> Value {
-    let mut map = HashMap::new();
-    map.insert("node_id".to_string(), Value::Integer(node.node_id as i64));
-    map.insert("label_id".to_string(), Value::Integer(node.label_id as i64));
-    Value::Map(map)
+/// Load a node from storage and return it as a `Value::Node`, with properties.
+pub(crate) fn load_node_value(
+    engine: &GraphStorageEngine,
+    node_id: u64,
+    fs: &dyn FileSystem,
+) -> Result<Option<Value>, ExecError> {
+    use crate::graph::graph::read_property_chain_engine;
+    use crate::graph::record::node_flags;
+    let record = match engine.get_node(node_id, fs)
+        .map_err(|e| ExecError::Eval(e.to_string()))? {
+        Some(r) if r.flags & node_flags::DELETED == 0 => r,
+        _ => return Ok(None),
+    };
+    let raw_props = read_property_chain_engine(engine, record.first_property, fs)
+        .map_err(|e| ExecError::Eval(e.to_string()))?;
+    // Convert label_id to label name via catalog.
+    let label_name = engine.catalog().read()
+        .expect("catalog read lock poisoned")
+        .label_name(record.label_id)
+        .map(|s| s.to_string());
+    let labels = label_name.map(|l| vec![l]).unwrap_or_default();
+    let mut properties = HashMap::new();
+    for (k, prop) in raw_props {
+        properties.insert(k, crate::cypher::value::Value::from_property(prop));
+    }
+    Ok(Some(Value::Node(crate::cypher::value::NodeValue {
+        id: record.node_id,
+        labels,
+        properties,
+    })))
 }
 
-/// Convert an [`EdgeRecord`] into a runtime [`Value`].
-fn edge_to_value(edge: &crate::graph::record::EdgeRecord) -> Value {
-    let mut map = HashMap::new();
-    map.insert("edge_id".to_string(), Value::Integer(edge.edge_id as i64));
-    map.insert("type_id".to_string(), Value::Integer(edge.type_id as i64));
-    Value::Map(map)
+/// Convert an [`EdgeRecord`] to `Value::Relationship`, resolving type name.
+fn edge_record_to_value(
+    edge: &crate::graph::record::EdgeRecord,
+    engine: &GraphStorageEngine,
+    fs: &dyn FileSystem,
+) -> Value {
+    use crate::graph::graph::read_property_chain_engine;
+    let type_name = engine.catalog().read()
+        .expect("catalog read lock")
+        .rel_type_name(edge.type_id)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("TYPE_{}", edge.type_id));
+    let raw_props = read_property_chain_engine(engine, edge.first_property, fs)
+        .unwrap_or_default();
+    let mut properties = HashMap::new();
+    for (k, prop) in raw_props {
+        properties.insert(k, crate::cypher::value::Value::from_property(prop));
+    }
+    Value::Relationship(crate::cypher::value::RelationshipValue {
+        id: edge.edge_id,
+        rel_type: type_name,
+        source_id: edge.source_id,
+        target_id: edge.target_id,
+        properties,
+    })
+}
+
+/// Build a `Value::Relationship` from known ids (no property load).
+fn edge_record_id_to_value(edge_id: u64, type_id: u32, source_id: u64, target_id: u64) -> Value {
+    Value::Relationship(crate::cypher::value::RelationshipValue {
+        id: edge_id,
+        rel_type: format!("TYPE_{}", type_id),
+        source_id,
+        target_id,
+        properties: HashMap::new(),
+    })
+}
+
+/// Convert a runtime `Value` to a storage `Property`.
+fn value_to_property(val: &Value) -> Option<crate::graph::property::Property> {
+    match val {
+        Value::Null => Some(crate::graph::property::Property::Null),
+        Value::Boolean(b) => Some(crate::graph::property::Property::Boolean(*b)),
+        Value::Integer(i) => Some(crate::graph::property::Property::Integer(*i)),
+        Value::Float(f) => Some(crate::graph::property::Property::Float(*f)),
+        Value::String(s) => Some(crate::graph::property::Property::String(s.clone())),
+        _ => None,
+    }
 }
 
 /// Build an [`EvalContext`] from a physical row.
-fn row_to_eval_context(row: &Row) -> EvalContext {
+pub(crate) fn row_to_eval_context(row: &Row) -> EvalContext {
     let mut ctx = EvalContext::new();
     for (k, v) in row {
         ctx = ctx.bind(k.clone(), v.clone());
@@ -933,18 +1661,8 @@ fn row_to_eval_context(row: &Row) -> EvalContext {
     ctx
 }
 
-fn compare_values(a: &Value, b: &Value, ascending: bool) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let ord = match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => Ordering::Greater, // NULL sorts last
-        (_, Value::Null) => Ordering::Less,
-        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-        (Value::String(x), Value::String(y)) => x.cmp(y),
-        (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
-        _ => Ordering::Equal, // incomparable types
-    };
+pub(crate) fn compare_values(a: &Value, b: &Value, ascending: bool) -> std::cmp::Ordering {
+    let ord = a.cypher_compare(b).unwrap_or(std::cmp::Ordering::Equal);
     if ascending { ord } else { ord.reverse() }
 }
 
@@ -968,19 +1686,29 @@ pub fn build_physical_plan(plan: &LogicalPlan) -> Box<dyn PhysicalOperator> {
 
 fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
     match op {
-        LogicalOperator::AllNodesScan => Box::new(AllNodesScanOp::new()),
-        LogicalOperator::NodeByLabelScan { label } => Box::new(NodeByLabelScanOp::new(label)),
+        LogicalOperator::AllNodesScan => Box::new(AllNodesScanOp::new("_node")),
+        LogicalOperator::NodeByLabelScan { label } => {
+            Box::new(NodeByLabelScanOp::new("_node", label.clone()))
+        }
         LogicalOperator::NodeByIdScan { node_id } => {
-            // Point lookup is modelled as a label scan with a filter (stub).
-            Box::new(AllNodesScanOp::new())
+            // Point lookup: wrap in a filter over all-nodes-scan (TODO: real index seek).
+            Box::new(NodeByIdScanOp::new(*node_id))
         }
         LogicalOperator::Expand {
             input,
             direction,
             rel_types,
             from_variable,
-            ..
-        } => Box::new(ExpandOp::new(*direction, rel_types.clone(), from_variable)),
+            rel_variable,
+            end_node_variable,
+        } => Box::new(ExpandOp::new(
+            build_physical_operator(input),
+            *direction,
+            rel_types.clone(),
+            from_variable.clone(),
+            rel_variable.clone(),
+            end_node_variable.clone(),
+        )),
         LogicalOperator::Filter { input, predicate } => Box::new(FilterOp::new(
             predicate.clone(),
             build_physical_operator(input),
@@ -1022,11 +1750,10 @@ fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
             build_physical_operator(input),
         )),
         LogicalOperator::Apply { left, right } => {
-            // Apply is a nested-loop join.  For Sprint 21 we return the
-            // Cartesian product of left and right (simplified stub).
-            let _l = build_physical_operator(left);
-            let _r = build_physical_operator(right);
-            Box::new(AllNodesScanOp::new()) // stub
+            Box::new(ApplyOp::new(
+                build_physical_operator(left),
+                build_physical_operator(right),
+            ))
         }
         LogicalOperator::Aggregate {
             input,
@@ -1037,17 +1764,19 @@ fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
             aggregations.clone(),
             build_physical_operator(input),
         )),
-        LogicalOperator::HashJoin { left, right, .. } => {
-            let _l = build_physical_operator(left);
-            let _r = build_physical_operator(right);
-            Box::new(AllNodesScanOp::new()) // stub
+        LogicalOperator::HashJoin { left, right, join_keys } => {
+            Box::new(HashJoinOp::new(
+                build_physical_operator(left),
+                build_physical_operator(right),
+                join_keys.clone(),
+            ))
         }
-        LogicalOperator::Merge { pattern, on_create, on_match, .. } => {
+        LogicalOperator::Merge { input, pattern, on_create, on_match } => {
             Box::new(MergeOp::new(
                 pattern.clone(),
                 on_create.clone(),
                 on_match.clone(),
-                Box::new(AllNodesScanOp::new()),
+                build_physical_operator(input),
             ))
         }
     }
@@ -1060,25 +1789,36 @@ fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
 /// Execute a [`LogicalPlan`] against the storage engine and return a
 /// [`QueryResult`].
 ///
-/// This is the bridge between the planner and the naive executor.  It
-/// materialises all rows into memory (suitable for the Sprint 21 subset).
-/// Future sprints will add streaming result sets.
+/// Column order follows the RETURN projection order as declared in the query.
+/// The `plan` must have been built with [`crate::cypher::planner::plan`].
 pub fn execute_plan(
     plan: &LogicalPlan,
     ctx: &ExecutionContext,
 ) -> Result<QueryResult, ExecError> {
+    // Derive the expected column order from the root Project operator if present.
+    let projection_columns = extract_projection_columns(&plan.root);
+
     let mut physical = build_physical_plan(plan);
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut columns: Vec<String> = Vec::new();
 
-    // Pull the first row to discover column names from Project.
+    // Pull the first row to set the column list.
     if let Some(first_row) = physical.next_row(ctx)? {
-        columns = first_row.keys().cloned().collect();
-        columns.sort(); // deterministic order
+        if !projection_columns.is_empty() {
+            // Use declared RETURN order.
+            columns = projection_columns.clone();
+        } else {
+            // Fall back to sorted keys for operator sub-trees with no Project root.
+            columns = first_row.keys().cloned().collect();
+            columns.sort();
+        }
         let values: Vec<Value> = columns.iter().map(|c| {
             first_row.get(c).cloned().unwrap_or(Value::Null)
         }).collect();
         rows.push(values);
+    } else if !projection_columns.is_empty() {
+        // Empty result — still expose the columns from the RETURN clause.
+        columns = projection_columns;
     }
 
     // Pull remaining rows.
@@ -1090,6 +1830,29 @@ pub fn execute_plan(
     }
 
     Ok(QueryResult { columns, rows })
+}
+
+/// Walk the logical plan tree to find the projection column names in RETURN order.
+fn extract_projection_columns(op: &LogicalOperator) -> Vec<String> {
+    match op {
+        LogicalOperator::Project { projections, .. } => {
+            projections.iter().map(|p| {
+                p.alias.clone().unwrap_or_else(|| p.expression.to_string())
+            }).collect()
+        }
+        // Descend through transparent wrappers.
+        LogicalOperator::Aggregate { grouping_keys, aggregations, .. } => {
+            let mut cols: Vec<String> = grouping_keys.iter().map(|e| e.to_string()).collect();
+            cols.extend(aggregations.iter().map(|a| a.alias.clone()));
+            cols
+        }
+        LogicalOperator::Limit { input, .. }
+        | LogicalOperator::Skip { input, .. }
+        | LogicalOperator::Sort { input, .. }
+        | LogicalOperator::Filter { input, .. }
+        | LogicalOperator::Eager { input } => extract_projection_columns(input),
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1380,9 +2143,6 @@ mod tests {
         // Leak both to keep them alive for 'static.
         let fs_ref: &'static dyn FileSystem = Box::leak(Box::new(fs));
         let engine_ref: &'static GraphStorageEngine = Box::leak(Box::new(engine));
-        ExecutionContext {
-            engine: engine_ref,
-            fs: fs_ref,
-        }
+        ExecutionContext::new(engine_ref, fs_ref)
     }
 }

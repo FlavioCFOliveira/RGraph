@@ -98,6 +98,12 @@ pub fn execute_naive(stmt: &Statement) -> Result<QueryResult, ExecError> {
                 Clause::Set(_) => "SET".to_string(),
                 Clause::Remove(_) => "REMOVE".to_string(),
                 Clause::Merge(_) => "MERGE".to_string(),
+                Clause::OptionalMatch(_) => "OPTIONAL MATCH".to_string(),
+                Clause::With(_) => "WITH".to_string(),
+                Clause::Unwind(_) => "UNWIND".to_string(),
+                Clause::Union(_) => "UNION".to_string(),
+                Clause::Call(_) => "CALL".to_string(),
+                Clause::Foreach(_) => "FOREACH".to_string(),
                 Clause::Return(_) => unreachable!(),
             })
             .collect();
@@ -244,6 +250,31 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             }
             serde_json::Value::Object(obj)
         }
+        Value::Node(n) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".to_string(), serde_json::Value::Number(n.id.into()));
+            obj.insert("labels".to_string(), serde_json::Value::Array(
+                n.labels.iter().map(|l| serde_json::Value::String(l.clone())).collect()
+            ));
+            serde_json::Value::Object(obj)
+        }
+        Value::Relationship(r) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".to_string(), serde_json::Value::Number(r.id.into()));
+            obj.insert("type".to_string(), serde_json::Value::String(r.rel_type.clone()));
+            serde_json::Value::Object(obj)
+        }
+        Value::Path(_) => serde_json::Value::String("<path>".to_string()),
+        Value::Point { x, y, .. } => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("x".to_string(), serde_json::Number::from_f64(*x)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null));
+            obj.insert("y".to_string(), serde_json::Number::from_f64(*y)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null));
+            serde_json::Value::Object(obj)
+        }
     }
 }
 
@@ -255,10 +286,12 @@ mod tests {
     #[test]
     fn execute_simple_return() {
         let stmt = Statement::new().with_clause(Clause::Return(ReturnClause {
-                    span: None,
-                    projections: vec![Projection {
-                    span: None,
-                    expression: Expression::Literal(Literal::Integer(42)),
+            distinct: false,
+            star: false,
+            span: None,
+            projections: vec![Projection {
+                span: None,
+                expression: Expression::Literal(Literal::Integer(42)),
                 alias: None,
             }],
             order_by: vec![],
@@ -274,10 +307,12 @@ mod tests {
     #[test]
     fn execute_return_with_alias() {
         let stmt = Statement::new().with_clause(Clause::Return(ReturnClause {
-                    span: None,
-                    projections: vec![Projection {
-                    span: None,
-                    expression: Expression::Literal(Literal::String("hello".to_string())),
+            distinct: false,
+            star: false,
+            span: None,
+            projections: vec![Projection {
+                span: None,
+                expression: Expression::Literal(Literal::String("hello".to_string())),
                 alias: Some("greeting".to_string()),
             }],
             order_by: vec![],
@@ -331,12 +366,15 @@ mod tests {
     #[test]
     fn unsupported_match_clause() {
         let stmt = Statement::new()
-            .with_clause(Clause::Match(crate::cypher::ast::MatchClause { span: None,
-                pattern: crate::cypher::ast::Pattern { span: None, elements: vec![] },
+            .with_clause(Clause::Match(crate::cypher::ast::MatchClause {
+                span: None,
+                patterns: vec![],
             }))
             .with_clause(Clause::Return(ReturnClause {
-                    span: None,
-                    projections: vec![Projection {
+                distinct: false,
+                star: false,
+                span: None,
+                projections: vec![Projection {
                     span: None,
                     expression: Expression::Literal(Literal::Integer(1)),
                     alias: None,

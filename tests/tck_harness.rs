@@ -124,7 +124,7 @@ fn tck_return_boolean_not() {
         vec![ExpectedRow {
             columns: {
                 let mut m = HashMap::new();
-                m.insert("NOT true".to_string(), Value::Boolean(false));
+                m.insert("(NOT true)".to_string(), Value::Boolean(false));
                 m
             },
         }],
@@ -274,10 +274,7 @@ fn make_test_ctx() -> ExecutionContext<'static> {
     let engine = GraphStorageEngine::init(dir.join("data.db"), &fs).unwrap();
     let fs_ref: &'static dyn rgraph::io::FileSystem = Box::leak(Box::new(fs));
     let engine_ref: &'static GraphStorageEngine = Box::leak(Box::new(engine));
-    ExecutionContext {
-        engine: engine_ref,
-        fs: fs_ref,
-    }
+    ExecutionContext::new(engine_ref, fs_ref)
 }
 
 #[test]

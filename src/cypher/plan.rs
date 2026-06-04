@@ -454,6 +454,14 @@ impl LogicalOperator {
                         SetItem::Label { variable, .. } => {
                             vars.push(variable.clone());
                         }
+                        SetItem::Merge { variable, value } => {
+                            vars.push(variable.clone());
+                            collect_expression_variables(value, &mut vars);
+                        }
+                        SetItem::Replace { variable, value } => {
+                            vars.push(variable.clone());
+                            collect_expression_variables(value, &mut vars);
+                        }
                     }
                 }
             }
@@ -549,6 +557,48 @@ fn collect_expression_variables(expr: &Expression, vars: &mut Vec<String>) {
         }
         Expression::Wildcard => {}
         Expression::Literal(_) => {}
+        Expression::Parameter(_) => {}
+        Expression::DynamicPropertyAccess { base, index, .. } => {
+            collect_expression_variables(base, vars);
+            collect_expression_variables(index, vars);
+        }
+        Expression::Slice { base, from, to, .. } => {
+            collect_expression_variables(base, vars);
+            if let Some(f) = from { collect_expression_variables(f, vars); }
+            if let Some(t) = to { collect_expression_variables(t, vars); }
+        }
+        Expression::Not { expr, .. } => {
+            collect_expression_variables(expr, vars);
+        }
+        Expression::Case { subject, alternatives, default, .. } => {
+            if let Some(s) = subject { collect_expression_variables(s, vars); }
+            for alt in alternatives {
+                collect_expression_variables(&alt.condition, vars);
+                collect_expression_variables(&alt.result, vars);
+            }
+            if let Some(d) = default { collect_expression_variables(d, vars); }
+        }
+        Expression::ListComprehension { variable, source, filter, projection, .. } => {
+            collect_expression_variables(source, vars);
+            if let Some(f) = filter { collect_expression_variables(f, vars); }
+            if let Some(p) = projection { collect_expression_variables(p, vars); }
+            // variable is a new binding inside the comprehension — not a reference
+            let _ = variable;
+        }
+        Expression::PatternComprehension { projection, filter, .. } => {
+            collect_expression_variables(projection, vars);
+            if let Some(f) = filter { collect_expression_variables(f, vars); }
+        }
+        Expression::Reduce { init, source, body, .. } => {
+            collect_expression_variables(init, vars);
+            collect_expression_variables(source, vars);
+            collect_expression_variables(body, vars);
+        }
+        Expression::Quantifier { source, filter, .. } => {
+            collect_expression_variables(source, vars);
+            collect_expression_variables(filter, vars);
+        }
+        Expression::Exists { subquery: _, pattern: _, .. } => {}
     }
 }
 

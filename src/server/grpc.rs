@@ -84,6 +84,15 @@ impl CypherQueryService {
             Expression::Literal(Literal::Null) => Ok(ProtoValue {
                 kind: Some(proto::value::Kind::Null(proto::Null {})),
             }),
+            // Temporal literals — represent as string values.
+            Expression::Literal(Literal::Date(s))
+            | Expression::Literal(Literal::Time(s))
+            | Expression::Literal(Literal::LocalTime(s))
+            | Expression::Literal(Literal::DateTime(s))
+            | Expression::Literal(Literal::LocalDateTime(s))
+            | Expression::Literal(Literal::Duration(s)) => Ok(ProtoValue {
+                kind: Some(proto::value::Kind::String(s.clone())),
+            }),
             Expression::BinaryOp { op, left, right, .. } => {
                 let lhs = Self::eval_expression(left)?;
                 let rhs = Self::eval_expression(right)?;
@@ -143,6 +152,25 @@ impl CypherQueryService {
             Expression::FunctionCall { .. } => Err(RGraphError::Semantic(
                 "Function calls not yet implemented in gRPC evaluator".into(),
             )),
+            // New expression types — return informative errors.
+            Expression::Not { .. }
+            | Expression::Case { .. }
+            | Expression::ListComprehension { .. }
+            | Expression::PatternComprehension { .. }
+            | Expression::Reduce { .. }
+            | Expression::Quantifier { .. }
+            | Expression::Exists { .. } => Err(RGraphError::Semantic(
+                "Complex expressions not yet supported in gRPC evaluator".into(),
+            )),
+            Expression::Parameter(name) => Err(RGraphError::Semantic(format!(
+                "parameter '${name}' not supported in gRPC evaluator (no parameter map)"
+            ))),
+            Expression::DynamicPropertyAccess { .. } => Err(RGraphError::Semantic(
+                "dynamic property access not yet supported in gRPC evaluator".into(),
+            )),
+            Expression::Slice { .. } => Err(RGraphError::Semantic(
+                "slice expressions not yet supported in gRPC evaluator".into(),
+            )),
         }
     }
 
@@ -158,7 +186,7 @@ impl CypherQueryService {
         match (l, r) {
             (Kind::Integer(a), Kind::Integer(b)) => {
                 let res = match op {
-                    BinaryOperator::Add => a + b,
+                    BinaryOperator::Add | BinaryOperator::Concat => a + b,
                     BinaryOperator::Sub => a - b,
                     BinaryOperator::Mul => a * b,
                     BinaryOperator::Div => a / b,

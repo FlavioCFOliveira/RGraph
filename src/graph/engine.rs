@@ -23,9 +23,10 @@ use crate::wal::aries::AriesRecovery;
 use crate::wal::doublewrite::DoubleWriteBuffer;
 use crate::wal::record::{RecordType, WalRecord};
 use crate::wal::writer::WalWriter;
+use crate::catalog::Catalog;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Monotonically-increasing graph-entity id allocator.
@@ -261,6 +262,8 @@ pub struct GraphStorageEngine {
     /// Tracks the WAL filesystem for use in transaction commit/rollback.
     /// Cached here so callers do not need to pass it separately.
     wal_fs: Arc<crate::io::posix::PosixFileSystem>,
+    /// Schema catalog — maps label/type/property-key names to compact u32 ids.
+    pub catalog: Arc<RwLock<Catalog>>,
 }
 
 impl GraphStorageEngine {
@@ -300,6 +303,7 @@ impl GraphStorageEngine {
             id_allocator: IdAllocator::new(1),
             txn_manager: Arc::new(TransactionManager::new()),
             wal_fs,
+            catalog: Arc::new(RwLock::new(Catalog::new())),
         })
     }
 
@@ -383,6 +387,7 @@ impl GraphStorageEngine {
             id_allocator: IdAllocator::new(1),
             txn_manager: Arc::new(TransactionManager::new()),
             wal_fs: wal_fs_arc,
+            catalog: Arc::new(RwLock::new(Catalog::new())),
         };
 
         // Rebuild secondary indexes from primary data pages.  This also
@@ -694,6 +699,28 @@ impl GraphStorageEngine {
             .map_err(StorageError::from)
     }
 
+    /// Return a shared reference to the schema catalog.
+    pub fn catalog(&self) -> Arc<RwLock<Catalog>> {
+        Arc::clone(&self.catalog)
+    }
+
+    /// Resolve a label name to its catalog id, creating an entry if absent.
+    ///
+    /// This is a write operation on the catalog — use when registering new
+    /// labels (typically during `CREATE` execution).
+    pub fn catalog_label_id(&self, label: &str) -> u32 {
+        self.catalog.write().expect("catalog write lock poisoned").get_or_create_label(label)
+    }
+
+    /// Look up the u64 label id used in storage from a string label name.
+    ///
+    /// Returns `None` if the label is not yet registered in the catalog.
+    pub fn storage_label_id_for(&self, label: &str) -> Option<u64> {
+        self.catalog.read().expect("catalog read lock poisoned")
+            .label_id(label)
+            .map(|id| id as u64)
+    }
+
     pub fn scan_nodes_by_label(
         &self,
         label_id: u64,
@@ -732,6 +759,84 @@ impl GraphStorageEngine {
                     results.push(edge);
                 }
             }
+        }
+        Ok(results)
+    }
+
+    /// Scan all outgoing edges from `source_node_id`, optionally filtered by
+    /// `type_ids` (empty = all types).  Returns a list of `(edge, end_node_id)`
+    /// pairs where `end_node_id` is the logical target node id.
+    pub fn scan_outgoing_edges(
+        &self,
+        source_node_id: u64,
+        type_ids: &[u64],
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<(EdgeRecord, u64)>, StorageError> {
+        let node_record = match self.get_node(source_node_id, fs)? {
+            Some(r) => r,
+            None => return Ok(vec![]),
+        };
+        let mut results = Vec::new();
+        let mut cursor = node_record.first_outgoing_edge;
+        const MAX_HOPS: usize = 65536;
+        let mut depth = 0usize;
+        while !cursor.is_null() && depth < MAX_HOPS {
+            depth += 1;
+            let bytes = match Self::read_record(&self.page_manager, cursor, fs)? {
+                Some(b) => b,
+                None => break,
+            };
+            let edge = match EdgeRecord::decode(&bytes) {
+                Some(e) => e,
+                None => break,
+            };
+            if edge.flags & edge_flags::DELETED == 0 {
+                let type_matches = type_ids.is_empty()
+                    || type_ids.contains(&(edge.type_id as u64));
+                if type_matches {
+                    results.push((edge, edge.target_id));
+                }
+            }
+            cursor = edge.next_source_edge;
+        }
+        Ok(results)
+    }
+
+    /// Scan all incoming edges to `target_node_id`, optionally filtered by
+    /// `type_ids` (empty = all types).  Returns `(edge, end_node_id)` where
+    /// `end_node_id` is the logical source node id.
+    pub fn scan_incoming_edges(
+        &self,
+        target_node_id: u64,
+        type_ids: &[u64],
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<(EdgeRecord, u64)>, StorageError> {
+        let node_record = match self.get_node(target_node_id, fs)? {
+            Some(r) => r,
+            None => return Ok(vec![]),
+        };
+        let mut results = Vec::new();
+        let mut cursor = node_record.first_incoming_edge;
+        const MAX_HOPS: usize = 65536;
+        let mut depth = 0usize;
+        while !cursor.is_null() && depth < MAX_HOPS {
+            depth += 1;
+            let bytes = match Self::read_record(&self.page_manager, cursor, fs)? {
+                Some(b) => b,
+                None => break,
+            };
+            let edge = match EdgeRecord::decode(&bytes) {
+                Some(e) => e,
+                None => break,
+            };
+            if edge.flags & edge_flags::DELETED == 0 {
+                let type_matches = type_ids.is_empty()
+                    || type_ids.contains(&(edge.type_id as u64));
+                if type_matches {
+                    results.push((edge, edge.source_id));
+                }
+            }
+            cursor = edge.next_target_edge;
         }
         Ok(results)
     }
