@@ -360,6 +360,11 @@ impl BPlusTree {
     /// page the batch mutated, so the index survives a crash and is replayed by
     /// ARIES recovery.
     ///
+    /// NOTE: this WAL-logged path is not yet wired into the engine commit path
+    /// (`TransactionManager::commit_with_indexes`), which currently applies index
+    /// mutations to the in-memory trees and relies on `rebuild_indexes` on
+    /// `open()` for index durability. See reliability-audit finding L18.
+    ///
     /// Requires an attached buffer pool and file system (see [`Self::with_pool`]).
     /// Each touched page is logged as an [`crate::wal::record::RecordType::IndexPageUpdate`]
     /// (or `IndexPageInsert` for newly allocated pages) carrying the full

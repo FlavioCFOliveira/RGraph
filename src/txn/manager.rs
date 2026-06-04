@@ -388,8 +388,18 @@ impl TransactionManager {
     /// 4. Append a [`RecordType::Commit`] WAL record and flush.
     /// 5. Release locks, update global state, clean up wound-wait metadata.
     ///
-    /// This ensures that either **both** the primary records and the secondary
-    /// indexes are durable, or neither is, preserving atomicity.
+    /// Atomicity of the *application* is preserved: if any staged index mutation
+    /// fails, the transaction is aborted, so the in-memory secondary indexes are
+    /// either fully updated or left untouched.
+    ///
+    /// Index durability model: the staged mutations are applied to the secondary
+    /// index trees in memory and are **not** individually WAL-logged here. (The
+    /// WAL-logged path [`crate::index::btree::BPlusTree::insert_batch_logged`]
+    /// exists but is not yet wired into this commit path.) Secondary indexes are
+    /// *derived state*: they are reconstructed from the durable primary records
+    /// by `rebuild_indexes` on `open()`. Durability of the indexes therefore
+    /// follows from the durability of the primary records committed here, not
+    /// from per-index WAL logging. See reliability-audit finding L18 (2026-06-04).
     pub fn commit_with_indexes(
         &self,
         tx: &mut Transaction,
