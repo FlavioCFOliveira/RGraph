@@ -234,6 +234,8 @@ impl WalWriter {
         } else {
             let handle = fs.open(&segment_path, true)?;
             handle.sync_data()?;
+            // Make the new segment's directory entry durable (H8).
+            fs.sync_dir(&wal_dir)?;
             // For segment 0, start at offset 1 so LSN 0 stays as the null sentinel.
             let offset: u32 = if segment_id == 0 { 1 } else { 0 };
             (offset, Some(handle))
@@ -439,6 +441,8 @@ impl WalWriter {
         {
             let handle = fs.open(&next_path, true)?;
             handle.sync_data()?;
+            // Make the new segment's directory entry durable before adopting it (H8).
+            fs.sync_dir(&self.wal_dir)?;
             self.segment_handle = Some(handle);
         }
 
@@ -488,6 +492,9 @@ impl WalWriter {
             handle.sync_data()?;
             fs.rename(&tmp, &link)?;
         }
+        // Make the renamed `wal-current` entry durable (H8): the atomic-rename
+        // trick is only crash-atomic once the directory itself is fsynced.
+        fs.sync_dir(&self.wal_dir)?;
         Ok(())
     }
 
@@ -639,6 +646,70 @@ mod tests {
     }
 
     // ── Rotation tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn segment_create_and_symlink_rename_fsync_the_wal_directory() {
+        // Regression gate for reliability-audit finding H8 (2026-06-04):
+        // creating a WAL segment and atomically renaming `wal-current` must
+        // `fsync` the containing directory, otherwise the new directory entries
+        // (and committed records in a freshly rotated segment) can vanish on a
+        // power loss even though the file data was fsynced.
+        use crate::io::FileHandle;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingFs {
+            inner: PosixFileSystem,
+            dir_syncs: Arc<AtomicUsize>,
+        }
+        impl FileSystem for CountingFs {
+            fn open(&self, path: &Path, create: bool) -> io::Result<Box<dyn FileHandle>> {
+                self.inner.open(path, create)
+            }
+            fn remove(&self, path: &Path) -> io::Result<()> {
+                self.inner.remove(path)
+            }
+            fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+                self.inner.rename(from, to)
+            }
+            #[cfg(unix)]
+            fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
+                self.inner.symlink(target, link)
+            }
+            fn exists(&self, path: &Path) -> bool {
+                self.inner.exists(path)
+            }
+            fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+                self.inner.create_dir_all(path)
+            }
+            fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+                self.dir_syncs.fetch_add(1, Ordering::SeqCst);
+                self.inner.sync_dir(dir)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let fs = CountingFs {
+            inner: PosixFileSystem::new(false),
+            dir_syncs: Arc::clone(&counter),
+        };
+
+        // open() creates segment 0 → must fsync the wal directory.
+        let mut writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
+        assert!(
+            counter.load(Ordering::SeqCst) >= 1,
+            "creating segment 0 must fsync the wal directory"
+        );
+
+        // rotate() creates a new segment AND renames wal-current → ≥2 more fsyncs.
+        let before = counter.load(Ordering::SeqCst);
+        writer.rotate(&fs).unwrap();
+        assert!(
+            counter.load(Ordering::SeqCst) >= before + 2,
+            "rotation must fsync the wal dir for the new segment and the symlink rename"
+        );
+    }
 
     #[test]
     fn rotate_creates_new_segment() {

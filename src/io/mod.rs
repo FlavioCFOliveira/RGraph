@@ -36,6 +36,33 @@ pub trait FileSystem: Send + Sync {
 
     /// Create a directory (and any parent directories).
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+
+    /// `fsync` the directory `dir` so that newly created or renamed entries
+    /// inside it become durable.
+    ///
+    /// POSIX guarantees the *contents* of a file are durable after
+    /// `fsync(file)`, but the *directory entry* (created by `creat`/`rename`/
+    /// `link`) is only guaranteed durable after an explicit `fsync` of the
+    /// containing directory.  Without this, a freshly created WAL segment — or
+    /// the atomically-renamed `wal-current` symlink — can vanish on power loss
+    /// even though its data was fsynced, losing committed records.  See
+    /// reliability-audit finding H8 (2026-06-04).
+    ///
+    /// The default implementation opens the directory read-only and `fsync`s
+    /// it, which is the correct behaviour on Unix.  On non-Unix targets it is a
+    /// no-op (directory fds cannot be fsynced portably).
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let handle = std::fs::File::open(dir)?;
+            handle.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            Ok(())
+        }
+    }
 }
 
 /// A handle to an open file.
