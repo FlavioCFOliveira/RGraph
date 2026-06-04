@@ -77,11 +77,10 @@ impl Graph {
         let (mut record, properties) = builder.into_parts();
         let id = self.engine.id_allocator.allocate();
         record.node_id = id;
-        let slot = self.engine.put_node(&record, fs)?;
-
-        // Persist properties as a linked chain attached to the node.
-        self.attach_properties_to_node(id, slot, properties, fs)?;
-
+        // Atomic no-steal/no-force create: the node and its property chain are
+        // committed as a single transaction (findings C1/C3).
+        let props = build_property_records(properties);
+        let slot = self.engine.create_node_atomic(&record, &props, fs)?;
         Ok((slot, id))
     }
 
@@ -132,58 +131,6 @@ impl Graph {
     // ------------------------------------------------------------------
     // Property persistence helpers
     // ------------------------------------------------------------------
-
-    /// Persist a property map as a linked `PropertyRecord` chain and attach
-    /// the chain to a node.
-    ///
-    /// Properties are stored in **reverse sorted order** so that each record
-    /// can set its `next_property` pointer to the slot of the already-stored
-    /// successor, building a complete chain without in-place updates.
-    fn attach_properties_to_node(
-        &mut self,
-        node_id: u64,
-        _node_slot: SlotRef,
-        properties: HashMap<String, Property>,
-        fs: &dyn FileSystem,
-    ) -> Result<(), StorageError> {
-        if properties.is_empty() {
-            return Ok(());
-        }
-
-        // Sort by key and iterate in reverse so each record can point to the
-        // already-written successor.
-        let mut entries: Vec<(String, Property)> = properties.into_iter().collect();
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        let mut next_slot = SlotRef::NULL; // pointer to the next record in chain
-
-        for (key, value) in entries.into_iter().rev() {
-            let (vtype, payload) = value
-                .to_value_type_payload()
-                .unwrap_or((ValueType::Null, Vec::new()));
-            let mut prop = PropertyRecord::inline(&key, 0, vtype, payload.clone());
-            // Point this record to the previously stored (successor) record.
-            prop.next_property = next_slot;
-
-            let prop_slot = self.engine.put_property(&prop, fs)?;
-            next_slot = prop_slot;
-
-            // Insert into the property secondary index.
-            let _ = self.engine.insert_property_index(
-                node_id as u128,
-                0, // key_id — using 0 as placeholder until a name registry is added
-                vtype,
-                &payload,
-                prop_slot,
-            );
-        }
-
-        // `next_slot` now points to the head of the chain (first property alphabetically).
-        self.engine
-            .attach_property_to_node(node_id, next_slot, fs)?;
-
-        Ok(())
-    }
 
     /// Persist a property map as a linked `PropertyRecord` chain and attach
     /// the chain to an edge.
@@ -572,8 +519,9 @@ impl<'a> GraphMut<'a> {
         let (mut record, properties) = builder.into_parts();
         let id = self.engine.id_allocator.allocate();
         record.node_id = id;
-        let slot = self.engine.put_node(&record, fs)?;
-        attach_properties_to_node_engine(self.engine, id, slot, properties, fs)?;
+        // Atomic no-steal/no-force create (findings C1/C3).
+        let props = build_property_records(properties);
+        let slot = self.engine.create_node_atomic(&record, &props, fs)?;
         Ok((slot, id))
     }
 
@@ -643,31 +591,22 @@ impl<'a> GraphMut<'a> {
 // Shared engine-level property helpers (free functions)
 // ------------------------------------------------------------------
 
-fn attach_properties_to_node_engine(
-    engine: &mut GraphStorageEngine,
-    node_id: u64,
-    _slot: SlotRef,
-    properties: HashMap<String, Property>,
-    fs: &dyn FileSystem,
-) -> Result<(), StorageError> {
-    if properties.is_empty() {
-        return Ok(());
-    }
+/// Build a node's `PropertyRecord`s from a property map, sorted by key (chain
+/// order).  Each record's `next_property` is left NULL; the engine assigns slots
+/// and links the chain when it prepares them in
+/// [`GraphStorageEngine::create_node_atomic`].
+fn build_property_records(properties: HashMap<String, Property>) -> Vec<PropertyRecord> {
     let mut entries: Vec<(String, Property)> = properties.into_iter().collect();
     entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let mut next_slot = SlotRef::NULL;
-    for (key, value) in entries.into_iter().rev() {
-        let (vtype, payload) = value
-            .to_value_type_payload()
-            .unwrap_or((ValueType::Null, Vec::new()));
-        let mut prop = PropertyRecord::inline(&key, 0, vtype, payload.clone());
-        prop.next_property = next_slot;
-        let prop_slot = engine.put_property(&prop, fs)?;
-        next_slot = prop_slot;
-        let _ = engine.insert_property_index(node_id as u128, 0, vtype, &payload, prop_slot);
-    }
-    engine.attach_property_to_node(node_id, next_slot, fs)?;
-    Ok(())
+    entries
+        .into_iter()
+        .map(|(key, value)| {
+            let (vtype, payload) = value
+                .to_value_type_payload()
+                .unwrap_or((ValueType::Null, Vec::new()));
+            PropertyRecord::inline(&key, 0, vtype, payload)
+        })
+        .collect()
 }
 
 fn attach_properties_to_edge_engine(

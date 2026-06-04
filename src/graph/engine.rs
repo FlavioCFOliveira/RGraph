@@ -625,6 +625,195 @@ impl GraphStorageEngine {
         Ok((sref, page_id, page.buf))
     }
 
+    /// Like [`Self::prepare_record`] but accumulates the resulting page image in
+    /// a transaction-local `pending` map, so that several records prepared in
+    /// the same (uncommitted) transaction can share a page without each one
+    /// re-reading the page's stale on-disk image.  Under no-steal the prepared
+    /// images are written only after the commit record is durable.
+    fn prepare_into_pending(
+        page_manager: &mut PageManager,
+        pending: &mut std::collections::HashMap<PageId, AlignedBuffer>,
+        record: &[u8],
+        page_list: &mut Vec<PageId>,
+        page_type: PageType,
+        fs: &dyn FileSystem,
+    ) -> Result<SlotRef, StorageError> {
+        // Try existing pages (most recent first), preferring the in-flight image.
+        for &page_id in page_list.iter().rev() {
+            let image = match pending.get(&page_id) {
+                Some(buf) => buf.clone(),
+                None => {
+                    let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+                    page_manager.read_page(fs, page_id, &mut buf)?;
+                    buf
+                }
+            };
+            let mut page = SlottedPage::new(image);
+            if let Some(slot) = page.insert(record) {
+                page.update_checksum();
+                let sref = slot_ref(page_id, slot)?;
+                pending.insert(page_id, page.buf);
+                return Ok(sref);
+            }
+        }
+        // Allocate a new page.
+        let page_id = page_manager.allocate_page();
+        let mut page = SlottedPage::init(page_id, page_type);
+        let slot = page.insert(record).ok_or(StorageError::PageFull)?;
+        page.update_checksum();
+        page_list.push(page_id);
+        let sref = slot_ref(page_id, slot)?;
+        pending.insert(page_id, page.buf);
+        Ok(sref)
+    }
+
+    /// Atomically create a node together with its property chain in a single
+    /// no-steal/no-force transaction (findings C1/C3).
+    ///
+    /// All page images (the node page and the property pages) are built in
+    /// memory, their physical `PageInsert` redo records are logged, the
+    /// transaction commits (flushing the WAL), and only THEN are the pages
+    /// written.  A crash before commit leaves nothing on the heap (no steal); a
+    /// committed create is fully reconstructable by REDO (no force).  This makes
+    /// `CREATE (n {props...})` atomic, unlike the previous put_node-then-attach
+    /// sequence which committed the node first and wrote the properties as a
+    /// separate, uncommitted step.
+    ///
+    /// `properties` are the node's `PropertyRecord`s in chain order
+    /// (alphabetical); the engine assigns their slots and links each record's
+    /// `next_property` to its successor.
+    pub fn create_node_atomic(
+        &mut self,
+        node: &NodeRecord,
+        properties: &[PropertyRecord],
+        fs: &dyn FileSystem,
+    ) -> Result<SlotRef, StorageError> {
+        if node.node_id == 0 {
+            return Err(StorageError::InvalidId);
+        }
+        let key = node_id_key(node.node_id as u128);
+        if self.node_index.search(&key).is_some() {
+            return Err(StorageError::AlreadyExists);
+        }
+
+        let resource_id = node_resource_id(node.node_id);
+        let txn_mgr = Arc::clone(&self.txn_manager);
+        let mut tx = txn_mgr.begin();
+        if let Err(e) = txn_mgr.acquire_lock(&mut tx, resource_id, LockMode::Exclusive) {
+            let _ = txn_mgr.rollback(&mut tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
+        let txid = tx.txid;
+
+        // ── Phase 1: build all page images in memory (no steal) ──────────────
+        let mut pending: std::collections::HashMap<PageId, AlignedBuffer> =
+            std::collections::HashMap::new();
+
+        // Properties are linked in reverse so each points to its successor; the
+        // node's first_property becomes the head of the resulting chain.
+        let mut next_slot = SlotRef::NULL;
+        // (value_type, payload, slot) for the derived property index, applied
+        // only after the durable commit.
+        let mut prop_index: Vec<(ValueType, Vec<u8>, SlotRef)> = Vec::new();
+        for prop in properties.iter().rev() {
+            let mut p = prop.clone();
+            p.next_property = next_slot;
+            let bytes = p.encode();
+            let slot = match Self::prepare_into_pending(
+                &mut self.page_manager,
+                &mut pending,
+                &bytes,
+                &mut self.property_pages,
+                PageType::SlottedData,
+                fs,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = txn_mgr.rollback(&mut tx, &mut self.wal_writer, &*self.wal_fs);
+                    return Err(e);
+                }
+            };
+            next_slot = slot;
+            if let Some(vt) = ValueType::from_u8(p.header.value_type) {
+                prop_index.push((vt, p.payload.clone(), slot));
+            }
+        }
+
+        let mut node_rec = *node;
+        node_rec.first_property = next_slot;
+        let mut node_buf = [0u8; NodeRecord::SIZE];
+        node_rec.encode(&mut node_buf);
+        let node_slot = match Self::prepare_into_pending(
+            &mut self.page_manager,
+            &mut pending,
+            &node_buf,
+            &mut self.node_pages,
+            PageType::SlottedData,
+            fs,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = txn_mgr.rollback(&mut tx, &mut self.wal_writer, &*self.wal_fs);
+                return Err(e);
+            }
+        };
+
+        // ── Phase 2: log a physical PageInsert per page (page-id order) ──────
+        let mut page_ids: Vec<PageId> = pending.keys().copied().collect();
+        page_ids.sort_unstable();
+        let mut lsns: std::collections::HashMap<PageId, u64> = std::collections::HashMap::new();
+        for &page_id in &page_ids {
+            let mut payload = Vec::with_capacity(8 + PAGE_SIZE);
+            payload.extend_from_slice(&page_id.to_be_bytes());
+            payload.extend_from_slice(pending[&page_id].as_ref());
+            let lsn = match Self::log(
+                &mut self.page_manager,
+                &mut self.wal_writer,
+                fs,
+                RecordType::PageInsert,
+                txid,
+                payload,
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = txn_mgr.rollback(&mut tx, &mut self.wal_writer, &*self.wal_fs);
+                    return Err(e);
+                }
+            };
+            lsns.insert(page_id, lsn);
+        }
+
+        // ── Phase 3: commit (append Commit, flush WAL) ───────────────────────
+        let wal_fs = Arc::clone(&self.wal_fs);
+        txn_mgr
+            .commit(&mut tx, &mut self.wal_writer, wal_fs.as_ref())
+            .map_err(StorageError::from)?;
+
+        // ── Phase 4: commit is durable — write all pages (stamping page_lsn =
+        //    each redo record's LSN), then update derived in-memory state ─────
+        for page_id in page_ids {
+            let mut image = pending.remove(&page_id).expect("pending image present");
+            let lsn = lsns[&page_id];
+            image.as_mut()[0..8].copy_from_slice(&lsn.to_be_bytes());
+            self.page_manager.write_page(fs, page_id, &mut image)?;
+        }
+
+        // RAM secondary indexes (derived; rebuilt from the heap on open).
+        let value = node_slot.raw.to_be_bytes().to_vec();
+        self.node_index
+            .insert(&key, &value)
+            .map_err(StorageError::from)?;
+        let label_key = label_index_key(node.label_id as u64, node.node_id as u128);
+        self.label_index
+            .insert(&label_key, &value)
+            .map_err(StorageError::from)?;
+        for (vt, payload, slot) in prop_index {
+            let _ = self.insert_property_index(node.node_id as u128, 0, vt, &payload, slot);
+        }
+
+        Ok(node_slot)
+    }
+
     /// Read a raw record from a [`SlotRef`].
     fn read_record(
         page_manager: &PageManager,

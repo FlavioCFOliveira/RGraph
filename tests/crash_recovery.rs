@@ -21,6 +21,7 @@
 
 use rgraph::config::GraphMode;
 use rgraph::db::database::Database;
+use rgraph::graph::Property;
 use rgraph::graph::builder::NodeBuilder;
 use rgraph::io::posix::PosixFileSystem;
 use rgraph::io::{
@@ -321,4 +322,53 @@ fn committed_writes_survive_crash() {
             "node {id} label must be intact after REDO"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Atomic create: a CREATE (n {props}) commits the node and its whole
+//    property chain as ONE no-steal transaction and survives a reopen intact.
+// ---------------------------------------------------------------------------
+
+/// Create a node WITH multiple properties, sync, drop, and reopen.  Under the
+/// no-steal/no-force policy (findings C1/C3) the node page and all property
+/// pages commit as a single transaction, so every property must survive the
+/// restart — there is no window where the node exists without its properties.
+#[test]
+fn create_node_with_properties_survives_crash_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("db");
+    let fs = fault_fs();
+
+    let id = {
+        let mut db = Database::init(&db_path, &fs, GraphMode::Lpg).unwrap();
+        let (_s, id) = db
+            .create_node(
+                NodeBuilder::new()
+                    .label(3)
+                    .property("name", "alice")
+                    .property("age", 30i64),
+                &fs,
+            )
+            .unwrap();
+        db.sync(&fs).unwrap();
+        drop(db);
+        id
+    };
+
+    let db = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap();
+    let node = db
+        .get_node(id, &fs)
+        .unwrap()
+        .expect("node must survive restart");
+    assert_eq!(node.label_id, 3);
+    assert_eq!(
+        node.properties.len(),
+        2,
+        "both properties must survive the restart atomically with the node"
+    );
+    assert_eq!(
+        node.properties.get("name"),
+        Some(&Property::String("alice".to_string()))
+    );
+    assert_eq!(node.properties.get("age"), Some(&Property::Integer(30)));
 }
