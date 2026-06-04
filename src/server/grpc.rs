@@ -187,6 +187,12 @@ impl proto::cypher_query_server::CypherQuery for CypherQueryService {
         let latency = start.elapsed();
         self.metrics.observe_query_latency(latency);
 
+        // Refresh buffer-pool cache metrics from the engine's live counters so
+        // dashboards reflect the I/O this query performed.
+        if let Some((hits, misses)) = self.engine.cache_stats().await {
+            self.metrics.record_cache_stats(hits, misses);
+        }
+
         match result {
             Ok(cypher_result) => {
                 let result_set = result_to_proto(cypher_result);
@@ -712,6 +718,53 @@ mod tests {
             .block_on(svc.commit(Request::new(CommitRequest { tx_id: 999_999 })))
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    // ------------------------------------------------------------------
+    // Observability metric tests (Task 178)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn query_error_increments_failure_metric() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rgraph.db");
+        let engine: Arc<dyn AsyncGraphEngine> =
+            Arc::new(GraphEngineAdapter::init(db).expect("init engine"));
+        let metrics = MetricsCollector::new();
+        let svc = CypherQueryService::new(engine, metrics.clone());
+
+        // Drive a syntactically invalid query.
+        let _ = run_query(&svc, "RETURN ((((");
+
+        assert!(
+            metrics.queries_failed.get() as u64 >= 1,
+            "a failed query must increment rgraph_queries_failed_total"
+        );
+    }
+
+    #[test]
+    fn transaction_rpcs_increment_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rgraph.db");
+        let engine: Arc<dyn AsyncGraphEngine> =
+            Arc::new(GraphEngineAdapter::init(db).expect("init engine"));
+        let metrics = MetricsCollector::new();
+        let svc = TransactionService::new(engine, metrics.clone());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let begin = rt
+            .block_on(svc.begin(Request::new(BeginRequest { read_only: false })))
+            .unwrap()
+            .into_inner();
+        let txid = match begin.result {
+            Some(proto::begin_response::Result::TxId(id)) => id,
+            other => panic!("expected tx id, got {other:?}"),
+        };
+        rt.block_on(svc.commit(Request::new(CommitRequest { tx_id: txid })))
+            .unwrap();
+
+        assert_eq!(metrics.transactions_total.get() as u64, 1);
+        assert_eq!(metrics.transactions_committed.get() as u64, 1);
     }
 
     // ------------------------------------------------------------------

@@ -197,6 +197,13 @@ pub trait AsyncGraphEngine: Send + Sync {
     /// Returns [`RGraphError::NotFound`] if `tx_id` is unknown.
     async fn rollback_txn(&self, tx_id: u64) -> Result<(), RGraphError>;
 
+    /// Return the cumulative buffer-pool `(hits, misses)` counts, if a buffer
+    /// pool is attached.
+    ///
+    /// Returns `None` for backends without a buffer pool (e.g. single-segment
+    /// mode), allowing the caller to skip cache-metric updates.
+    async fn cache_stats(&self) -> Option<(u64, u64)>;
+
     /// Flush all durable state to disk.
     async fn sync(&self) -> Result<(), RGraphError>;
 }
@@ -714,6 +721,22 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         })
         .await
         .map_err(|e| RGraphError::Internal(e.to_string()))?
+    }
+
+    async fn cache_stats(&self) -> Option<(u64, u64)> {
+        use std::sync::atomic::Ordering;
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.blocking_read();
+            guard.engine().page_manager.buffer_pool().map(|pool| {
+                (
+                    pool.hits.load(Ordering::Relaxed),
+                    pool.misses.load(Ordering::Relaxed),
+                )
+            })
+        })
+        .await
+        .unwrap_or(None)
     }
 
     async fn sync(&self) -> Result<(), RGraphError> {

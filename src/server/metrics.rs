@@ -368,4 +368,71 @@ mod tests {
         h.set_ready(false).await;
         assert!(!h.is_ready().await);
     }
+
+    #[test]
+    fn per_server_registries_are_isolated() {
+        // Two collectors must not share state, and constructing many of them
+        // must not fail with "already registered" (the global-registry bug).
+        let a = MetricsCollector::new();
+        let b = MetricsCollector::new();
+
+        a.observe_transaction_committed();
+        a.observe_transaction_committed();
+
+        assert_eq!(a.transactions_committed.get() as u64, 2);
+        assert_eq!(
+            b.transactions_committed.get() as u64,
+            0,
+            "the second collector must be independent of the first"
+        );
+    }
+
+    #[test]
+    fn connection_metrics_track_open_and_close() {
+        let m = MetricsCollector::new();
+        m.observe_connection_opened();
+        m.observe_connection_opened();
+        m.observe_connection_closed();
+
+        assert_eq!(m.connections_opened.get() as u64, 2);
+        assert_eq!(m.connections_closed.get() as u64, 1);
+        assert_eq!(m.active_connections.get() as i64, 1);
+    }
+
+    #[test]
+    fn transaction_metrics_track_lifecycle() {
+        let m = MetricsCollector::new();
+        m.observe_transaction_begun();
+        m.observe_transaction_committed();
+        m.observe_transaction_aborted();
+
+        assert_eq!(m.transactions_total.get() as u64, 1);
+        assert_eq!(m.transactions_committed.get() as u64, 1);
+        assert_eq!(m.transactions_aborted.get() as u64, 1);
+    }
+
+    #[test]
+    fn cache_stats_update_counters_and_rate() {
+        let m = MetricsCollector::new();
+        m.record_cache_stats(75, 25);
+        assert_eq!(m.cache_hits.get() as u64, 75);
+        assert_eq!(m.cache_misses.get() as u64, 25);
+        assert!((m.cache_hit_rate.get() - 0.75).abs() < 1e-9);
+
+        // A later, larger cumulative reading advances by the delta only.
+        m.record_cache_stats(100, 25);
+        assert_eq!(m.cache_hits.get() as u64, 100);
+        assert_eq!(m.cache_misses.get() as u64, 25);
+    }
+
+    #[test]
+    fn render_prometheus_exposes_per_server_metrics() {
+        let m = MetricsCollector::new();
+        m.observe_query_failed();
+        let text = m.render_prometheus().expect("render ok");
+        assert!(
+            text.contains("rgraph_queries_failed_total"),
+            "per-server registry must expose the failure counter"
+        );
+    }
 }
