@@ -736,11 +736,11 @@ fn apply_after_image(
 /// # Before-image extraction (Task 149)
 ///
 /// The WAL payload may carry a before-image appended after the after-image
-/// content, preceded by a 4-byte magic sentinel `BIMG` (`0x42494D47`) and a
-/// 4-byte length field:
+/// content, framed by a trailing CRC, length and magic sentinel `BIMG`
+/// (`0x42494D47`) so the section can be located and validated unambiguously:
 ///
 /// ```text
-/// [original payload][0x42494D47 magic][4 bytes before_image_len][before_image bytes]
+/// [original payload][before_image bytes][crc32c(image) 4][before_image_len 4][0x42494D47 magic 4]
 /// ```
 ///
 /// When a before-image is present it is written to `page_id` to restore the
@@ -794,7 +794,7 @@ fn apply_inverse(
 /// A WAL record payload that carries a before-image has the following structure:
 ///
 /// ```text
-/// [original after-image content][BEFORE_IMAGE_MAGIC 4 bytes][before_image_len 4 bytes][before_image bytes]
+/// [original after-image content][before_image bytes][crc32c 4 bytes][before_image_len 4 bytes][BEFORE_IMAGE_MAGIC 4 bytes]
 /// ```
 const BEFORE_IMAGE_MAGIC: u32 = 0x42494D47; // "BIMG"
 
@@ -809,42 +809,49 @@ const BEFORE_IMAGE_MAGIC: u32 = 0x42494D47; // "BIMG"
 /// * `before_image` — the raw page bytes before the mutation.
 pub fn embed_before_image(payload: &mut Vec<u8>, before_image: &[u8]) {
     let trimmed_len = before_image.len().min(PAGE_SIZE);
-    payload.extend_from_slice(&BEFORE_IMAGE_MAGIC.to_be_bytes());
+    let image = &before_image[..trimmed_len];
+    // Trailer: [image][crc32c(image) u32][image_len u32][MAGIC u32].
+    // The magic occupies the FINAL 4 bytes so extraction is deterministic (no
+    // backward scan), and the explicit length + CRC make a coincidental match of
+    // arbitrary page-image bytes effectively impossible (finding M25).
+    payload.extend_from_slice(image);
+    payload.extend_from_slice(&crc32c::crc32c(image).to_be_bytes());
     payload.extend_from_slice(&(trimmed_len as u32).to_be_bytes());
-    payload.extend_from_slice(&before_image[..trimmed_len]);
+    payload.extend_from_slice(&BEFORE_IMAGE_MAGIC.to_be_bytes());
 }
 
 /// Extract the before-image from a WAL payload if the sentinel is present.
 ///
 /// Returns `None` if no before-image was embedded.
 fn extract_before_image(payload: &[u8]) -> Option<&[u8]> {
-    // The before-image section begins 8 bytes before the end of the payload:
-    // 4 bytes magic + 4 bytes length.  Scan backward to find the sentinel.
-    // We accept the sentinel only when the claimed length is consistent with
-    // the remaining bytes.
-    if payload.len() < 8 {
+    // Trailer layout written by `embed_before_image`:
+    //   [before_image bytes][crc32c(image) u32][image_len u32][MAGIC u32]
+    // The magic is the final 4 bytes, so extraction is deterministic (no
+    // backward scan) and is validated by an explicit length and CRC.  This makes
+    // a coincidental match of arbitrary page-image bytes — e.g. a `PageUpdate`
+    // after-image that happens to contain the magic — effectively impossible
+    // (finding M25): a false positive would require the final 4 bytes to equal
+    // the magic AND the preceding length to be self-consistent AND the CRC over
+    // the implied image to match.
+    let n = payload.len();
+    if n < 12 {
         return None;
     }
-    // Walk backward searching for the BEFORE_IMAGE_MAGIC sentinel.
-    // The sentinel must appear at position `payload.len() - 8 - before_image_len`.
-    // We check all positions where the magic could legitimately sit.
-    let magic_bytes = BEFORE_IMAGE_MAGIC.to_be_bytes();
-    // The structure is: [...payload...][magic 4][len 4][image N]
-    // So the magic sits at offset (payload.len() - 8 - N) for N >= 0.
-    // We know N <= PAGE_SIZE, so we search within that range.
-    let search_limit = payload.len().saturating_sub(8);
-    let search_start = search_limit.saturating_sub(PAGE_SIZE);
-    for pos in (search_start..=search_limit).rev() {
-        if payload[pos..pos + 4] == magic_bytes {
-            let len_bytes: [u8; 4] = payload[pos + 4..pos + 8].try_into().ok()?;
-            let image_len = u32::from_be_bytes(len_bytes) as usize;
-            if pos + 8 + image_len == payload.len() {
-                // Consistent: the image fills exactly the tail.
-                return Some(&payload[pos + 8..]);
-            }
-        }
+    let magic = u32::from_be_bytes(payload[n - 4..n].try_into().ok()?);
+    if magic != BEFORE_IMAGE_MAGIC {
+        return None;
     }
-    None
+    let image_len = u32::from_be_bytes(payload[n - 8..n - 4].try_into().ok()?) as usize;
+    // 12 = crc(4) + len(4) + magic(4); the image must fit before the trailer.
+    if image_len > PAGE_SIZE || image_len + 12 > n {
+        return None;
+    }
+    let crc_stored = u32::from_be_bytes(payload[n - 12..n - 8].try_into().ok()?);
+    let image = &payload[n - 12 - image_len..n - 12];
+    if crc32c::crc32c(image) != crc_stored {
+        return None;
+    }
+    Some(image)
 }
 
 /// Build the payload for a CLR record.
@@ -1195,6 +1202,55 @@ mod tests {
             buf.iter().all(|&b| b == 0),
             "page must be zeroed after insert undo"
         );
+    }
+
+    #[test]
+    fn before_image_roundtrips_arbitrary_images() {
+        for &len in &[0usize, 1, 7, 100, 4095, PAGE_SIZE] {
+            let image: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+                .collect();
+            let mut payload = b"after-image-prefix-bytes".to_vec();
+            embed_before_image(&mut payload, &image);
+            let got = extract_before_image(&payload).expect("before-image must round-trip");
+            assert_eq!(got, &image[..], "round-trip failed for len {len}");
+        }
+    }
+
+    #[test]
+    fn before_image_extract_rejects_coincidental_magic() {
+        // Regression gate for finding M25 (2026-06-04): a payload that was never
+        // framed by `embed_before_image` must never be mistaken for a
+        // before-image, even when its bytes contain — or end in — the BIMG magic.
+
+        // (a) A full page of the magic byte pattern: contains the magic many
+        //     times but is not a valid frame.
+        let mut page = vec![0u8; PAGE_SIZE];
+        for chunk in page.chunks_mut(4) {
+            if chunk.len() == 4 {
+                chunk.copy_from_slice(&BEFORE_IMAGE_MAGIC.to_be_bytes());
+            }
+        }
+        assert!(extract_before_image(&page).is_none());
+
+        // (b) A payload ending exactly in the magic but with no valid len/crc.
+        let mut p = vec![0xABu8; 64];
+        p.extend_from_slice(&BEFORE_IMAGE_MAGIC.to_be_bytes());
+        assert!(extract_before_image(&p).is_none());
+
+        // (c) A payload ending in [bogus crc][len=32][magic] — magic and a
+        //     self-consistent length, but the CRC does not match the bytes.
+        let mut q = vec![0xCDu8; 100];
+        q.extend_from_slice(&0u32.to_be_bytes()); // wrong crc
+        q.extend_from_slice(&32u32.to_be_bytes()); // len = 32
+        q.extend_from_slice(&BEFORE_IMAGE_MAGIC.to_be_bytes());
+        assert!(extract_before_image(&q).is_none());
+
+        // (d) A genuine PageUpdate-style payload (page_id + full page image) with
+        //     no embedded before-image must extract to None.
+        let mut upd = 5u64.to_be_bytes().to_vec();
+        upd.extend_from_slice(&vec![0x42u8; PAGE_SIZE]); // page image, no frame
+        assert!(extract_before_image(&upd).is_none());
     }
 
     #[test]
