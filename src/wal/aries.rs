@@ -422,7 +422,9 @@ impl<'a> AriesRecovery<'a> {
                 | RecordType::EdgeDelete
                 | RecordType::EdgeUpdate
                 | RecordType::PropertyInsert
-                | RecordType::PropertyUpdate => {
+                | RecordType::PropertyUpdate
+                | RecordType::RdfTripleInsert
+                | RecordType::RdfTripleDelete => {
                     // Update ATT last_lsn for this txid.
                     if let Some(entry) = att.get_mut(&rec.txid)
                         && lsn > entry.last_lsn

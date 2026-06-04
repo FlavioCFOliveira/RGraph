@@ -283,6 +283,13 @@ pub struct GraphStorageEngine {
     /// Optional frozen CSR adjacency snapshot for fast read-only traversals
     /// (Task 58).  Published by [`GraphStorageEngine::freeze_adjacency`].
     pub csr: CsrHolder,
+    /// Persistent RDF triple/quad store (Task 180).
+    ///
+    /// Holds the term dictionary and SPO/POS/OSP permutation index, projected
+    /// over RDF primary records that live on their own slotted data pages.
+    /// Empty and idle in `GraphMode::Lpg`; populated by `add_triple`/`add_quad`
+    /// in `GraphMode::Rdf`.  Rebuilt from the data pages on `open`.
+    pub rdf_store: crate::rdf::RdfTripleStore,
 }
 
 impl GraphStorageEngine {
@@ -326,6 +333,7 @@ impl GraphStorageEngine {
             node_free_list: StdMutex::new(Vec::new()),
             edge_free_list: StdMutex::new(Vec::new()),
             csr: CsrHolder::new(),
+            rdf_store: crate::rdf::RdfTripleStore::new(),
         })
     }
 
@@ -413,11 +421,20 @@ impl GraphStorageEngine {
             node_free_list: StdMutex::new(Vec::new()),
             edge_free_list: StdMutex::new(Vec::new()),
             csr: CsrHolder::new(),
+            rdf_store: crate::rdf::RdfTripleStore::new(),
         };
 
         // Rebuild secondary indexes from primary data pages.  This also
         // seeds the id_allocator with the highest id seen on disk.
         let _ = engine.rebuild_indexes(fs);
+
+        // Rebuild the RDF term dictionary and permutation index from the RDF
+        // primary records on the data pages.  No-op in LPG databases (no RDF
+        // records are present), so it is safe to run unconditionally.
+        let allocated = engine.page_manager.allocated_pages();
+        engine
+            .rdf_store
+            .rebuild(&engine.page_manager, &allocated, fs);
 
         Ok(engine)
     }
@@ -968,6 +985,88 @@ impl GraphStorageEngine {
     /// Return a shared reference to the schema catalog.
     pub fn catalog(&self) -> Arc<RwLock<Catalog>> {
         Arc::clone(&self.catalog)
+    }
+
+    // ------------------------------------------------------------------
+    // RDF triple/quad API (Task 180)
+    // ------------------------------------------------------------------
+
+    /// Insert an RDF triple into the default graph, persisting it durably.
+    ///
+    /// Interns the subject/predicate/object terms, writes the triple record
+    /// to an RDF data page, WAL-logs the mutation, and updates the in-memory
+    /// permutation index.  Returns `true` if the triple was newly added or
+    /// `false` if it already existed (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on page or WAL I/O failure.
+    pub fn add_triple(
+        &mut self,
+        triple: &crate::rdf::Triple,
+        fs: &dyn FileSystem,
+    ) -> Result<bool, StorageError> {
+        self.rdf_store
+            .insert_triple(&mut self.page_manager, &mut self.wal_writer, triple, fs)
+            .map_err(|_| StorageError::IndexError)
+    }
+
+    /// Insert an RDF quad (triple plus optional named graph).  See
+    /// [`add_triple`](GraphStorageEngine::add_triple).
+    pub fn add_quad(
+        &mut self,
+        quad: &crate::rdf::Quad,
+        fs: &dyn FileSystem,
+    ) -> Result<bool, StorageError> {
+        self.rdf_store
+            .insert_quad(&mut self.page_manager, &mut self.wal_writer, quad, fs)
+            .map_err(|_| StorageError::IndexError)
+    }
+
+    /// Delete an RDF triple from the default graph.  Returns `true` if it
+    /// existed and was removed.
+    pub fn delete_triple(
+        &mut self,
+        triple: &crate::rdf::Triple,
+        fs: &dyn FileSystem,
+    ) -> Result<bool, StorageError> {
+        self.rdf_store
+            .delete_triple(&mut self.page_manager, &mut self.wal_writer, triple, fs)
+            .map_err(|_| StorageError::IndexError)
+    }
+
+    /// Match a triple pattern across all graphs.  Any position may be `None`
+    /// (a wildcard).  Returns the matching term-valued triples.
+    pub fn match_triples(
+        &self,
+        subject: Option<&crate::rdf::Term>,
+        predicate: Option<&crate::rdf::Term>,
+        object: Option<&crate::rdf::Term>,
+    ) -> Vec<crate::rdf::Triple> {
+        self.rdf_store.match_triples(subject, predicate, object)
+    }
+
+    /// Match a quad pattern.  Any of subject/predicate/object/graph may be
+    /// `None` (a wildcard).  Returns the matching term-valued quads.
+    pub fn match_quads(
+        &self,
+        subject: Option<&crate::rdf::Term>,
+        predicate: Option<&crate::rdf::Term>,
+        object: Option<&crate::rdf::Term>,
+        graph: Option<&crate::rdf::Term>,
+    ) -> Vec<crate::rdf::Quad> {
+        self.rdf_store
+            .match_pattern(subject, predicate, object, graph)
+    }
+
+    /// Return every stored RDF quad.
+    pub fn all_quads(&self) -> Vec<crate::rdf::Quad> {
+        self.rdf_store.all_quads()
+    }
+
+    /// Number of distinct RDF triples currently stored.
+    pub fn rdf_triple_count(&self) -> usize {
+        self.rdf_store.triple_count()
     }
 
     /// Resolve a label name to its catalog id, creating an entry if absent.
@@ -2627,5 +2726,207 @@ mod tests {
             !engine.csr.is_frozen(),
             "CSR should not be frozen after thaw_adjacency()"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // RDF data model (Task 180)
+    // ------------------------------------------------------------------
+
+    use crate::rdf::{Quad, RdfLiteral, Term, Triple, xsd};
+
+    fn t_alice() -> Term {
+        Term::iri("http://example.org/alice")
+    }
+    fn t_bob() -> Term {
+        Term::iri("http://example.org/bob")
+    }
+    fn p_knows() -> Term {
+        Term::iri("http://xmlns.com/foaf/0.1/knows")
+    }
+    fn p_name() -> Term {
+        Term::iri("http://xmlns.com/foaf/0.1/name")
+    }
+
+    #[test]
+    fn rdf_insert_and_match_exact_spo() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+        let triple = Triple::new(t_alice(), p_knows(), t_bob());
+        assert!(engine.add_triple(&triple, &fs).unwrap(), "newly added");
+        // Idempotent re-insert.
+        assert!(!engine.add_triple(&triple, &fs).unwrap(), "already present");
+        assert_eq!(engine.rdf_triple_count(), 1);
+
+        let results = engine.match_triples(Some(&t_alice()), Some(&p_knows()), Some(&t_bob()));
+        assert_eq!(results, vec![triple]);
+    }
+
+    #[test]
+    fn rdf_match_all_five_patterns() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+        // (alice knows bob), (alice name "Alice"), (bob knows alice)
+        let t1 = Triple::new(t_alice(), p_knows(), t_bob());
+        let t2 = Triple::new(
+            t_alice(),
+            p_name(),
+            Term::literal(RdfLiteral::string("Alice")),
+        );
+        let t3 = Triple::new(t_bob(), p_knows(), t_alice());
+        for t in [&t1, &t2, &t3] {
+            engine.add_triple(t, &fs).unwrap();
+        }
+
+        // (s, p, o): exact.
+        assert_eq!(
+            engine.match_triples(Some(&t_alice()), Some(&p_knows()), Some(&t_bob())),
+            vec![t1.clone()]
+        );
+        // (s, ?, ?): all of alice's triples.
+        let by_subject = engine.match_triples(Some(&t_alice()), None, None);
+        assert_eq!(by_subject.len(), 2);
+        assert!(by_subject.contains(&t1));
+        assert!(by_subject.contains(&t2));
+        // (?, p, ?): all `knows` triples.
+        let by_pred = engine.match_triples(None, Some(&p_knows()), None);
+        assert_eq!(by_pred.len(), 2);
+        assert!(by_pred.contains(&t1));
+        assert!(by_pred.contains(&t3));
+        // (?, ?, o): everything with object = bob.
+        let by_object = engine.match_triples(None, None, Some(&t_bob()));
+        assert_eq!(by_object, vec![t1.clone()]);
+        // (?, ?, ?): all triples.
+        let all = engine.match_triples(None, None, None);
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn rdf_unknown_term_yields_no_matches() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+        engine
+            .add_triple(&Triple::new(t_alice(), p_knows(), t_bob()), &fs)
+            .unwrap();
+        // A subject never interned must not match anything (and must not panic).
+        let never = Term::iri("http://example.org/nobody");
+        assert!(engine.match_triples(Some(&never), None, None).is_empty());
+    }
+
+    #[test]
+    fn rdf_named_graph_quads() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+        let g = Term::iri("http://example.org/graph1");
+        let triple = Triple::new(t_alice(), p_knows(), t_bob());
+        // Same triple in the default graph and in a named graph are distinct.
+        engine.add_triple(&triple, &fs).unwrap();
+        engine
+            .add_quad(&Quad::in_graph(triple.clone(), g.clone()), &fs)
+            .unwrap();
+        assert_eq!(engine.rdf_triple_count(), 2);
+
+        // Filter by named graph.
+        let in_g = engine.match_quads(None, None, None, Some(&g));
+        assert_eq!(in_g.len(), 1);
+        assert_eq!(in_g[0].graph, Some(g));
+        // Across all graphs.
+        assert_eq!(engine.all_quads().len(), 2);
+    }
+
+    #[test]
+    fn rdf_delete_triple() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+        let triple = Triple::new(t_alice(), p_knows(), t_bob());
+        engine.add_triple(&triple, &fs).unwrap();
+        assert!(engine.delete_triple(&triple, &fs).unwrap());
+        assert_eq!(engine.rdf_triple_count(), 0);
+        assert!(
+            engine
+                .match_triples(Some(&t_alice()), Some(&p_knows()), Some(&t_bob()))
+                .is_empty()
+        );
+        // Deleting again is a no-op (false).
+        assert!(!engine.delete_triple(&triple, &fs).unwrap());
+    }
+
+    #[test]
+    fn rdf_delete_one_graph_keeps_other() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+        let g = Term::iri("http://example.org/graph1");
+        let triple = Triple::new(t_alice(), p_knows(), t_bob());
+        engine.add_triple(&triple, &fs).unwrap();
+        engine
+            .add_quad(&Quad::in_graph(triple.clone(), g.clone()), &fs)
+            .unwrap();
+
+        // Delete the default-graph copy; the named-graph copy must survive.
+        assert!(engine.delete_triple(&triple, &fs).unwrap());
+        assert_eq!(engine.rdf_triple_count(), 1);
+        let surviving = engine.match_quads(None, None, None, Some(&g));
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].graph, Some(g));
+    }
+
+    #[test]
+    fn rdf_typed_literals_distinct_from_strings() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+        let s = t_alice();
+        let p = Term::iri("http://example.org/age");
+        let int_lit = Term::literal(RdfLiteral::typed("30", xsd::INTEGER));
+        let str_lit = Term::literal(RdfLiteral::string("30"));
+        engine
+            .add_triple(&Triple::new(s.clone(), p.clone(), int_lit.clone()), &fs)
+            .unwrap();
+        engine
+            .add_triple(&Triple::new(s.clone(), p.clone(), str_lit.clone()), &fs)
+            .unwrap();
+        // The two literals are distinct terms → two distinct triples.
+        assert_eq!(engine.rdf_triple_count(), 2);
+        let matched = engine.match_triples(Some(&s), Some(&p), Some(&int_lit));
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].object, int_lit);
+    }
+
+    #[test]
+    fn rdf_survives_crash_and_replay() {
+        let (_dir, fs, path) = temp_fs();
+        let g = Term::iri("http://example.org/graph1");
+        let t1 = Triple::new(t_alice(), p_knows(), t_bob());
+        let t2 = Triple::new(
+            t_alice(),
+            p_name(),
+            Term::literal(RdfLiteral::lang("Alice", "en")),
+        );
+        {
+            let mut engine = GraphStorageEngine::init(path.clone(), &fs).unwrap();
+            engine.add_triple(&t1, &fs).unwrap();
+            engine.add_triple(&t2, &fs).unwrap();
+            engine
+                .add_quad(&Quad::in_graph(t1.clone(), g.clone()), &fs)
+                .unwrap();
+            engine.sync(&fs).unwrap();
+        }
+        // Reopen: the dictionary and permutation index are rebuilt from pages.
+        let engine = GraphStorageEngine::open(path, &fs).unwrap();
+        assert_eq!(engine.rdf_triple_count(), 3, "all triples recovered");
+        // Exact match still works after rebuild.
+        assert_eq!(
+            engine.match_triples(Some(&t_alice()), Some(&p_knows()), Some(&t_bob())),
+            vec![t1.clone()]
+        );
+        // The lang literal round-trips exactly.
+        let names = engine.match_triples(Some(&t_alice()), Some(&p_name()), None);
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            names[0].object,
+            Term::literal(RdfLiteral::lang("Alice", "en"))
+        );
+        // Named-graph quad is recovered with its graph intact.
+        let in_g = engine.match_quads(None, None, None, Some(&g));
+        assert_eq!(in_g.len(), 1);
+        assert_eq!(in_g[0].graph, Some(g));
     }
 }

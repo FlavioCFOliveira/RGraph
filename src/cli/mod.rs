@@ -21,6 +21,7 @@
 pub mod benchmark;
 pub mod export;
 pub mod import;
+pub mod turtle;
 
 /// Property key under which a node's textual label is stored on disk.
 pub const LABEL_KEY: &str = "_label";

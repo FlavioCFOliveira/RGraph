@@ -10,6 +10,7 @@ pub mod graph;
 pub mod txn;
 pub mod error;
 pub mod cypher;
+pub mod rdf;
 pub mod cli;
 pub mod tck;
 pub mod acid;

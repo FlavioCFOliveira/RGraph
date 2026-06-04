@@ -466,6 +466,31 @@ impl From<Property> for Value {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// From RDF Term (Task 180)
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl Value {
+    /// Convert an RDF [`Term`](crate::rdf::term::Term) into a Cypher [`Value`].
+    ///
+    /// IRIs and blank nodes become their N-Triples string form; typed literals
+    /// map by datatype to `Integer` / `Float` / `Boolean`, and everything else
+    /// (plain strings, language strings, dates, unknown datatypes) becomes a
+    /// `String` carrying the lexical form.  This reuses the existing Cypher
+    /// type system unchanged, so RDF values participate in equality and
+    /// orderability exactly like the equivalent native values, and **no LPG
+    /// behaviour is altered** — the mapping is additive.
+    pub fn from_rdf_term(term: &crate::rdf::term::Term) -> Self {
+        term.to_cypher_value()
+    }
+}
+
+impl From<&crate::rdf::term::Term> for Value {
+    fn from(term: &crate::rdf::term::Term) -> Self {
+        term.to_cypher_value()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -607,5 +632,31 @@ mod tests {
         let null = Value::Null;
         assert_eq!(a.cypher_compare(&null), Some(Ordering::Less));
         assert_eq!(null.cypher_compare(&a), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn rdf_term_maps_to_value_and_compares_natively() {
+        use crate::rdf::term::{RdfLiteral, Term, xsd};
+        // An xsd:integer literal becomes a Cypher Integer and compares equal to
+        // the equivalent native integer — proving RDF values reuse the existing
+        // type system rather than a parallel one.
+        let int_term = Term::literal(RdfLiteral::typed("7", xsd::INTEGER));
+        let v: Value = (&int_term).into();
+        assert_eq!(v, Value::Integer(7));
+        assert_eq!(
+            v.cypher_eq(&Value::Integer(7)).unwrap(),
+            Value::Boolean(true)
+        );
+        // A plain string literal compares like a native string.
+        let str_term = Term::literal(RdfLiteral::string("hello"));
+        assert_eq!(
+            Value::from_rdf_term(&str_term),
+            Value::String("hello".into())
+        );
+        // An IRI becomes its N-Triples string form.
+        assert_eq!(
+            Value::from_rdf_term(&Term::iri("http://x/a")),
+            Value::String("<http://x/a>".into())
+        );
     }
 }

@@ -63,6 +63,20 @@ pub enum RecordType {
     EdgeUpdate = 0x36,
     /// After-image of a modified property record.
     PropertyUpdate = 0x37,
+    /// A new RDF triple/quad record was inserted (Task 180).
+    ///
+    /// A **logical** entity record: the payload is the term-id triple record
+    /// (`[magic][s][p][o][g]`), not a physical page image.  Like
+    /// [`NodeInsert`](RecordType::NodeInsert), it is skipped by physical REDO;
+    /// the engine rebuilds the RDF dictionary and permutation index from the
+    /// data pages during `open()`, so it needs no physical REDO.
+    RdfTripleInsert = 0x38,
+    /// An RDF triple/quad record was deleted (Task 180).
+    ///
+    /// Logical record with the same payload layout as
+    /// [`RdfTripleInsert`](RecordType::RdfTripleInsert); the on-disk slot is
+    /// tombstoned and the change is rebuilt on open.
+    RdfTripleDelete = 0x39,
     /// Compensation Log Record — written during UNDO, never itself undone.
     ///
     /// Payload layout:
@@ -255,6 +269,8 @@ impl WalRecord {
             0x35 => RecordType::NodeUpdate,
             0x36 => RecordType::EdgeUpdate,
             0x37 => RecordType::PropertyUpdate,
+            0x38 => RecordType::RdfTripleInsert,
+            0x39 => RecordType::RdfTripleDelete,
             0x40 => RecordType::Clr,
             0x50 => RecordType::SegmentDescriptor,
             0x60 => RecordType::CompactionBegin,

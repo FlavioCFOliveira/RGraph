@@ -329,6 +329,71 @@ impl Graph {
         self.engine.sync(fs)
     }
 
+    // ------------------------------------------------------------------
+    // RDF triple/quad API (Task 180) — delegates to the engine's store.
+    // ------------------------------------------------------------------
+
+    /// Insert an RDF triple into the default graph.  Returns `true` if newly
+    /// added.
+    pub fn add_triple(
+        &mut self,
+        triple: &crate::rdf::Triple,
+        fs: &dyn FileSystem,
+    ) -> Result<bool, StorageError> {
+        self.engine.add_triple(triple, fs)
+    }
+
+    /// Insert an RDF quad (triple plus optional named graph).
+    pub fn add_quad(
+        &mut self,
+        quad: &crate::rdf::Quad,
+        fs: &dyn FileSystem,
+    ) -> Result<bool, StorageError> {
+        self.engine.add_quad(quad, fs)
+    }
+
+    /// Delete an RDF triple from the default graph.  Returns `true` if it
+    /// existed.
+    pub fn delete_triple(
+        &mut self,
+        triple: &crate::rdf::Triple,
+        fs: &dyn FileSystem,
+    ) -> Result<bool, StorageError> {
+        self.engine.delete_triple(triple, fs)
+    }
+
+    /// Match a triple pattern across all graphs (each position may be `None`).
+    pub fn match_triples(
+        &self,
+        subject: Option<&crate::rdf::Term>,
+        predicate: Option<&crate::rdf::Term>,
+        object: Option<&crate::rdf::Term>,
+    ) -> Vec<crate::rdf::Triple> {
+        self.engine.match_triples(subject, predicate, object)
+    }
+
+    /// Match a quad pattern (each of subject/predicate/object/graph may be
+    /// `None`).
+    pub fn match_quads(
+        &self,
+        subject: Option<&crate::rdf::Term>,
+        predicate: Option<&crate::rdf::Term>,
+        object: Option<&crate::rdf::Term>,
+        graph: Option<&crate::rdf::Term>,
+    ) -> Vec<crate::rdf::Quad> {
+        self.engine.match_quads(subject, predicate, object, graph)
+    }
+
+    /// Return every stored RDF quad.
+    pub fn all_quads(&self) -> Vec<crate::rdf::Quad> {
+        self.engine.all_quads()
+    }
+
+    /// Number of distinct RDF triples currently stored.
+    pub fn rdf_triple_count(&self) -> usize {
+        self.engine.rdf_triple_count()
+    }
+
     /// Scan all nodes with the given `label_id`.
     pub fn scan_by_label(
         &self,

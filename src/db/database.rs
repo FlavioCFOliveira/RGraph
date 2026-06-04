@@ -160,6 +160,90 @@ impl Database {
     }
 
     // ------------------------------------------------------------------
+    // RDF interface (Task 180)
+    // ------------------------------------------------------------------
+
+    /// Is this database operating in RDF mode?
+    pub fn is_rdf(&self) -> bool {
+        self.graph_mode == GraphMode::Rdf
+    }
+
+    /// Insert an RDF triple into the default graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::IndexError`] if the database is not in
+    /// [`GraphMode::Rdf`], or on a storage failure.  Routing RDF writes only
+    /// in RDF mode keeps [`GraphMode::Lpg`] behaviour byte-for-byte unchanged.
+    pub fn add_triple(
+        &mut self,
+        triple: &crate::rdf::Triple,
+        fs: &dyn FileSystem,
+    ) -> Result<bool, StorageError> {
+        if !self.is_rdf() {
+            return Err(StorageError::IndexError);
+        }
+        self.graph.add_triple(triple, fs)
+    }
+
+    /// Insert an RDF quad (triple plus optional named graph).  Requires RDF
+    /// mode; see [`add_triple`](Database::add_triple).
+    pub fn add_quad(
+        &mut self,
+        quad: &crate::rdf::Quad,
+        fs: &dyn FileSystem,
+    ) -> Result<bool, StorageError> {
+        if !self.is_rdf() {
+            return Err(StorageError::IndexError);
+        }
+        self.graph.add_quad(quad, fs)
+    }
+
+    /// Delete an RDF triple from the default graph.  Requires RDF mode.
+    pub fn delete_triple(
+        &mut self,
+        triple: &crate::rdf::Triple,
+        fs: &dyn FileSystem,
+    ) -> Result<bool, StorageError> {
+        if !self.is_rdf() {
+            return Err(StorageError::IndexError);
+        }
+        self.graph.delete_triple(triple, fs)
+    }
+
+    /// Match a triple pattern across all graphs (each position may be `None`).
+    pub fn match_triples(
+        &self,
+        subject: Option<&crate::rdf::Term>,
+        predicate: Option<&crate::rdf::Term>,
+        object: Option<&crate::rdf::Term>,
+    ) -> Vec<crate::rdf::Triple> {
+        self.graph.match_triples(subject, predicate, object)
+    }
+
+    /// Match a quad pattern (each of subject/predicate/object/graph may be
+    /// `None`).
+    pub fn match_quads(
+        &self,
+        subject: Option<&crate::rdf::Term>,
+        predicate: Option<&crate::rdf::Term>,
+        object: Option<&crate::rdf::Term>,
+        graph: Option<&crate::rdf::Term>,
+    ) -> Vec<crate::rdf::Quad> {
+        self.graph.match_quads(subject, predicate, object, graph)
+    }
+
+    /// Return every stored RDF quad.
+    pub fn all_quads(&self) -> Vec<crate::rdf::Quad> {
+        self.graph.all_quads()
+    }
+
+    /// Number of distinct RDF triples currently stored.
+    pub fn rdf_triple_count(&self) -> usize {
+        self.graph.rdf_triple_count()
+    }
+
+    // ------------------------------------------------------------------
     // Lifecycle
     // ------------------------------------------------------------------
 
