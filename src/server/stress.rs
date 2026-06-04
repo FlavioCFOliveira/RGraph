@@ -369,8 +369,9 @@ mod tests {
             .await
             .unwrap();
         assert!(report.ops_executed > 0);
-        assert_eq!(report.dirty_reads, 0);
-        assert_eq!(report.lost_updates, 0);
+        assert_eq!(report.dirty_reads, 0, "dirty reads detected under concurrent load");
+        assert_eq!(report.lost_updates, 0, "lost updates detected: final balance diverged from 10_000");
+        assert_eq!(report.phantom_reads, 0, "phantom reads detected under concurrent load");
     }
 
     #[test]
