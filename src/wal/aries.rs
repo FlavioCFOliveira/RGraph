@@ -578,21 +578,25 @@ impl<'a> AriesRecovery<'a> {
                     continue;
                 }
 
-                // Only undoable page-mutation records produce inverse ops.
+                // Only **physical** page-mutation records produce inverse ops.
+                //
+                // Logical entity records (NodeInsert/EdgeInsert/PropertyInsert
+                // and their *Update/*Delete variants) encode an *entity id* — not
+                // a page id — in their first 8 payload bytes and carry no
+                // before-image.  Routing them through `apply_inverse` would read
+                // the entity id as a page id and zero-fill the page at
+                // `entity_id * PAGE_SIZE`, corrupting unrelated metadata/data
+                // pages (node_id 1 → mirror superblock, 2 → bitmap, N → data page
+                // N).  They are therefore excluded from physical UNDO — exactly as
+                // they are excluded from the DPT in ANALYSIS and from replay in
+                // REDO — and must be undone logically.  See reliability-audit
+                // finding C2 (2026-06-04).
                 let undoable = matches!(
                     rec.record_type,
                     RecordType::PageInsert
                         | RecordType::PageUpdate
-                        | RecordType::NodeInsert
-                        | RecordType::NodeDelete
-                        | RecordType::NodeUpdate
-                        | RecordType::EdgeInsert
-                        | RecordType::EdgeDelete
-                        | RecordType::EdgeUpdate
-                        | RecordType::PropertyInsert
-                        | RecordType::PropertyUpdate
-                        | RecordType::BitmapUpdate
                         | RecordType::PageFree
+                        | RecordType::BitmapUpdate
                         | RecordType::IndexPageInsert
                         | RecordType::IndexPageUpdate
                         | RecordType::IndexPageFree
@@ -763,13 +767,13 @@ fn apply_inverse(
 
     // No before-image: fall back to tombstone strategy for insert records, and
     // no-op for other record types (the state was already at the after-image).
+    //
+    // Only **physical** insert records reach this point — logical entity inserts
+    // are excluded from physical UNDO in `undo` (finding C2), so reading their
+    // entity id as a page id can never zero an unrelated page here.
     let is_insert = matches!(
         rec.record_type,
-        RecordType::NodeInsert
-            | RecordType::EdgeInsert
-            | RecordType::PropertyInsert
-            | RecordType::PageInsert
-            | RecordType::IndexPageInsert
+        RecordType::PageInsert | RecordType::IndexPageInsert
     );
 
     if is_insert {
@@ -1171,11 +1175,14 @@ mod tests {
             handle.sync_data().unwrap();
         }
 
-        // Build a NodeInsert record for page 3 — no before-image (it's an insert).
+        // Build a *physical* PageInsert record for page 3 — no before-image (it
+        // is an insert).  Physical inserts ARE tombstoned by UNDO; logical
+        // NodeInsert records are NOT physically undone — see
+        // `undo_skips_logical_entity_records`.
         let mut payload = 3u64.to_be_bytes().to_vec();
         payload.extend_from_slice(&[0xAAu8; 16]); // fake after-image content
 
-        let mut insert_rec = WalRecord::new(RecordType::NodeInsert, 42, 0, 0, payload);
+        let mut insert_rec = WalRecord::new(RecordType::PageInsert, 42, 0, 0, payload);
         insert_rec.set_lsn(100);
 
         // Simulate UNDO: apply_inverse should zero-fill the page.
@@ -1187,6 +1194,74 @@ mod tests {
         assert!(
             buf.iter().all(|&b| b == 0),
             "page must be zeroed after insert undo"
+        );
+    }
+
+    #[test]
+    fn undo_skips_logical_entity_records() {
+        // Regression gate for reliability-audit finding C2 (2026-06-04): a loser
+        // transaction whose chain contains a logical `NodeInsert` must NOT be
+        // physically undone.  Physical UNDO would read the `node_id` from the
+        // first 8 payload bytes as a `page_id` and zero-fill the page at
+        // `node_id * PAGE_SIZE` — here node_id 2, i.e. the bitmap page — silently
+        // corrupting committed metadata during recovery.
+        use crate::io::posix::PosixFileSystem;
+        use crate::storage::page::{PageType, SlottedPage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let data_path = dir.path().join("data.db");
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Write a recognizable sentinel page at offset node_id * PAGE_SIZE.
+        let node_id: u64 = 2;
+        {
+            let mut page = SlottedPage::init(node_id, PageType::SlottedData);
+            page.insert(b"do-not-touch").unwrap();
+            page.update_checksum();
+            let handle = fs.open(&data_path, true).unwrap();
+            handle
+                .write_at(&page.buf, node_id * PAGE_SIZE as u64)
+                .unwrap();
+            handle.sync_data().unwrap();
+        }
+        let mut sentinel = AlignedBuffer::zeroed(PAGE_SIZE);
+        {
+            let handle = fs.open(&data_path, false).unwrap();
+            handle
+                .read_at(&mut sentinel, node_id * PAGE_SIZE as u64)
+                .unwrap();
+        }
+
+        // Active loser: Begin(txid=42) -> NodeInsert(txid=42, node_id=2), no Commit.
+        let mut begin = WalRecord::new(RecordType::Begin, 42, 0, 0, Vec::new());
+        begin.set_lsn(10);
+        let mut payload = node_id.to_be_bytes().to_vec(); // first 8 bytes = entity id
+        payload.extend_from_slice(&[0xAAu8; 32]); // fake record bytes (no before-image)
+        let mut insert = WalRecord::new(RecordType::NodeInsert, 42, 0, 10, payload);
+        insert.set_lsn(20);
+
+        let mut wal = WalWriter::open(wal_dir.clone(), &fs).unwrap();
+        let recovery = AriesRecovery::new(&fs, &wal_dir, &data_path, 0);
+        let result = recovery
+            .recover_from_slice(&[begin, insert], &mut wal)
+            .unwrap();
+
+        // The logical NodeInsert must not have been physically undone.
+        assert_eq!(
+            result.undo_count, 0,
+            "logical NodeInsert must not be physically undone"
+        );
+        let handle = fs.open(&data_path, false).unwrap();
+        let mut after = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle
+            .read_at(&mut after, node_id * PAGE_SIZE as u64)
+            .unwrap();
+        assert_eq!(
+            &after[..],
+            &sentinel[..],
+            "page at node_id*PAGE_SIZE must be untouched by UNDO of a logical record"
         );
     }
 
