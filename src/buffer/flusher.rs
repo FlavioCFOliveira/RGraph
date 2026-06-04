@@ -130,6 +130,14 @@ impl Flusher {
             if frame.desc.io_inflight.swap(true, Ordering::Acquire) {
                 continue; // another thread already flushing
             }
+            // Re-check the pin after claiming io_inflight: a writer may have
+            // pinned the frame since `dirty_candidates()` snapshotted it.  A
+            // pinned frame can have a live `PageGuard` writer mutating bytes, so
+            // flushing it would race that writer.  Release the claim and skip.
+            if frame.desc.is_pinned() {
+                frame.desc.io_inflight.store(false, Ordering::Release);
+                continue;
+            }
             pending.push(Pending {
                 fid,
                 page_id,
@@ -145,20 +153,35 @@ impl Flusher {
         pending.sort_by_key(|p| p.page_id);
 
         // Update checksums for all pending frames so the DW copy is consistent.
+        //
+        // Each frame already has `io_inflight = true` (claimed above), and we
+        // take its `io_mutex` for the byte mutation so the update cannot race a
+        // concurrent load.  Writers via `PageGuard` wait on `io_inflight`, so
+        // no `&mut` from the access path overlaps these references.
         for p in &pending {
-            let frame_mut = pool.frame_mut(p.fid);
-            crate::storage::page::SlottedPage::update_checksum_bytes(&mut frame_mut.buf);
+            let frame = pool.frame(p.fid);
+            let _io_guard = frame.io_mutex.lock();
+            // SAFETY: io_inflight is set and io_mutex is held: this is the only
+            // live reference to the buffer (see FrameBuf aliasing discipline).
+            let buf = unsafe { frame.buf.get_mut() };
+            crate::storage::page::SlottedPage::update_checksum_bytes(buf);
         }
 
         // Stage ALL pending pages in one doublewrite batch before any in-place
         // write.  If we crash between the DW sync and the data writes, recovery
         // can restore any partially-written page from the DW copy.
         if let Some(dw) = pool.doublewrite() {
+            // Hold every pending frame's io_mutex for the duration of the
+            // staging read so no concurrent load mutates the bytes.
+            let _io_guards: Vec<_> =
+                pending.iter().map(|p| pool.frame(p.fid).io_mutex.lock()).collect();
             let pages: Vec<(u64, &[u8])> = pending
                 .iter()
                 .map(|p| {
                     let frame = pool.frame(p.fid);
-                    (p.page_id, &frame.buf[..])
+                    // SAFETY: io_inflight set + io_mutex held: shared read only.
+                    let bytes = unsafe { frame.buf.get() };
+                    (p.page_id, &bytes[..])
                 })
                 .collect();
             if let Err(e) = dw.write_batch(&pages, fs) {
@@ -238,12 +261,27 @@ impl Flusher {
         let offset = extent[0].page_id * PAGE_SIZE as u64;
         let handle = fs.open(&pool.data_path, false)?;
 
-        // Build a list of buffer slices for vectored write.
+        // Hold each frame's io_mutex for the whole vectored write so the bytes
+        // cannot be mutated by a concurrent load.  Each frame already has
+        // `io_inflight = true`, so writers via `PageGuard` are blocked too.
+        let _io_guards: Vec<_> =
+            extent.iter().map(|p| pool.frame(p.fid).io_mutex.lock()).collect();
+
+        // First pass: refresh checksums (exclusive byte access under io_mutex).
+        for p in extent {
+            let frame = pool.frame(p.fid);
+            // SAFETY: io_inflight set + io_mutex held: exclusive byte access.
+            let buf = unsafe { frame.buf.get_mut() };
+            SlottedPage::update_checksum_bytes(buf);
+        }
+
+        // Second pass: collect shared slices for the vectored write.
         let mut slices: Vec<&[u8]> = Vec::with_capacity(extent.len());
         for p in extent {
-            let frame_mut = pool.frame_mut(p.fid);
-            SlottedPage::update_checksum_bytes(&mut frame_mut.buf);
-            slices.push(&frame_mut.buf[..]);
+            let frame = pool.frame(p.fid);
+            // SAFETY: io_inflight set + io_mutex held: shared read only.
+            let bytes = unsafe { frame.buf.get() };
+            slices.push(&bytes[..]);
         }
 
         handle.writev_at(&slices, offset)?;

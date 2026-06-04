@@ -1,5 +1,8 @@
 use crate::io::AlignedBuffer;
 use crate::storage::page::PAGE_SIZE;
+use parking_lot::Mutex as ParkingMutex;
+use std::cell::UnsafeCell;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 
 /// Dense index into the frame table.
@@ -96,11 +99,105 @@ impl FrameDescriptor {
     }
 }
 
+/// Interior-mutable wrapper around a frame's page buffer.
+///
+/// # Why `UnsafeCell`
+///
+/// The buffer pool hands out `&Frame` references to many callers
+/// simultaneously (the background flusher, the CLOCK sweeper, the
+/// checkpointer, and `PageGuard` holders).  Yet exactly one of those callers
+/// must be able to *mutate* a given frame's bytes at a time.  `UnsafeCell`
+/// provides that interior mutability without violating Rust's aliasing model,
+/// provided the two access disciplines below are respected.
+///
+/// # Aliasing discipline (the invariant that makes the `unsafe` sound)
+///
+/// A mutable reference to the inner [`AlignedBuffer`] may only be formed when
+/// the caller holds **one** of:
+///
+/// 1. The owning frame's `io_mutex` (the I/O path: load-from-disk and
+///    write-back-to-disk).  `io_inflight` is also set so the CLOCK sweeper
+///    and other flushers skip the frame, and the `LOADING_SENTINEL` keeps the
+///    miss path from publishing the frame before its first load completes.
+/// 2. A `&mut PageGuard` for the frame, which is unique by construction and
+///    whose `pin_count > 0` keeps the frame from being evicted or loaded
+///    underneath it.
+///
+/// Shared (`&`) reads of the buffer require either of the above, or simply a
+/// live `PageGuard` (pin held) when no writer can be active.
+///
+/// [`Deref`] exposes the buffer **read-only** so ergonomic indexing
+/// (`frame.buf[0]`, `&frame.buf[..]`, `frame.buf.len()`) keeps working; these
+/// shared reads are sound under the same pin / `io_mutex` discipline.
+#[derive(Debug)]
+pub struct FrameBuf {
+    inner: UnsafeCell<AlignedBuffer>,
+}
+
+impl FrameBuf {
+    /// Wrap an existing aligned buffer.
+    #[inline]
+    pub fn new(buf: AlignedBuffer) -> Self {
+        Self {
+            inner: UnsafeCell::new(buf),
+        }
+    }
+
+    /// Raw shared pointer to the underlying buffer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must respect the aliasing discipline documented on
+    /// [`FrameBuf`]: no `&mut` to the same buffer may be live concurrently.
+    #[inline]
+    pub(crate) unsafe fn get(&self) -> &AlignedBuffer {
+        // SAFETY: caller upholds the FrameBuf aliasing discipline.
+        unsafe { &*self.inner.get() }
+    }
+
+    /// Raw exclusive pointer to the underlying buffer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the owning frame's `io_mutex` **or** a
+    /// `&mut PageGuard` for the frame, guaranteeing no other reference to the
+    /// buffer is live.  See the [`FrameBuf`] aliasing discipline.
+    #[inline]
+    #[allow(clippy::mut_from_ref)] // Intentional: UnsafeCell interior mutability.
+    pub(crate) unsafe fn get_mut(&self) -> &mut AlignedBuffer {
+        // SAFETY: caller upholds the FrameBuf aliasing discipline (exclusive).
+        unsafe { &mut *self.inner.get() }
+    }
+}
+
+impl Deref for FrameBuf {
+    type Target = AlignedBuffer;
+
+    /// Read-only view of the buffer.
+    ///
+    /// This is sound under the [`FrameBuf`] aliasing discipline: a shared
+    /// borrow is only created while a pin is held or under `io_mutex`, where
+    /// no concurrent writer exists.
+    #[inline]
+    fn deref(&self) -> &AlignedBuffer {
+        // SAFETY: shared read under the pin / io_mutex discipline.
+        unsafe { &*self.inner.get() }
+    }
+}
+
 /// A frame owns both its descriptor and its aligned page buffer.
+///
+/// The buffer is wrapped in [`FrameBuf`] so the pool can mutate a single
+/// frame's bytes through a shared `&Frame` while keeping Rust's aliasing
+/// model intact.  Per-frame I/O is serialised by [`Frame::io_mutex`].
 #[derive(Debug)]
 pub struct Frame {
     pub desc: FrameDescriptor,
-    pub buf: AlignedBuffer,
+    pub buf: FrameBuf,
+    /// Serialises background flush and load-from-disk I/O for this frame's
+    /// bytes.  The normal page-access path (held `PageGuard`) does **not**
+    /// acquire this lock; pin exclusivity covers it instead.
+    pub(crate) io_mutex: ParkingMutex<()>,
 }
 
 impl Default for Frame {
@@ -113,7 +210,8 @@ impl Frame {
     pub fn new() -> Self {
         Self {
             desc: FrameDescriptor::new(),
-            buf: AlignedBuffer::zeroed(PAGE_SIZE),
+            buf: FrameBuf::new(AlignedBuffer::zeroed(PAGE_SIZE)),
+            io_mutex: ParkingMutex::new(()),
         }
     }
 
@@ -122,10 +220,47 @@ impl Frame {
         assert_eq!(buf.len(), PAGE_SIZE, "frame buffer must be PAGE_SIZE");
         Self {
             desc: FrameDescriptor::new(),
-            buf,
+            buf: FrameBuf::new(buf),
+            io_mutex: ParkingMutex::new(()),
+        }
+    }
+
+    /// Block until no I/O is in flight on this frame, establishing a
+    /// happens-before edge with the I/O path before the caller touches bytes.
+    ///
+    /// Used by the `PageGuard` write accessors: a pinned writer waits out any
+    /// flush that started just before it acquired the pin.  Because every flush
+    /// path skips pinned frames, the pin then keeps further flushes away, so
+    /// the writer obtains exclusive access to the buffer bytes.
+    ///
+    /// The `io_mutex` round-trip provides the acquire/release fence; the
+    /// `io_inflight` check provides the liveness condition.
+    pub(crate) fn wait_io_quiescent(&self) {
+        loop {
+            {
+                let _io_guard = self.io_mutex.lock();
+                if !self.desc.io_inflight.load(Ordering::Acquire) {
+                    return;
+                }
+            }
+            std::thread::yield_now();
         }
     }
 }
+
+// SAFETY: A `Frame` is `Sync` because:
+//  * `desc` is composed solely of atomics.
+//  * `buf` is an `UnsafeCell<AlignedBuffer>` whose backing memory is plain
+//    page-aligned bytes (`AlignedBuffer` is itself `Send + Sync`).  All
+//    mutable access is funnelled through the `FrameBuf` aliasing discipline
+//    (held `io_mutex` on the I/O path, or `&mut PageGuard` with `pin_count > 0`
+//    on the access path), so no two threads ever form overlapping `&mut`
+//    references to the same buffer.
+//  * `io_mutex` is itself `Sync`.
+// `Send` follows for the same reasons: ownership of a frame can move between
+// threads safely because the bytes carry no thread affinity.
+unsafe impl Sync for Frame {}
+unsafe impl Send for Frame {}
 
 #[cfg(test)]
 mod tests {

@@ -1,9 +1,8 @@
-use crate::buffer::frame::{Frame, FrameDescriptor, FrameId, FrameState};
+use crate::buffer::frame::{Frame, FrameDescriptor, FrameId, FrameState, INVALID_FRAME_ID};
 use crate::buffer::NumaTopology;
 use crate::io::{AlignedBuffer, FileSystem};
 use crate::storage::page::{PageId, PAGE_SIZE};
 use crate::wal::doublewrite::DoubleWriteBuffer;
-use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -13,6 +12,17 @@ use std::sync::{Arc, Mutex};
 /// Number of shards in the page-to-frame mapping table.
 pub const SHARD_COUNT: usize = 256;
 
+/// Sentinel `FrameId` stored in the shard map while a page is being loaded.
+///
+/// The miss path inserts this value under the shard lock *before* it releases
+/// the lock to perform disk I/O.  Any racing thread that observes the sentinel
+/// must spin-yield (via [`BufferPool::wait_for_loading`]) until a real
+/// `FrameId` replaces it.  This guarantees that:
+///
+/// * at most one thread issues I/O for a given page, and
+/// * no thread can pin or read a frame before its first load has completed.
+const LOADING_SENTINEL: FrameId = INVALID_FRAME_ID - 1;
+
 /// Guard returned by [`BufferPool::fix_page`].
 /// Automatically unpins the frame when dropped.
 pub struct PageGuard<'a> {
@@ -21,28 +31,50 @@ pub struct PageGuard<'a> {
     pub page_id: PageId,
 }
 
+impl std::fmt::Debug for PageGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageGuard")
+            .field("frame_id", &self.frame_id)
+            .field("page_id", &self.page_id)
+            .finish()
+    }
+}
+
 impl<'a> PageGuard<'a> {
     /// Mutable access to the frame buffer.
     ///
-    /// # Safety
-    /// The caller must ensure no other reference to this frame's buffer
-    /// exists concurrently.  The buffer pool guarantees this via the pin
-    /// count (writers should hold an exclusive pin).
+    /// Sound because:
+    ///
+    /// * `&mut self` is the unique live reference to this guard, so no other
+    ///   `&mut`/`&` can be derived from *this* guard.
+    /// * `pin_count > 0` is held for the guard's lifetime, and every flush
+    ///   path skips pinned frames before claiming `io_inflight`
+    ///   ([`BufferPool::flush_single_frame`], [`BufferPool::find_free_frame`],
+    ///   [`BufferPool::dirty_candidates`]).  Therefore no flusher can be reading
+    ///   these bytes while the pin is held.
+    /// * The `io_mutex` acquisition below establishes a happens-before edge
+    ///   with any flush that finished just before this guard pinned the frame,
+    ///   so the `&mut` never aliases a stale flush read.
     pub fn buf_mut(&mut self) -> &mut AlignedBuffer {
-        let frame = self.pool.frame_mut(self.frame_id);
-        &mut frame.buf
+        let frame = self.pool.frame(self.frame_id);
+        // Synchronise with any in-flight / just-finished flush, then proceed.
+        frame.wait_io_quiescent();
+        // SAFETY: pin held + frame quiescent: this is the only live reference.
+        unsafe { frame.buf.get_mut() }
     }
 
     /// Read-only access to the frame buffer.
     pub fn buf(&self) -> &AlignedBuffer {
         let frame = self.pool.frame(self.frame_id);
-        &frame.buf
+        // SAFETY: a live PageGuard pins the frame; no writer can hold an
+        // overlapping &mut while this shared borrow exists (buf_mut needs
+        // &mut self).
+        unsafe { frame.buf.get() }
     }
 
     /// Access the frame descriptor.
     pub fn desc(&self) -> &FrameDescriptor {
-        let frame = self.pool.frame(self.frame_id);
-        &frame.desc
+        &self.pool.frame(self.frame_id).desc
     }
 
     /// Mark this frame dirty with the given LSN.
@@ -64,22 +96,22 @@ impl<'a> PageGuard<'a> {
     /// evicted while this guard (and therefore the slice) is alive.
     pub fn as_slice(&self) -> &[u8] {
         let frame = self.pool.frame(self.frame_id);
-        &frame.buf[..]
+        // SAFETY: same shared-borrow argument as `buf`.
+        unsafe { &frame.buf.get()[..] }
     }
 
     /// Zero-copy mutable slice of the frame buffer.
     ///
-    /// # Safety
-    /// The caller must ensure no other reference to this frame's buffer
-    /// exists concurrently.  The buffer pool guarantees this via the pin
-    /// count (writers should hold an exclusive pin).
+    /// Sound for the same reason as [`PageGuard::buf_mut`].
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
-        let frame = self.pool.frame_mut(self.frame_id);
-        &mut frame.buf[..]
+        let frame = self.pool.frame(self.frame_id);
+        frame.wait_io_quiescent();
+        // SAFETY: same exclusive-borrow argument as `buf_mut`.
+        unsafe { &mut frame.buf.get_mut()[..] }
     }
 }
 
-impl<'a> Drop for PageGuard<'a> {
+impl Drop for PageGuard<'_> {
     fn drop(&mut self) {
         self.pool.unfix_page(self.frame_id);
     }
@@ -93,16 +125,33 @@ pub type PageHandle<'a> = PageGuard<'a>;
 
 /// A production-grade buffer pool with CLOCK-Pro replacement.
 ///
-/// The pool owns a dense array of frames, a sharded page table,
-/// and a ghost queue for scan resistance.
+/// # Concurrency model
+///
+/// - **Shard locks** (one per 256 pages) guard the page-table entries.
+/// - **`LOADING_SENTINEL`**: the miss path inserts this sentinel *under the
+///   shard lock* before releasing the lock to perform I/O.  Racing threads
+///   that see the sentinel spin-yield until the real `FrameId` is installed,
+///   preventing duplicate I/O and premature publication of a frame.
+/// - **Per-frame `io_mutex`**: serialises background flush and load-from-disk
+///   for a single frame's bytes.
+/// - **`FrameDescriptor` atomics**: allow lock-free inspection of metadata
+///   (pin count, dirty flag, state, LSNs) by the flusher and CLOCK sweeper.
+/// - **`pin_count`**: a frame with `pin_count > 0` is exempt from eviction.
+///   The [`PageGuard`] RAII type increments on creation and decrements on drop.
+///
+/// # Page-id 0
+///
+/// [`BufferPool::fix_page`] rejects page id `0` with [`io::ErrorKind::InvalidInput`].
+/// Page 0 is the null/superblock sentinel and must never alias a data frame;
+/// `0` is also the value [`FrameDescriptor::reset`] writes to mark a frame empty.
 #[derive(Debug)]
 pub struct BufferPool {
     /// Total number of frames (derived from RAM budget).
     pub frame_count: u32,
-    /// Dense array of frames.  Index = FrameId.
-    /// `UnsafeCell` is used so that multiple `PageGuard`s can each hold
-    /// a shared reference to the pool while mutating distinct frames.
-    frames: UnsafeCell<Vec<Frame>>,
+    /// Dense array of frames.  Index == FrameId.  Never reallocated after
+    /// construction, so `&Frame` borrows stay valid for the pool's lifetime.
+    /// Per-frame interior mutability lives inside `Frame`'s `FrameBuf`.
+    frames: Vec<Frame>,
     /// Sharded mapping from PageId -> FrameId.
     shards: [Mutex<HashMap<PageId, FrameId>>; SHARD_COUNT],
     /// CLOCK hand for victim selection.
@@ -129,12 +178,18 @@ pub struct BufferPool {
     doublewrite: Option<Arc<DoubleWriteBuffer>>,
 }
 
-// SAFETY: The buffer pool is Sync because each frame is independently
-// accessed through atomic descriptors, and the UnsafeCell is only used
-// to obtain &mut Frame when the caller already holds a PageGuard that
-// proves exclusive access (pin_count > 0 and write lock implied by
-// mut PageGuard).
+// SAFETY: `BufferPool` is `Send + Sync` because:
+//  1. Every mutable access to a frame's buffer is mediated through either the
+//     per-frame `io_mutex` (I/O path) or the `PageGuard` pin invariant
+//     (`pin_count > 0` + `&mut PageGuard`, normal access path).  Both prevent
+//     overlapping `&mut` references to the same bytes (see `FrameBuf`).
+//  2. `frames: Vec<Frame>` is never reallocated after construction, so the
+//     `&Frame` references handed out by `frame()`/`iter_frames()` remain valid.
+//  3. All shared counters and descriptor fields are atomics.
+//  4. Shard maps, ghost structures, and the doublewrite handle are protected
+//     by `std::sync::Mutex` / `Arc` respectively.
 unsafe impl Sync for BufferPool {}
+unsafe impl Send for BufferPool {}
 
 impl BufferPool {
     /// Create a new buffer pool with the given number of frames.
@@ -168,7 +223,7 @@ impl BufferPool {
         let ghost_capacity = (frame_count as usize / 4).max(16);
         Self {
             frame_count,
-            frames: UnsafeCell::new(frames),
+            frames,
             shards,
             clock_hand: AtomicU32::new(0),
             ghost_capacity,
@@ -192,6 +247,8 @@ impl BufferPool {
     /// Once set, every [`flush_single_frame`] call stages the page through the
     /// double-write buffer before the final in-place write, providing torn-page
     /// protection.
+    ///
+    /// [`flush_single_frame`]: BufferPool::flush_single_frame
     pub fn set_doublewrite(&mut self, dw: Arc<DoubleWriteBuffer>) {
         self.doublewrite = Some(dw);
     }
@@ -201,104 +258,162 @@ impl BufferPool {
         self.doublewrite.as_ref()
     }
 
-    /// Shared access to a frame (safe because the caller holds a guard).
+    /// Shared access to a frame.
+    ///
+    /// Returns `&Frame` directly: the frame array is never reallocated and the
+    /// frame's metadata is atomic, so a shared borrow is always sound.  Buffer
+    /// bytes inside the returned frame must still be accessed under the
+    /// `FrameBuf` aliasing discipline (held pin or `io_mutex`).
     pub fn frame(&self, fid: FrameId) -> &Frame {
-        // SAFETY: The caller holds a PageGuard that proves the frame is
-        // pinned and therefore valid.  We never reallocate `frames` after
-        // construction, so the pointer is stable.
-        unsafe { (&(*self.frames.get())).get(fid as usize).unwrap() }
+        &self.frames[fid as usize]
     }
 
-    /// Iterate over all frames (read-only).
+    /// Iterate over all frames (read-only metadata access).
     pub fn iter_frames(&self) -> impl Iterator<Item = &Frame> {
-        // SAFETY: We never mutate the Vec length after construction.
-        unsafe { (*self.frames.get()).iter() }
-    }
-
-    /// Mutable access to a frame (safe because the caller holds &mut PageGuard).
-    #[allow(clippy::mut_from_ref)]
-    pub(crate) fn frame_mut(&self, fid: FrameId) -> &mut Frame {
-        // SAFETY: The caller holds a &mut PageGuard, which means no other
-        // reference to this specific frame exists through guards.
-        unsafe { (&mut (*self.frames.get())).get_mut(fid as usize).unwrap() }
+        self.frames.iter()
     }
 
     /// Fix a page in memory, reading from disk if necessary.
     ///
     /// Returns a [`PageGuard`] that keeps the frame pinned until dropped.
-    pub fn fix_page(
-        &self,
-        fs: &dyn FileSystem,
-        page_id: PageId,
-    ) -> std::io::Result<PageGuard<'_>> {
-        // Fast path: page is already resident.
-        let shard_idx = Self::shard_index(page_id);
-        {
-            let shard = self.shards[shard_idx].lock().unwrap();
-            if let Some(&fid) = shard.get(&page_id) {
-                let frame = self.frame(fid);
-                frame.desc.pin_count.fetch_add(1, Ordering::Relaxed);
-                frame.desc.clock_ref.store(true, Ordering::Relaxed);
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(PageGuard {
-                    pool: self,
-                    frame_id: fid,
-                    page_id,
-                });
-            }
-        }
-
-        // Miss: need to load from disk into a free frame.
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        let fid = self.find_free_frame(fs)?;
-        let frame = self.frame(fid);
-
-        // Read page from disk.
-        let offset = page_id * PAGE_SIZE as u64;
-        let handle = fs.open(&self.data_path, false)?;
-        // SAFETY: We are loading into a free frame that no other thread
-        // can access (it is not yet in the page table).
-        let buf = unsafe { &mut (&mut (*self.frames.get()))[fid as usize].buf };
-        handle.read_at(buf, offset)?;
-
-        // Verify checksum before marking the page valid.
-        if !crate::storage::page::SlottedPage::verify_checksum_bytes(buf) {
+    ///
+    /// # Errors
+    ///
+    /// - [`io::ErrorKind::InvalidInput`] if `page_id == 0` (the null sentinel).
+    /// - [`io::ErrorKind::InvalidData`] if the loaded page fails checksum
+    ///   verification.
+    /// - Propagates I/O errors from the underlying read.
+    pub fn fix_page(&self, fs: &dyn FileSystem, page_id: PageId) -> std::io::Result<PageGuard<'_>> {
+        if page_id == 0 {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("page {} checksum mismatch", page_id),
+                io::ErrorKind::InvalidInput,
+                "page_id 0 is reserved; cannot fix the null-sentinel page",
             ));
         }
 
-        // Update descriptor.
-        frame.desc.reset();
-        frame.desc.page_id.store(page_id, Ordering::Relaxed);
-        frame.desc.state.store(FrameState::Clean as u8, Ordering::Relaxed);
-        frame.desc.pin_count.store(1, Ordering::Relaxed);
-        frame.desc.clock_ref.store(true, Ordering::Relaxed);
+        let shard_idx = Self::shard_index(page_id);
 
-        // Insert into page table.
-        let mut shard = self.shards[shard_idx].lock().unwrap();
-        // Re-check in case another thread raced.
-        if let Some(&existing_fid) = shard.get(&page_id) {
-            // Another thread loaded it first.  Back out.
-            frame.desc.reset();
-            drop(shard);
-            let existing_frame = self.frame(existing_fid);
-            existing_frame.desc.pin_count.fetch_add(1, Ordering::Relaxed);
-            existing_frame.desc.clock_ref.store(true, Ordering::Relaxed);
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(PageGuard {
-                pool: self,
-                frame_id: existing_fid,
-                page_id,
-            });
+        // ------------------------------------------------------------------
+        // Fast path: page is already resident.
+        // ------------------------------------------------------------------
+        {
+            let shard = self.shards[shard_idx].lock().unwrap();
+            match shard.get(&page_id).copied() {
+                Some(fid) if fid == LOADING_SENTINEL => {
+                    drop(shard);
+                    return self.wait_for_loading(fs, page_id);
+                }
+                Some(fid) => {
+                    let frame = self.frame(fid);
+                    frame.desc.pin_count.fetch_add(1, Ordering::Relaxed);
+                    frame.desc.clock_ref.store(true, Ordering::Relaxed);
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(PageGuard {
+                        pool: self,
+                        frame_id: fid,
+                        page_id,
+                    });
+                }
+                None => {}
+            }
         }
-        shard.insert(page_id, fid);
-        drop(shard);
 
-        // Ghost promotion: if this page was recently evicted, it was a ghost hit.
-        // We don't need special action here; the simple fact it was loaded
-        // makes it "hot" because clock_ref is set.
+        // ------------------------------------------------------------------
+        // Miss path — two-phase load.
+        //
+        // Phase 1: reserve a free frame and publish LOADING_SENTINEL under the
+        //          shard lock so racing threads wait instead of issuing
+        //          duplicate I/O or touching a half-loaded frame.
+        // Phase 2: perform I/O with `io_mutex` held; publish the real FrameId.
+        // ------------------------------------------------------------------
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let fid = self.find_free_frame(fs)?;
+
+        // Phase 1: publish the sentinel under the shard lock.
+        {
+            let mut shard = self.shards[shard_idx].lock().unwrap();
+            match shard.get(&page_id).copied() {
+                Some(existing) if existing == LOADING_SENTINEL => {
+                    // Another thread is already loading; abandon our frame.
+                    self.frame(fid).desc.reset();
+                    drop(shard);
+                    return self.wait_for_loading(fs, page_id);
+                }
+                Some(existing) => {
+                    // Another thread completed the load while we searched for a
+                    // free frame.  Back out and pin the existing frame.
+                    self.frame(fid).desc.reset();
+                    let frame = self.frame(existing);
+                    frame.desc.pin_count.fetch_add(1, Ordering::Relaxed);
+                    frame.desc.clock_ref.store(true, Ordering::Relaxed);
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(PageGuard {
+                        pool: self,
+                        frame_id: existing,
+                        page_id,
+                    });
+                }
+                None => {
+                    // We are first: reserve the slot with the sentinel.
+                    shard.insert(page_id, LOADING_SENTINEL);
+                    // Pre-configure the frame so the eviction sweep skips it.
+                    let frame = self.frame(fid);
+                    frame.desc.reset();
+                    frame
+                        .desc
+                        .state
+                        .store(FrameState::Loading as u8, Ordering::Relaxed);
+                    frame.desc.page_id.store(page_id, Ordering::Relaxed);
+                    frame.desc.io_inflight.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
+        // Phase 2: perform I/O.  `io_mutex` serialises against any background
+        // flush; the LOADING_SENTINEL keeps every other path away from this
+        // frame's bytes until we publish the real FrameId below.
+        let offset = page_id * PAGE_SIZE as u64;
+        let io_result: std::io::Result<()> = (|| {
+            let frame = self.frame(fid);
+            let _io_guard = frame.io_mutex.lock();
+            let handle = fs.open(&self.data_path, false)?;
+            // SAFETY: io_mutex is held and the LOADING_SENTINEL prevents any
+            // other thread from forming a reference to this buffer.
+            let buf = unsafe { frame.buf.get_mut() };
+            handle.read_at(buf, offset)?;
+
+            // Verify the checksum before the page is published.
+            // SAFETY: still under io_mutex; exclusive access to the bytes.
+            let bytes = unsafe { frame.buf.get() };
+            if !crate::storage::page::SlottedPage::verify_checksum_bytes(bytes) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("page {} checksum mismatch", page_id),
+                ));
+            }
+            Ok(())
+        })();
+
+        // Publish the real FrameId (or remove the sentinel on error).
+        {
+            let mut shard = self.shards[shard_idx].lock().unwrap();
+            let frame = self.frame(fid);
+            if io_result.is_ok() {
+                frame.desc.io_inflight.store(false, Ordering::Release);
+                frame.desc.state.store(FrameState::Clean as u8, Ordering::Release);
+                frame.desc.pin_count.store(1, Ordering::Release);
+                frame.desc.clock_ref.store(true, Ordering::Release);
+                shard.insert(page_id, fid);
+            } else {
+                frame.desc.reset();
+                shard.remove(&page_id);
+            }
+        }
+
+        io_result?;
+
+        // Ghost promotion: if this page was recently evicted, drop it from the
+        // ghost queue.  Being loaded already makes it "hot" (clock_ref set).
         {
             let mut ghost = self.ghost_set.lock().unwrap();
             if ghost.remove(&page_id).is_some() {
@@ -310,7 +425,11 @@ impl BufferPool {
         // Sequential readahead: if the per-thread tracker signals a prefetch,
         // load the next batch of pages into free frames.
         if let Some(prefetch_start) = crate::buffer::readahead::track_access(page_id) {
-            let _ = self.prefetch_range(fs, prefetch_start, crate::buffer::readahead::MAX_PREFETCH_PAGES as u32);
+            let _ = self.prefetch_range(
+                fs,
+                prefetch_start,
+                crate::buffer::readahead::MAX_PREFETCH_PAGES as u32,
+            );
         }
 
         Ok(PageGuard {
@@ -320,71 +439,160 @@ impl BufferPool {
         })
     }
 
+    /// Spin-yield until the [`LOADING_SENTINEL`] for `page_id` is replaced with
+    /// a real `FrameId`, then pin and return a guard for it.
+    ///
+    /// If the in-flight load fails (the sentinel is removed without a real
+    /// FrameId being installed), this retries the whole [`fix_page`] flow.
+    ///
+    /// [`fix_page`]: BufferPool::fix_page
+    fn wait_for_loading(
+        &self,
+        fs: &dyn FileSystem,
+        page_id: PageId,
+    ) -> std::io::Result<PageGuard<'_>> {
+        let shard_idx = Self::shard_index(page_id);
+        loop {
+            std::thread::yield_now();
+            let shard = self.shards[shard_idx].lock().unwrap();
+            match shard.get(&page_id).copied() {
+                Some(fid) if fid == LOADING_SENTINEL => {
+                    // Still loading; release the lock and keep spinning.
+                    drop(shard);
+                    continue;
+                }
+                Some(fid) => {
+                    let frame = self.frame(fid);
+                    frame.desc.pin_count.fetch_add(1, Ordering::Relaxed);
+                    frame.desc.clock_ref.store(true, Ordering::Relaxed);
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(PageGuard {
+                        pool: self,
+                        frame_id: fid,
+                        page_id,
+                    });
+                }
+                None => {
+                    // The load failed and removed the sentinel; retry from the
+                    // top so this thread issues its own load.
+                    drop(shard);
+                    return self.fix_page(fs, page_id);
+                }
+            }
+        }
+    }
+
     /// Prefetch a contiguous range of pages into free frames.
     ///
-    /// This is best-effort: if free frames run out, or a page is already
-    /// resident, the method simply skips the remaining pages.
+    /// This is best-effort: if free frames run out, a page is already resident,
+    /// or a page fails its checksum, the method simply skips it.  Each frame's
+    /// buffer is filled under its `io_mutex`; the frame is published to the
+    /// shard map only after a successful read and checksum check.
     pub fn prefetch_range(
         &self,
         fs: &dyn FileSystem,
         start_page: PageId,
         count: u32,
     ) -> std::io::Result<()> {
-        let mut bufs: Vec<&mut [u8]> = Vec::with_capacity(count as usize);
-        let mut frames_to_fill: Vec<(FrameId, PageId)> = Vec::with_capacity(count as usize);
+        // Cap the reservation so prefetch never starves real fixes: take at
+        // most half the pool (and never the whole thing).  This also bounds the
+        // number of frames whose `io_mutex` we will hold during the read.
+        let budget = (self.frame_count / 2).max(1).min(count);
 
+        // Reserve free frames first (without taking the io_mutex), tracking
+        // which page each will hold.  We use the *non-blocking* sweep so a
+        // saturated pool simply yields fewer prefetched pages instead of
+        // blocking (or, worse, recursing) on `find_free_frame`.
+        let mut frames_to_fill: Vec<(FrameId, PageId)> = Vec::with_capacity(budget as usize);
         for i in 0..count {
+            if frames_to_fill.len() as u32 >= budget {
+                break;
+            }
             let page_id = start_page + i as u64;
+            if page_id == 0 {
+                continue; // page 0 is the null sentinel; never cache it
+            }
             let shard_idx = Self::shard_index(page_id);
             {
                 let shard = self.shards[shard_idx].lock().unwrap();
                 if shard.contains_key(&page_id) {
-                    continue; // already resident
+                    continue; // already resident (or loading)
                 }
             }
-            match self.find_free_frame(fs) {
-                Ok(fid) => {
-                    let _frame = self.frame(fid);
-                    // SAFETY: we have exclusive access to this free frame.
-                    let buf = unsafe { &mut (&mut (*self.frames.get()))[fid as usize].buf };
-                    bufs.push(&mut buf[..]);
+            match self.try_find_free_frame(fs)? {
+                Some(fid) => {
+                    let frame = self.frame(fid);
+                    frame.desc.reset();
+                    frame
+                        .desc
+                        .state
+                        .store(FrameState::Loading as u8, Ordering::Relaxed);
+                    frame.desc.page_id.store(page_id, Ordering::Relaxed);
+                    frame.desc.io_inflight.store(true, Ordering::Relaxed);
                     frames_to_fill.push((fid, page_id));
                 }
-                Err(_) => break, // no free frames available
+                None => break, // no free frames immediately available
             }
         }
 
-        if bufs.is_empty() {
+        if frames_to_fill.is_empty() {
             return Ok(());
         }
 
-        // Issue a single vectored read for all buffers.
+        // Issue a single vectored read into the reserved buffers, all held
+        // under their respective io_mutexes for the duration of the read.
         let offset = start_page * PAGE_SIZE as u64;
         let handle = fs.open(&self.data_path, false)?;
-        handle.readv_at(&mut bufs, offset)?;
+        {
+            // Collect io_mutex guards so no background flush can touch these
+            // buffers while the vectored read is in flight.
+            let guards: Vec<_> = frames_to_fill
+                .iter()
+                .map(|(fid, _)| self.frame(*fid).io_mutex.lock())
+                .collect();
 
-        // Verify checksums and update descriptors.
-        for (fid, page_id) in &frames_to_fill {
-            let buf = unsafe { &(&(*self.frames.get()))[*fid as usize].buf[..] };
-            if !crate::storage::page::SlottedPage::verify_checksum_bytes(buf) {
-                // Evict the frame and skip the corrupt page.
+            let mut bufs: Vec<&mut [u8]> = Vec::with_capacity(frames_to_fill.len());
+            for (fid, _) in &frames_to_fill {
                 let frame = self.frame(*fid);
+                // SAFETY: this frame's io_mutex is held in `guards`, and it has
+                // not been published to the shard map yet, so no other thread
+                // can reach these bytes.
+                let buf = unsafe { frame.buf.get_mut() };
+                bufs.push(&mut buf[..]);
+            }
+            handle.readv_at(&mut bufs, offset)?;
+            drop(guards);
+        }
+
+        // Verify checksums and publish each frame.
+        for (fid, page_id) in &frames_to_fill {
+            let frame = self.frame(*fid);
+            // SAFETY: the frame is not yet published; we are the only accessor.
+            let valid = {
+                let _io_guard = frame.io_mutex.lock();
+                let bytes = unsafe { frame.buf.get() };
+                crate::storage::page::SlottedPage::verify_checksum_bytes(bytes)
+            };
+            if !valid {
+                // Corrupt page: discard the frame, do not publish it.
                 frame.desc.reset();
-                let shard_idx = Self::shard_index(*page_id);
-                let mut shard = self.shards[shard_idx].lock().unwrap();
-                shard.remove(page_id);
                 continue;
             }
-            let frame = self.frame(*fid);
-            frame.desc.reset();
-            frame.desc.page_id.store(*page_id, Ordering::Relaxed);
-            frame.desc.state.store(FrameState::Clean as u8, Ordering::Relaxed);
+            frame.desc.io_inflight.store(false, Ordering::Release);
+            frame.desc.state.store(FrameState::Clean as u8, Ordering::Release);
             frame.desc.pin_count.store(0, Ordering::Relaxed);
             frame.desc.clock_ref.store(false, Ordering::Relaxed);
 
             let shard_idx = Self::shard_index(*page_id);
             let mut shard = self.shards[shard_idx].lock().unwrap();
-            shard.entry(*page_id).or_insert(*fid);
+            // Only publish if nobody raced us in for this page.
+            if let std::collections::hash_map::Entry::Vacant(e) = shard.entry(*page_id) {
+                e.insert(*fid);
+            } else {
+                // Lost the race: drop our copy so it can be reused.
+                drop(shard);
+                frame.desc.reset();
+            }
         }
 
         Ok(())
@@ -395,17 +603,42 @@ impl BufferPool {
         let frame = self.frame(frame_id);
         let old = frame.desc.pin_count.fetch_sub(1, Ordering::Relaxed);
         if old == 0 {
-            // Underflow should never happen in correct code, but reset to 0
-            // to avoid wrapping.
+            // Underflow guard: clamp back to 0 rather than wrapping to u16::MAX.
             frame.desc.pin_count.store(0, Ordering::Relaxed);
         }
     }
 
-    /// Find a free or evictable frame using CLOCK-Pro sweep.
+    /// Find a free or evictable frame using a CLOCK-Pro sweep.
     ///
-    /// This method loops until it finds a suitable frame.  Under extreme
-    /// memory pressure it may block briefly.
+    /// This blocks until it finds a suitable frame: under memory pressure it
+    /// yields between sweeps to let the flusher convert dirty frames to clean.
+    /// The loop is bounded per attempt (no unbounded recursion), so a pool that
+    /// is momentarily saturated by in-flight I/O simply spins-yields rather
+    /// than overflowing the stack.
     fn find_free_frame(&self, fs: &dyn FileSystem) -> std::io::Result<FrameId> {
+        loop {
+            if let Some(fid) = self.sweep_for_victim(fs)? {
+                return Ok(fid);
+            }
+            // No victim this sweep (everything pinned / in-flight); yield and
+            // retry so the flusher and concurrent unpins can make progress.
+            std::thread::yield_now();
+        }
+    }
+
+    /// Try to find a free or evictable frame in a single bounded sweep.
+    ///
+    /// Returns `Ok(None)` when no frame is immediately reclaimable (all frames
+    /// pinned or with I/O in flight).  Callers that must not block — such as
+    /// best-effort prefetch — use this and stop when it returns `None`.
+    fn try_find_free_frame(&self, fs: &dyn FileSystem) -> std::io::Result<Option<FrameId>> {
+        self.sweep_for_victim(fs)
+    }
+
+    /// One CLOCK-Pro sweep: returns a reclaimed `FrameId`, or `None` if this
+    /// pass found no evictable frame.  Inline-flushes one unreferenced dirty
+    /// victim per encounter so repeated calls drain dirty frames.
+    fn sweep_for_victim(&self, fs: &dyn FileSystem) -> std::io::Result<Option<FrameId>> {
         let start = self.clock_hand.load(Ordering::Relaxed);
         let count = self.frame_count;
 
@@ -417,34 +650,38 @@ impl BufferPool {
                 && !frame.desc.io_inflight.load(Ordering::Relaxed)
             {
                 self.clock_hand.store(idx as u32, Ordering::Relaxed);
-                return Ok(idx as FrameId);
+                return Ok(Some(idx as FrameId));
             }
         }
 
-        // Second pass: CLOCK sweep looking for unreferenced, clean victims.
+        // Second pass: CLOCK sweep for unreferenced, clean victims.
         let mut scanned = 0u32;
         while scanned < count * 2 {
             let idx = self.clock_hand.load(Ordering::Relaxed) as usize;
             let frame = self.frame(idx as FrameId);
             let state = frame.desc.state.load(Ordering::Relaxed);
 
-            // Advance hand atomically.
+            // Advance the hand.
             self.clock_hand
                 .store((idx as u32 + 1) % count, Ordering::Relaxed);
             scanned += 1;
 
-            // Skip frames that are busy.
+            // Skip busy frames (pinned or with I/O in flight, which also covers
+            // frames reserved by a concurrent two-phase load).
             if frame.desc.is_pinned() || frame.desc.io_inflight.load(Ordering::Relaxed) {
                 continue;
             }
 
             if state == FrameState::Clean as u8 || state == FrameState::Empty as u8 {
-                // If it had a page, evict it.
                 let old_page = frame.desc.page_id.load(Ordering::Relaxed);
                 if old_page != 0 {
                     let old_shard = Self::shard_index(old_page);
                     let mut shard = self.shards[old_shard].lock().unwrap();
-                    shard.remove(&old_page);
+                    // Only unmap if this frame still owns the page (it may have
+                    // been remapped by a racing load/evict).
+                    if shard.get(&old_page) == Some(&(idx as FrameId)) {
+                        shard.remove(&old_page);
+                    }
                     drop(shard);
 
                     let referenced = frame.desc.clock_ref.swap(false, Ordering::Relaxed);
@@ -454,37 +691,28 @@ impl BufferPool {
                     }
                     self.evictions.fetch_add(1, Ordering::Relaxed);
                 }
-                return Ok(idx as FrameId);
+                frame.desc.reset();
+                return Ok(Some(idx as FrameId));
             }
 
-            // Dirty frame: if referenced, clear bit and keep; if not, we
-            // need to flush it before eviction.  For now we skip it and
-            // let the background flusher convert it to clean.  To avoid
-            // spinning forever we yield occasionally.
+            // Dirty frame: if referenced, clear the bit and keep it; otherwise
+            // flush it inline so we can reclaim it on a later sweep.
             if state == FrameState::Dirty as u8 {
-                let referenced = frame.desc.clock_ref.load(Ordering::Relaxed);
-                if referenced {
+                if frame.desc.clock_ref.load(Ordering::Relaxed) {
                     frame.desc.clock_ref.store(false, Ordering::Relaxed);
                     continue;
                 }
-                // Not referenced and dirty: attempt to flush inline so we
-                // can evict it immediately.
                 self.flush_single_frame(fs, idx as FrameId)?;
-                // After inline flush the frame is clean (or empty if we
-                // evict).  Re-try this index on the next loop iteration.
                 continue;
             }
 
             if state == FrameState::Loading as u8 || state == FrameState::Flushing as u8 {
-                // Wait a tiny bit for I/O to finish, then continue.
-                std::thread::yield_now();
+                // I/O in flight elsewhere; skip and let the next sweep retry.
                 continue;
             }
         }
 
-        // Desperate fallback: wait for the flusher to make progress.
-        std::thread::yield_now();
-        self.find_free_frame(fs)
+        Ok(None)
     }
 
     /// Write a single dirty frame back to disk.
@@ -494,6 +722,10 @@ impl BufferPool {
     /// ensures that a crash between the DW write and the in-place write can be
     /// detected and repaired by [`DoubleWriteBuffer::recover_torn_pages`] on
     /// the next startup.
+    ///
+    /// The whole checksum-update / DW-stage / in-place-write sequence runs
+    /// under the frame's `io_mutex`, so it cannot race a concurrent load or a
+    /// second flusher touching the same bytes.
     pub fn flush_single_frame(
         &self,
         fs: &dyn FileSystem,
@@ -505,26 +737,47 @@ impl BufferPool {
             return Ok(());
         }
 
-        // Mark inflight so the sweeper does not pick it.
+        // Mark inflight so the sweeper and other flushers skip it.
         let was_inflight = frame.desc.io_inflight.swap(true, Ordering::Acquire);
         if was_inflight {
             return Ok(()); // another thread is already flushing it
         }
 
-        // Update checksum on the frame buffer before any write.
-        let frame_mut = self.frame_mut(frame_id);
-        crate::storage::page::SlottedPage::update_checksum_bytes(&mut frame_mut.buf);
+        // A pinned frame may have a live `PageGuard` writer mutating the bytes;
+        // flushing it would read bytes that overlap that writer's `&mut`.  Skip
+        // it and let a later flush (or `flush_all`) pick it up once unpinned.
+        // The `io_inflight` swap above happens-before this check, and a writer
+        // calls `wait_io_quiescent()` (which observes `io_inflight`) before
+        // mutating, so the pin/flush exclusion is symmetric and race-free.
+        if frame.desc.is_pinned() {
+            frame.desc.io_inflight.store(false, Ordering::Release);
+            return Ok(());
+        }
+
+        // Serialise the buffer access (checksum + writes) against any load.
+        let _io_guard = frame.io_mutex.lock();
+
+        // Update the checksum on the frame buffer before any write.
+        // SAFETY: io_mutex held and io_inflight set; no other writer can exist.
+        let buf_mut = unsafe { frame.buf.get_mut() };
+        crate::storage::page::SlottedPage::update_checksum_bytes(buf_mut);
 
         // Stage through the double-write buffer if one is attached, providing
         // torn-page protection for this single-frame flush.
         if let Some(dw) = &self.doublewrite {
-            let pages: Vec<(u64, &[u8])> = vec![(page_id, &frame_mut.buf[..])];
+            // SAFETY: still under io_mutex; shared read of the just-updated bytes.
+            let bytes = unsafe { frame.buf.get() };
+            let pages: Vec<(u64, &[u8])> = vec![(page_id, &bytes[..])];
             dw.write_batch(&pages, fs)?;
         }
 
         let offset = page_id * PAGE_SIZE as u64;
         let handle = fs.open(&self.data_path, false)?;
-        handle.write_at(&frame_mut.buf, offset)?;
+        {
+            // SAFETY: io_mutex held; shared read of the frame bytes for the write.
+            let bytes = unsafe { frame.buf.get() };
+            handle.write_at(bytes, offset)?;
+        }
         handle.sync_data()?;
 
         // DW buffer can now be cleared: the in-place write completed durably.
@@ -534,10 +787,10 @@ impl BufferPool {
             let _ = dw.clear(fs);
         }
 
-        frame_mut.desc.dirty.store(false, Ordering::Release);
-        frame_mut.desc.state.store(FrameState::Clean as u8, Ordering::Release);
-        frame_mut.desc.io_inflight.store(false, Ordering::Release);
-        frame_mut.desc.rec_lsn.store(u64::MAX, Ordering::Relaxed);
+        frame.desc.dirty.store(false, Ordering::Release);
+        frame.desc.state.store(FrameState::Clean as u8, Ordering::Release);
+        frame.desc.io_inflight.store(false, Ordering::Release);
+        frame.desc.rec_lsn.store(u64::MAX, Ordering::Relaxed);
         Ok(())
     }
 
@@ -569,11 +822,11 @@ impl BufferPool {
         }
     }
 
-    /// Scan all frames and return ids of dirty ones that are not pinned
-    /// and not already being flushed.
+    /// Scan all frames and return ids of dirty ones that are not pinned and
+    /// not already being flushed.
     pub fn dirty_candidates(&self) -> Vec<FrameId> {
         let mut out = Vec::new();
-        for (idx, frame) in unsafe { (*self.frames.get()).iter().enumerate() } {
+        for (idx, frame) in self.frames.iter().enumerate() {
             let state = frame.desc.state.load(Ordering::Relaxed);
             if state == FrameState::Dirty as u8
                 && !frame.desc.is_pinned()
@@ -596,36 +849,52 @@ impl BufferPool {
 
     /// Evict any frame currently holding `page_id`.
     ///
-    /// The frame is marked clean and empty so it can be reclaimed by the
-    /// CLOCK-Pro sweeper.  This must be called after freeing a page so that
-    /// a subsequent reallocation of the same page id never serves stale bytes
-    /// from the cache.
+    /// The frame's bytes are zeroed and its descriptor reset so the frame can
+    /// be reclaimed by the CLOCK-Pro sweeper.  This must be called after
+    /// freeing a page so that a subsequent reallocation of the same page id
+    /// never serves stale bytes from the cache.
     ///
     /// If the page is not resident the call is a no-op.
     pub fn invalidate(&self, page_id: PageId) {
+        if page_id == 0 {
+            return;
+        }
         let shard_idx = Self::shard_index(page_id);
         let fid = {
             let mut shard = self.shards[shard_idx].lock().unwrap();
             match shard.remove(&page_id) {
+                Some(fid) if fid == LOADING_SENTINEL => {
+                    // A load is in progress; re-insert and let it finish.  The
+                    // caller (post free_page) should not normally hit this, but
+                    // we must not strand the sentinel.
+                    shard.insert(page_id, LOADING_SENTINEL);
+                    return;
+                }
                 Some(fid) => fid,
                 None => return, // page not resident
             }
         };
 
         let frame = self.frame(fid);
-        // Wait until any in-flight I/O on this frame completes.
-        // A simple spin is sufficient: the flusher holds the flag for only a
-        // few microseconds and we only arrive here after explicit free_page().
+        // Wait until any in-flight I/O on this frame completes.  A simple spin
+        // is sufficient: the flusher holds the flag for only a few microseconds
+        // and we only arrive here after an explicit free_page().
         while frame.desc.io_inflight.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
 
-        // Zeroize the buffer so a subsequent fix_page never serves stale data.
-        let frame_mut = self.frame_mut(fid);
-        frame_mut.buf.iter_mut().for_each(|b| *b = 0);
+        // Zeroise the buffer so a subsequent fix_page never serves stale data.
+        // Take io_mutex to serialise against any flush that may still be racing.
+        {
+            let _io_guard = frame.io_mutex.lock();
+            // SAFETY: io_mutex held and the page is no longer mapped, so no
+            // other thread can form a reference to these bytes.
+            let buf = unsafe { frame.buf.get_mut() };
+            buf.iter_mut().for_each(|b| *b = 0);
+        }
 
         // Reset the descriptor: the frame is now empty.
-        frame_mut.desc.reset();
+        frame.desc.reset();
     }
 }
 
@@ -661,6 +930,13 @@ mod tests {
     }
 
     #[test]
+    fn fix_page_zero_rejected() {
+        let (_dir, fs, pool) = temp_pool(4);
+        let err = pool.fix_page(&fs, 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn fix_unreferenced_page_reads_from_disk() {
         use crate::storage::page::{PageType, SlottedPage};
         let (_dir, fs, pool) = temp_pool(4);
@@ -690,15 +966,16 @@ mod tests {
     #[test]
     fn guard_unpins_on_drop() {
         let (_dir, fs, pool) = temp_pool(4);
-        {
+        let frame_id = {
             let guard = pool.fix_page(&fs, 2).unwrap();
             assert_eq!(guard.desc().pin_count.load(Ordering::Relaxed), 1);
-        }
-        let frame = &pool.frames;
-        // After drop pin count is 0 on the frame that held page 2.
-        // Page 2 loaded into frame 2 on first pass because frame 0,1 might be empty.
-        let f = unsafe { (&(*frame.get())).get(2).unwrap() };
-        assert_eq!(f.desc.pin_count.load(Ordering::Relaxed), 0);
+            guard.frame_id
+        };
+        // After drop the pin count is 0 on the frame that held page 2.
+        assert_eq!(
+            pool.frame(frame_id).desc.pin_count.load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -734,7 +1011,7 @@ mod tests {
         pool.flush_all(&fs).unwrap();
         // Find which frame holds page 7.
         let mut found = false;
-        for frame in unsafe { (*pool.frames.get()).iter() } {
+        for frame in pool.iter_frames() {
             if frame.desc.page_id.load(Ordering::Relaxed) == 7 {
                 assert!(!frame.desc.dirty.load(Ordering::Relaxed));
                 found = true;
@@ -842,7 +1119,10 @@ mod tests {
 
         let shard_idx = BufferPool::shard_index(101);
         let shard = pool.shards[shard_idx].lock().unwrap();
-        assert!(!shard.contains_key(&101), "page 101 should NOT be prefetched after random access");
+        assert!(
+            !shard.contains_key(&101),
+            "page 101 should NOT be prefetched after random access"
+        );
     }
 
     #[test]
@@ -901,8 +1181,8 @@ mod tests {
 
     #[test]
     fn freed_then_reallocated_page_is_clean() {
+        use crate::storage::manager::PageManager;
         use crate::storage::page::{PageType, SlottedPage};
-        use crate::storage::manager::{PageManager, FIRST_DATA_PAGE_ID};
         use std::sync::Arc;
 
         let (_dir, fs, path) = {
@@ -912,7 +1192,6 @@ mod tests {
             {
                 let mut f = std::fs::File::create(&path).unwrap();
                 f.set_len(64 * PAGE_SIZE as u64).unwrap();
-                use std::io::Write;
                 f.flush().unwrap();
             }
             let handle = fs.open(&path, false).unwrap();
@@ -997,6 +1276,149 @@ mod tests {
         drop(handle);
 
         let result = pool.fix_page(&fs, 5);
-        assert!(result.is_err(), "corrupted page should fail checksum verification");
+        assert!(
+            result.is_err(),
+            "corrupted page should fail checksum verification"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Concurrency tests (Task 173)
+    // -----------------------------------------------------------------
+
+    /// Build a pool over a freshly initialised data file with `file_pages`
+    /// valid pages.  Returns an `Arc<BufferPool>` and an `Arc<PosixFileSystem>`
+    /// so worker threads can share both.
+    fn concurrent_pool(
+        frames: u32,
+        file_pages: u64,
+    ) -> (tempfile::TempDir, Arc<PosixFileSystem>, Arc<BufferPool>) {
+        use crate::storage::page::{PageType, SlottedPage};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rgraph.db");
+        let fs = Arc::new(PosixFileSystem::new(false));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.set_len(file_pages * PAGE_SIZE as u64).unwrap();
+            f.flush().unwrap();
+        }
+        let handle = fs.open(&path, false).unwrap();
+        for pid in 0..file_pages {
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.update_checksum();
+            handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
+        }
+        handle.sync_data().unwrap();
+        drop(handle);
+        let pool = Arc::new(BufferPool::new(frames, path));
+        (dir, fs, pool)
+    }
+
+    /// Many threads fix the same page concurrently across many iterations.
+    /// No data race may occur and every fix must observe the correct bytes.
+    #[test]
+    fn concurrent_fix_same_page_no_race() {
+        const ITERS: usize = 200;
+        const THREADS: usize = 8;
+        let (_dir, fs, pool) = concurrent_pool(16, 64);
+
+        for _ in 0..ITERS {
+            let mut handles = Vec::with_capacity(THREADS);
+            for _ in 0..THREADS {
+                let pool = pool.clone();
+                let fs = fs.clone();
+                handles.push(std::thread::spawn(move || {
+                    let g = pool.fix_page(fs.as_ref(), 5).expect("fix page 5");
+                    // Read the buffer to exercise the shared-borrow path.
+                    let _first = g.as_slice()[0];
+                    g.frame_id
+                }));
+            }
+            // Every thread that fixed page 5 must share the same frame id.
+            let mut ids: Vec<FrameId> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            ids.dedup();
+            assert_eq!(ids.len(), 1, "all concurrent fixes must share one frame");
+            // Drop all pins for the next iteration by re-fixing nothing; pins
+            // were already released when each guard dropped at thread end.
+            // Evict page 5 so the next iteration exercises the miss path again.
+            pool.invalidate(5);
+        }
+    }
+
+    /// A pinned frame must never be chosen for eviction even under pressure.
+    #[test]
+    fn pin_prevents_concurrent_eviction() {
+        use std::sync::Barrier;
+        // Two frames only, to force eviction pressure.
+        let (_dir, fs, pool) = concurrent_pool(2, 64);
+
+        for _ in 0..100 {
+            let barrier = Arc::new(Barrier::new(2));
+            let pinned_frame = {
+                // Thread A pins page 1 and keeps it pinned across B's fix.
+                let pool_a = pool.clone();
+                let fs_a = fs.clone();
+                let barrier_a = barrier.clone();
+                let a = std::thread::spawn(move || {
+                    let g = pool_a.fix_page(fs_a.as_ref(), 1).unwrap();
+                    let fid = g.frame_id;
+                    barrier_a.wait();
+                    // Hold the pin while B forces eviction pressure.
+                    std::thread::yield_now();
+                    let still = g.as_slice()[0]; // touch the buffer
+                    drop(g);
+                    (fid, still)
+                });
+
+                let pool_b = pool.clone();
+                let fs_b = fs.clone();
+                let barrier_b = barrier.clone();
+                let b = std::thread::spawn(move || {
+                    barrier_b.wait();
+                    // page 1 is pinned; the pool must evict a different frame.
+                    let g = pool_b.fix_page(fs_b.as_ref(), 2).expect("fix page 2");
+                    g.frame_id
+                });
+
+                let (fid_a, _) = a.join().unwrap();
+                let fid_b = b.join().unwrap();
+                assert_ne!(
+                    fid_a, fid_b,
+                    "pinned frame must not be evicted to serve another page"
+                );
+                fid_a
+            };
+            // Clean up for the next iteration.
+            pool.invalidate(1);
+            pool.invalidate(2);
+            let _ = pinned_frame;
+        }
+    }
+
+    /// The LOADING_SENTINEL must prevent duplicate I/O: two concurrent fixes of
+    /// the same page id always converge on a single frame.
+    #[test]
+    fn loading_sentinel_prevents_duplicate_io() {
+        let (_dir, fs, pool) = concurrent_pool(16, 64);
+
+        for _ in 0..200 {
+            let pool_a = pool.clone();
+            let fs_a = fs.clone();
+            let a = std::thread::spawn(move || {
+                pool_a.fix_page(fs_a.as_ref(), 7).unwrap().frame_id
+            });
+            let pool_b = pool.clone();
+            let fs_b = fs.clone();
+            let b = std::thread::spawn(move || {
+                pool_b.fix_page(fs_b.as_ref(), 7).unwrap().frame_id
+            });
+            let fid_a = a.join().unwrap();
+            let fid_b = b.join().unwrap();
+            assert_eq!(
+                fid_a, fid_b,
+                "two concurrent fixes of the same page must share a frame"
+            );
+            pool.invalidate(7);
+        }
     }
 }
