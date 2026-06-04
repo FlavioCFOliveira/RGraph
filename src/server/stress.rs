@@ -339,6 +339,8 @@ impl StressHarness {
 
 #[cfg(test)]
 mod tests {
+    // Tests build a baseline via `Default` then tweak individual fields.
+    #![allow(clippy::field_reassign_with_default)]
     use super::*;
     use crate::io::posix::PosixFileSystem;
 

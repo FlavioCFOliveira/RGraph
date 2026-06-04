@@ -1113,7 +1113,7 @@ pub fn eval_order_key(expr: &Expression, ctx: &EvalContext) -> Result<Value, Eva
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cypher::ast::{BinaryOperator, ComparisonOperator, Expression, Literal, Projection, UnaryOperator};
+    use crate::cypher::ast::{BinaryOperator, ComparisonOperator, Expression, Literal, UnaryOperator};
 
     #[test]
     fn eval_literal_integer() {

@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn percentiles_are_monotonic() {
-        let samples: Vec<Duration> = (1..=100).map(|n| Duration::from_micros(n)).collect();
+        let samples: Vec<Duration> = (1..=100).map(Duration::from_micros).collect();
         let stats = LatencyStats::from_samples(samples, Duration::from_millis(10));
         assert!(stats.p50 <= stats.p95);
         assert!(stats.p95 <= stats.p99);

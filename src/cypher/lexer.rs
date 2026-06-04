@@ -715,8 +715,8 @@ mod tests {
 
     #[test]
     fn lex_float_literal() {
-        let tokens = lex("RETURN 3.14");
-        assert_eq!(tokens[1].token, Token::Float(3.14));
+        let tokens = lex("RETURN 2.5");
+        assert_eq!(tokens[1].token, Token::Float(2.5));
     }
 
     #[test]

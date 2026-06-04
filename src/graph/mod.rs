@@ -7,6 +7,9 @@
 pub mod record;
 pub mod property;
 pub mod builder;
+// The high-level `Graph` API lives in `graph/graph.rs`; the repeated path
+// segment is intentional and renaming the module would churn the public API.
+#[allow(clippy::module_inception)]
 pub mod graph;
 pub mod adjacency;
 pub mod csr;

@@ -883,7 +883,7 @@ mod tests {
     fn scan_nodes_by_label_returns_matching_nodes() {
         let (_dir, fs, _path, mut graph) = temp_graph();
         let (_, id1) = graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
-        let (_, id2) = graph.create_node(NodeBuilder::new().label(20), &fs).unwrap();
+        let (_, _id2) = graph.create_node(NodeBuilder::new().label(20), &fs).unwrap();
         let (_, id3) = graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
 
         let nodes = graph.scan_by_label(10, &fs).unwrap();
@@ -914,7 +914,7 @@ mod tests {
         let (_, eid1) = graph.create_relationship(
             RelationshipBuilder::new().from(src_id).to(tgt_id).type_id(5), &fs
         ).unwrap();
-        let (_, eid2) = graph.create_relationship(
+        let (_, _eid2) = graph.create_relationship(
             RelationshipBuilder::new().from(tgt_id).to(src_id).type_id(7), &fs
         ).unwrap();
         let (_, eid3) = graph.create_relationship(

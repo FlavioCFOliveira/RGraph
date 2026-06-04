@@ -1160,7 +1160,7 @@ mod tests {
 
     #[test]
     fn invalidate_evicts_resident_frame() {
-        use crate::storage::page::{PageType, SlottedPage};
+        use crate::storage::page::SlottedPage;
         let (_dir, fs, pool) = temp_pool(4);
 
         // Fix page 4, write known data, mark dirty, unpin.

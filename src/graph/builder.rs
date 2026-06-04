@@ -110,7 +110,11 @@ pub struct RelationshipBuilder {
 }
 
 /// Error raised when a [`RelationshipBuilder`] constraint is violated.
+///
+/// The shared `Missing` prefix is intentional and part of the public API: each
+/// variant names the required field that was absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum BuilderError {
     /// The source node id was not set.
     MissingSource,

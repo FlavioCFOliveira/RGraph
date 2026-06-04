@@ -2080,7 +2080,7 @@ fn extract_projection_columns(op: &LogicalOperator) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::cypher::ast::{Expression, Literal, Projection};
-    use crate::cypher::plan::LogicalPlan;
+    
 
     #[test]
     fn filter_op_keeps_true_rows() {

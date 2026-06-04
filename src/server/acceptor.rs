@@ -78,6 +78,10 @@ pub struct ServerStream {
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+// The TLS variant is intentionally larger than the plain variant; boxing it
+// would add a per-connection heap allocation on the accept hot path for no
+// real benefit, since one `ServerStreamInner` exists per live connection.
+#[allow(clippy::large_enum_variant)]
 enum ServerStreamInner {
     Plain(TcpStream),
     Tls(TlsStream<TcpStream>),

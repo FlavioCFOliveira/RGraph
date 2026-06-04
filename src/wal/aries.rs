@@ -942,13 +942,6 @@ mod tests {
         r
     }
 
-    fn node_insert(txid: u64, lsn: u64, prev: u64, page_id: u64) -> WalRecord {
-        let mut payload = page_id.to_be_bytes().to_vec();
-        payload.extend_from_slice(&[0xABu8; 16]);
-        let mut r = WalRecord::new(RecordType::NodeInsert, txid, 0, prev, payload);
-        r.set_lsn(lsn);
-        r
-    }
 
     // ── ANALYSIS ──────────────────────────────────────────────────────────────
 
@@ -1200,7 +1193,7 @@ mod tests {
     #[test]
     fn undo_update_restores_before_image() {
         use crate::io::posix::PosixFileSystem;
-        use crate::storage::page::{PageType, SlottedPage};
+        
 
         let dir = tempfile::tempdir().unwrap();
         let fs = PosixFileSystem::new(false);

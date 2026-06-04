@@ -613,7 +613,7 @@ mod tests {
         handle
             .read_at(
                 &mut bitmap_buf,
-                FIRST_BITMAP_PAGE_ID as u64 * PAGE_SIZE as u64,
+                FIRST_BITMAP_PAGE_ID * PAGE_SIZE as u64,
             )
             .unwrap();
         drop(handle);

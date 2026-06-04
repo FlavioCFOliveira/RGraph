@@ -350,8 +350,8 @@ mod tests {
 
     #[test]
     fn from_f64() {
-        let p: Property = 3.14.into();
-        assert_eq!(p, Property::Float(OrderedF64(3.14)));
+        let p: Property = 2.5.into();
+        assert_eq!(p, Property::Float(OrderedF64(2.5)));
     }
 
     #[test]

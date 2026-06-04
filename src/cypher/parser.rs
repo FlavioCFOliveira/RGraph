@@ -1590,9 +1590,6 @@ mod tests {
     use super::*;
     use text_size::TextSize;
 
-    fn first_clause(q: &str) -> Clause {
-        parse(q).unwrap().clauses.into_iter().next().unwrap()
-    }
 
     #[test]
     fn parse_simple_match_return() {
@@ -1731,23 +1728,21 @@ mod tests {
     #[test]
     fn parse_function_call() {
         let stmt = parse("RETURN count(*)").unwrap();
-        if let Clause::Return(r) = &stmt.clauses[0] {
-            if let Expression::FunctionCall { name, args, .. } = &r.projections[0].expression {
+        if let Clause::Return(r) = &stmt.clauses[0]
+            && let Expression::FunctionCall { name, args, .. } = &r.projections[0].expression {
                 assert_eq!(name, "count");
                 assert_eq!(args.len(), 1);
             }
-        }
     }
 
     #[test]
     fn parse_function_call_with_args() {
         let stmt = parse("RETURN collect(n.name)").unwrap();
-        if let Clause::Return(r) = &stmt.clauses[0] {
-            if let Expression::FunctionCall { name, args, .. } = &r.projections[0].expression {
+        if let Clause::Return(r) = &stmt.clauses[0]
+            && let Expression::FunctionCall { name, args, .. } = &r.projections[0].expression {
                 assert_eq!(name, "collect");
                 assert_eq!(args.len(), 1);
             }
-        }
     }
 
     #[test]
@@ -1954,7 +1949,7 @@ mod tests {
         let result = parse_with_recovery("RETURN 1 @ RETURN 2");
         // May have partial output or errors — the important thing is it doesn't panic.
         // The first RETURN 1 should parse; the `@` is invalid.
-        assert!(!result.errors.is_empty() || result.statement.clauses.len() >= 1);
+        assert!(!result.errors.is_empty() || !result.statement.clauses.is_empty());
     }
 
     #[test]

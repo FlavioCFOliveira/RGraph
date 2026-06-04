@@ -525,9 +525,9 @@ mod tests {
 
     #[test]
     fn encode_property_value_float_roundtrip() {
-        let payload = 3.14f64.to_bits().to_be_bytes();
+        let payload = 2.5f64.to_bits().to_be_bytes();
         let encoded = encode_property_value(ValueType::Float64, &payload).unwrap();
         let (decoded, _) = decode(&encoded).unwrap();
-        assert_eq!(decoded.to_f64(), Some(3.14));
+        assert_eq!(decoded.to_f64(), Some(2.5));
     }
 }

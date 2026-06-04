@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn with_source_attaches_and_preserves_cause() {
-        let io_err = io::Error::new(io::ErrorKind::Other, "boom");
+        let io_err = io::Error::other("boom");
         let err = RGraphError::Storage("write failed".into()).with_source(io_err);
 
         // The message is the variant's own message...
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     fn clone_preserves_message_and_source() {
-        let io_err = io::Error::new(io::ErrorKind::Other, "boom");
+        let io_err = io::Error::other("boom");
         let err = RGraphError::Storage("oops".into()).with_source(io_err);
         let cloned = err.clone();
         assert_eq!(cloned.to_string(), err.to_string());

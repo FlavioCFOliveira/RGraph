@@ -653,6 +653,9 @@ impl GraphBuilder {
 
 #[cfg(test)]
 mod tests {
+    // Tests build a baseline via `Default` then tweak individual fields; this
+    // reads more clearly than a full struct literal for a many-field config.
+    #![allow(clippy::field_reassign_with_default)]
     use super::*;
 
     #[test]
