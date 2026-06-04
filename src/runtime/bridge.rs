@@ -1,11 +1,28 @@
 use crate::buffer::pool::BufferPool;
-use crate::io::{AlignedBuffer, FileSystem};
+use crate::io::{AlignedBuffer, FileHandle, FileSystem};
 use crate::storage::page::{PageId, PAGE_SIZE};
 use crate::wal::writer::WalWriter;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{spawn, JoinHandle};
+
+/// Open the data file once per worker, then reuse the resulting [`FileHandle`]
+/// for every page read/write.  This eliminates the per-request `open()` syscall
+/// that the bridge previously incurred.
+fn open_data_handle(
+    fs: &dyn FileSystem,
+    path: &std::path::Path,
+    open_count: &AtomicU64,
+    cached: &mut Option<Box<dyn FileHandle>>,
+) -> std::io::Result<()> {
+    if cached.is_none() {
+        let h = fs.open(path, false)?;
+        open_count.fetch_add(1, Ordering::Relaxed);
+        *cached = Some(h);
+    }
+    Ok(())
+}
 
 /// A command sent from the async/sync frontend to the storage backend.
 #[derive(Debug)]
@@ -137,6 +154,9 @@ pub struct IoBridge {
     shutdown: Arc<AtomicBool>,
     /// Thread handles.
     workers: Vec<JoinHandle<()>>,
+    /// Total number of times a worker opened the data file.  With persistent
+    /// fds this is at most `worker_count` for the bridge's whole lifetime.
+    data_open_count: Arc<AtomicU64>,
 }
 
 impl IoBridge {
@@ -151,6 +171,7 @@ impl IoBridge {
     ) -> Self {
         let (tx, rx): (Sender<IoCommand>, Receiver<IoCommand>) = bounded(channel_capacity);
         let shutdown = Arc::new(AtomicBool::new(false));
+        let data_open_count = Arc::new(AtomicU64::new(0));
         let mut workers = Vec::with_capacity(worker_count);
 
         for _ in 0..worker_count {
@@ -159,31 +180,56 @@ impl IoBridge {
             let pool = pool.clone();
             let fs = fs.clone();
             let wal = wal.clone();
+            let open_count = data_open_count.clone();
             workers.push(spawn(move || {
+                // Persistent, lazily-opened data-file handle reused across all
+                // requests this worker serves.
+                let mut data_handle: Option<Box<dyn FileHandle>> = None;
+
                 while !shutdown.load(Ordering::Relaxed) {
                     match rx.recv_timeout(std::time::Duration::from_millis(10)) {
                         Ok(IoCommand::ReadPage { page_id, respond }) => {
                             let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
                             let offset = page_id * PAGE_SIZE as u64;
-                            let res = match fs.open(&pool.data_path, false) {
-                                Ok(handle) => match handle.read_at(&mut buf, offset) {
-                                    Ok(()) => IoResponse::Ok(buf.to_vec()),
-                                    Err(e) => IoResponse::Err(e.to_string()),
-                                },
+                            let res = match open_data_handle(
+                                fs.as_ref(),
+                                &pool.data_path,
+                                &open_count,
+                                &mut data_handle,
+                            ) {
+                                Ok(()) => {
+                                    let handle = data_handle
+                                        .as_deref()
+                                        .expect("INVARIANT: handle opened above");
+                                    match handle.read_at(&mut buf, offset) {
+                                        Ok(()) => IoResponse::Ok(buf.to_vec()),
+                                        Err(e) => IoResponse::Err(e.to_string()),
+                                    }
+                                }
                                 Err(e) => IoResponse::Err(e.to_string()),
                             };
                             let _ = respond.send(res);
                         }
                         Ok(IoCommand::WritePage { page_id, buf, respond }) => {
                             let offset = page_id * PAGE_SIZE as u64;
-                            let res = match fs.open(&pool.data_path, false) {
-                                Ok(handle) => match handle.write_at(&buf, offset) {
-                                    Ok(()) => match handle.sync_data() {
-                                        Ok(()) => IoResponse::Ok(vec![]),
+                            let res = match open_data_handle(
+                                fs.as_ref(),
+                                &pool.data_path,
+                                &open_count,
+                                &mut data_handle,
+                            ) {
+                                Ok(()) => {
+                                    let handle = data_handle
+                                        .as_deref()
+                                        .expect("INVARIANT: handle opened above");
+                                    match handle.write_at(&buf, offset) {
+                                        Ok(()) => match handle.sync_data() {
+                                            Ok(()) => IoResponse::Ok(vec![]),
+                                            Err(e) => IoResponse::Err(e.to_string()),
+                                        },
                                         Err(e) => IoResponse::Err(e.to_string()),
-                                    },
-                                    Err(e) => IoResponse::Err(e.to_string()),
-                                },
+                                    }
+                                }
                                 Err(e) => IoResponse::Err(e.to_string()),
                             };
                             let _ = respond.send(res);
@@ -228,7 +274,17 @@ impl IoBridge {
             handle: IoHandle { tx },
             shutdown,
             workers,
+            data_open_count,
         }
+    }
+
+    /// Total number of `open()` calls workers have made on the data file.
+    ///
+    /// With persistent fds this saturates at the worker count: each worker
+    /// opens the data file at most once for its whole lifetime, regardless of
+    /// how many page requests it serves.
+    pub fn data_open_count(&self) -> u64 {
+        self.data_open_count.load(Ordering::Relaxed)
     }
 
     /// Signal workers to stop and wait for them.
@@ -348,6 +404,51 @@ mod tests {
         let (_dir, bridge, _pool, _wal) = setup_bridge(4);
         let res = bridge.handle.sync_wal_sync();
         assert!(matches!(res, IoResponse::Ok(_)), "sync failed");
+        bridge.stop();
+    }
+
+    #[test]
+    fn bridge_persistent_fd_does_not_reopen_per_request() {
+        // Use a single worker so the data-file open count is unambiguous, then
+        // serve many reads/writes and assert the file was opened at most once.
+        use crate::storage::page::{PageType, SlottedPage};
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("rgraph.db");
+        let wal_dir = dir.path().join("wal");
+        let fs = Arc::new(PosixFileSystem::new(false));
+        {
+            let mut f = std::fs::File::create(&data_path).unwrap();
+            f.set_len(64 * PAGE_SIZE as u64).unwrap();
+            f.flush().unwrap();
+            let handle = fs.open(&data_path, false).unwrap();
+            for pid in 0..64u64 {
+                let mut page = SlottedPage::init(pid, PageType::SlottedData);
+                page.update_checksum();
+                handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
+            }
+            handle.sync_data().unwrap();
+        }
+        let pool = Arc::new(BufferPool::new(4, data_path));
+        let wal = Arc::new(std::sync::Mutex::new(
+            WalWriter::open(wal_dir, fs.as_ref()).unwrap(),
+        ));
+        let bridge = IoBridge::new(pool.clone(), fs.clone(), wal.clone(), 1, 64);
+
+        for i in 0..40u64 {
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            buf[0] = (i & 0xFF) as u8;
+            assert!(matches!(
+                bridge.handle.write_page_sync(5, buf),
+                IoResponse::Ok(_)
+            ));
+            assert!(matches!(bridge.handle.read_page_sync(5), IoResponse::Ok(_)));
+        }
+
+        assert!(
+            bridge.data_open_count() <= 1,
+            "data file must be opened at most once per worker, got {}",
+            bridge.data_open_count()
+        );
         bridge.stop();
     }
 

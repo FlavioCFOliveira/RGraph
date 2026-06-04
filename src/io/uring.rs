@@ -1,3 +1,32 @@
+//! `io_uring`-backed [`FileSystem`] implementation and the project's async-I/O
+//! backend decision (Task 181).
+//!
+//! # Backend decision
+//!
+//! The `io-uring` dependency backs [`IoUringFileSystem`], a complete,
+//! test-covered [`FileSystem`] implementation that drives reads, writes, and
+//! `fsync` through a single kernel ring.  It is therefore a *used* dependency,
+//! not dead weight — it is kept.
+//!
+//! What this sprint deliberately does **not** do is wire io_uring's
+//! *asynchronous* completion-poller model directly into the tonic request hot
+//! path.  That is the higher-risk option the task flags, and doing it soundly
+//! (a per-runtime ring, a completion reactor, and cancellation-safe futures)
+//! is out of scope here.  Instead, the supported async backend is:
+//!
+//! 1. A **persistent file handle per I/O worker** (see
+//!    [`crate::runtime::scheduler::IoScheduler`] and
+//!    [`crate::runtime::bridge::IoBridge`]) — no `open()` per request.
+//! 2. Blocking [`FileSystem`] calls executed off the async reactor via
+//!    `spawn_blocking` / the dedicated I/O worker pool.
+//!
+//! Because every worker now submits through the [`FileSystem`] trait object
+//! while holding a long-lived handle, swapping in [`IoUringFileSystem`] on Linux
+//! is a *backend choice*, not a rewrite: construct the scheduler/bridge with an
+//! `Arc<IoUringFileSystem>` instead of `Arc<PosixFileSystem>`.  This keeps the
+//! io_uring fast path available and earned while avoiding an unsound async
+//! integration under time pressure.
+
 use super::{FileHandle, FileSystem};
 use io_uring::{opcode, types, IoUring};
 use std::fs::OpenOptions;
