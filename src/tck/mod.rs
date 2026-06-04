@@ -13,7 +13,12 @@
 //!   3. Expected results or error
 //!   4. Expected side effects
 
+use crate::cypher::parser::parse;
+use crate::cypher::planner::plan;
+use crate::cypher::physical::{execute_plan, ExecutionContext};
+use crate::cypher::value::Value;
 use crate::error::{ErrorPhase, ErrorRegistry, TckErrorClass};
+use crate::graph::builder::{NodeBuilder, RelationshipBuilder};
 use crate::graph::graph::Graph;
 use crate::graph::property::Property;
 use crate::graph::engine::StorageError;
@@ -188,56 +193,178 @@ impl TckHarness {
         supported.contains(&category.to_lowercase().as_str())
     }
 
+    /// Materialise the initial graph state by building nodes and relationships.
     fn setup_state(
-        _graph: &mut Graph,
-        _fs: &dyn crate::io::FileSystem,
-        _state: &GraphState,
+        graph: &mut Graph,
+        fs: &dyn crate::io::FileSystem,
+        state: &GraphState,
     ) -> Result<(), StorageError> {
-        // TODO: materialize initial graph state via CREATE statements.
+        let mut var_to_node_id: HashMap<String, u64> = HashMap::new();
+
+        // Create nodes.
+        for tck_node in &state.nodes {
+            let label_id = tck_node.labels.first()
+                .map(|l| graph.engine_mut().catalog_label_id(l))
+                .unwrap_or(0u32);
+            let mut builder = NodeBuilder::new().label(label_id);
+            for (k, v) in &tck_node.properties {
+                builder = builder.property(k.clone(), v.clone());
+            }
+            let (_, node_id) = graph.create_node(builder, fs)?;
+            var_to_node_id.insert(tck_node.variable.clone(), node_id);
+        }
+
+        // Create relationships.
+        for tck_rel in &state.relationships {
+            let src_id = *var_to_node_id.get(&tck_rel.source).ok_or(StorageError::NotFound)?;
+            let tgt_id = *var_to_node_id.get(&tck_rel.target).ok_or(StorageError::NotFound)?;
+            let type_id = graph.engine_mut().catalog().write()
+                .expect("catalog lock")
+                .get_or_create_rel_type(&tck_rel.rel_type);
+            let mut builder = RelationshipBuilder::new()
+                .from(src_id)
+                .to(tgt_id)
+                .rel_type(type_id);
+            for (k, v) in &tck_rel.properties {
+                builder = builder.property(k.clone(), v.clone());
+            }
+            graph.create_relationship(builder, fs)?;
+        }
+
         Ok(())
     }
 
     fn execute_and_validate(
         scenario: &TckScenario,
-        _graph: &mut Graph,
-        _fs: &dyn crate::io::FileSystem,
+        graph: &mut Graph,
+        fs: &dyn crate::io::FileSystem,
     ) -> TckResult {
-        // TODO: integrate with parser and execution engine.
-        // For Sprint 22 gate, we validate side-effect tracking structure.
-        let _side_effects = Self::compute_side_effects(&scenario.init_state);
-
         match &scenario.expected {
-            ExpectedResult::Table(_expected) => {
-                // TODO: compare result tables.
-                TckResult::Skip("result table comparison not yet implemented".to_string())
-            }
-            ExpectedResult::Error { error_class, phase } => {
-                // Validate error mapping through registry.
-                let mapped = Self::map_error_to_tck_class(&scenario.query);
-                match mapped {
-                    Some((cls, ph)) if cls == *error_class && ph == *phase => TckResult::Pass,
-                    Some((cls, ph)) => TckResult::Fail(format!(
-                        "expected {:?}/{:?}, got {:?}/{:?}",
-                        error_class, phase, cls, ph
-                    )),
-                    None => TckResult::Fail("no error produced".to_string()),
+            ExpectedResult::Table(expected_rows) => {
+                // Execute the query through the full pipeline.
+                let result = Self::execute_query(&scenario.query, graph, fs);
+                match result {
+                    Err(e) => TckResult::Fail(format!("unexpected error: {}", e)),
+                    Ok(query_result) => {
+                        // Compare row counts.
+                        if query_result.rows.len() != expected_rows.len() {
+                            return TckResult::Fail(format!(
+                                "expected {} rows, got {}",
+                                expected_rows.len(),
+                                query_result.rows.len()
+                            ));
+                        }
+                        // Compare row values (order-aware).
+                        for (row_idx, (actual_row, expected_row)) in
+                            query_result.rows.iter().zip(expected_rows.iter()).enumerate()
+                        {
+                            for (col_name, expected_val) in expected_row {
+                                let col_idx = query_result.columns.iter().position(|c| c == col_name);
+                                let Some(idx) = col_idx else {
+                                    return TckResult::Fail(format!(
+                                        "expected column '{}' not in result", col_name
+                                    ));
+                                };
+                                let actual_val = &actual_row[idx];
+                                let expected_cypher = property_to_value(expected_val);
+                                if actual_val.cypher_eq(&expected_cypher) != Some(Value::Boolean(true)) {
+                                    return TckResult::Fail(format!(
+                                        "row {} col '{}': expected {:?}, got {:?}",
+                                        row_idx, col_name, expected_val, actual_val
+                                    ));
+                                }
+                            }
+                        }
+                        TckResult::Pass
+                    }
                 }
             }
-            ExpectedResult::Empty => TckResult::Pass,
+            ExpectedResult::Error { error_class, phase } => {
+                let result = Self::execute_query(&scenario.query, graph, fs);
+                match result {
+                    Err(e) => {
+                        // Map the error to TCK class.
+                        let (cls, ph) = map_exec_error_to_tck(&e);
+                        if cls == *error_class && ph == *phase {
+                            TckResult::Pass
+                        } else {
+                            TckResult::Fail(format!(
+                                "expected {:?}/{:?}, got {:?}/{:?}: {}",
+                                error_class, phase, cls, ph, e
+                            ))
+                        }
+                    }
+                    Ok(_) => TckResult::Fail(format!(
+                        "expected error {:?}/{:?} but query succeeded",
+                        error_class, phase
+                    )),
+                }
+            }
+            ExpectedResult::Empty => {
+                match Self::execute_query(&scenario.query, graph, fs) {
+                    Ok(_) => TckResult::Pass,
+                    Err(e) => TckResult::Fail(format!("unexpected error: {}", e)),
+                }
+            }
         }
     }
 
-    fn compute_side_effects(state: &GraphState) -> SideEffects {
+    fn execute_query(
+        query: &str,
+        graph: &mut Graph,
+        fs: &dyn crate::io::FileSystem,
+    ) -> Result<crate::cypher::executor::QueryResult, String> {
+        let stmt = parse(query).map_err(|e| format!("parse error: {}", e))?;
+        let _ = crate::cypher::semantic::analyse(&stmt).map_err(|e| format!("semantic error: {}", e.message))?;
+        let logical = plan(&stmt).map_err(|e| format!("plan error: {}", e))?;
+        let ctx = ExecutionContext::new_with_write(graph.engine_mut(), fs);
+        execute_plan(&logical, &ctx).map_err(|e| format!("exec error: {}", e))
+    }
+
+    fn _compute_side_effects(state: &GraphState) -> SideEffects {
         SideEffects {
             nodes_created: state.nodes.len() as u64,
             ..Default::default()
         }
     }
 
-    fn map_error_to_tck_class(_query: &str) -> Option<(TckErrorClass, ErrorPhase)> {
-        // TODO: integrate with actual query execution and error registry.
-        // This is a placeholder that validates the mapping structure.
+    /// Map a Cypher query parse error to TCK error class.
+    ///
+    /// A syntax error (parse failure) maps to `SyntaxError/Compile`;
+    /// a semantic error maps to `SemanticError/Compile`;
+    /// a type error maps to `TypeError/Runtime`.
+    pub fn map_error_to_tck_class(query: &str) -> Option<(TckErrorClass, ErrorPhase)> {
+        // Try to parse.
+        match parse(query) {
+            Err(_) => return Some((TckErrorClass::SyntaxError, ErrorPhase::CompileTime)),
+            Ok(stmt) => {
+                // Try semantic analysis.
+                match crate::cypher::semantic::analyse(&stmt) {
+                    Err(_) => return Some((TckErrorClass::SemanticError, ErrorPhase::CompileTime)),
+                    Ok(_) => {}
+                }
+            }
+        }
         None
+    }
+}
+
+/// Convert a `Property` value to a runtime `Value` for comparison.
+fn property_to_value(prop: &Property) -> Value {
+    Value::from_property(prop.clone())
+}
+
+/// Map an execution error string to a TCK error class.
+fn map_exec_error_to_tck(err: &str) -> (TckErrorClass, ErrorPhase) {
+    let lower = err.to_lowercase();
+    if lower.contains("parse") || lower.contains("syntax") {
+        (TckErrorClass::SyntaxError, ErrorPhase::CompileTime)
+    } else if lower.contains("semantic") || lower.contains("undefined") || lower.contains("unresolved") {
+        (TckErrorClass::SemanticError, ErrorPhase::CompileTime)
+    } else if lower.contains("type") {
+        (TckErrorClass::TypeError, ErrorPhase::Runtime)
+    } else {
+        (TckErrorClass::SyntaxError, ErrorPhase::Runtime)
     }
 }
 

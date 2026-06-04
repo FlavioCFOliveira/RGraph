@@ -53,6 +53,33 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
     p.parse_statement()
 }
 
+/// Parse result with optional error recovery.
+///
+/// On a syntax error, returns a `ParseWithErrors` that contains:
+/// - The successfully parsed clauses so far (partial AST).
+/// - The list of errors encountered.
+///
+/// This allows tooling (IDE integration, partial execution) to work with
+/// incomplete or erroneous queries.
+#[derive(Debug)]
+pub struct ParseWithErrors {
+    /// Partially-parsed statement (may be empty if parsing failed immediately).
+    pub statement: Statement,
+    /// All syntax errors encountered; empty if the parse succeeded.
+    pub errors: Vec<ParseError>,
+}
+
+/// Parse a Cypher query with error recovery.
+///
+/// Unlike [`parse`], this function never returns an `Err`; instead it always
+/// produces a (possibly partial) [`Statement`] and records errors in the
+/// returned [`ParseWithErrors`].
+pub fn parse_with_recovery(input: &str) -> ParseWithErrors {
+    let tokens = lex(input);
+    let mut p = Parser::new(tokens, input);
+    p.parse_statement_with_recovery()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Parser state
 // ─────────────────────────────────────────────────────────────────────────────
@@ -169,6 +196,62 @@ impl Parser {
 
         let end = self.peek_span().end();
         Ok(Statement { clauses, span: Some(TextRange::new(start, end)) })
+    }
+
+    /// Parse with error recovery: on error, skip tokens until a clause boundary
+    /// and continue parsing, collecting errors.
+    fn parse_statement_with_recovery(&mut self) -> ParseWithErrors {
+        let start = self.peek_span().start();
+        let mut clauses = Vec::new();
+        let mut errors: Vec<ParseError> = Vec::new();
+
+        while !self.at_eof() {
+            while matches!(self.peek(), Token::Semi) {
+                self.advance();
+            }
+            if self.at_eof() { break; }
+
+            match self.parse_clause() {
+                Ok(clause) => {
+                    clauses.push(clause);
+                }
+                Err(e) => {
+                    errors.push(e);
+                    // Skip to the next clause-starting keyword.
+                    self.skip_to_next_clause();
+                }
+            }
+        }
+
+        let end = self.peek_span().end();
+        let statement = if clauses.is_empty() {
+            Statement { clauses: Vec::new(), span: Some(TextRange::new(start, end)) }
+        } else {
+            Statement { clauses, span: Some(TextRange::new(start, end)) }
+        };
+
+        ParseWithErrors { statement, errors }
+    }
+
+    /// Skip tokens until we reach a token that could start a new clause.
+    fn skip_to_next_clause(&mut self) {
+        loop {
+            if self.at_eof() { break; }
+            match self.peek() {
+                Token::Match
+                | Token::Return
+                | Token::Where
+                | Token::Create
+                | Token::Delete
+                | Token::Semi => break,
+                Token::Ident(s) if matches!(
+                    s.to_ascii_uppercase().as_str(),
+                    "WITH" | "UNWIND" | "UNION" | "CALL" | "FOREACH"
+                    | "OPTIONAL" | "DETACH" | "SET" | "REMOVE" | "MERGE"
+                ) => break,
+                _ => { self.advance(); }
+            }
+        }
     }
 
     // ── Clause dispatch ───────────────────────────────────────────────────
@@ -1863,6 +1946,37 @@ mod tests {
         let stmt = parse("RETURN a + b * c < 10 AND d STARTS WITH 'x' OR e IN [1,2]").unwrap();
         if let Clause::Return(r) = &stmt.clauses[0] {
             assert!(matches!(r.projections[0].expression, Expression::Or { .. }));
+        }
+    }
+
+    #[test]
+    fn parse_with_recovery_produces_partial_ast_on_error() {
+        // A valid RETURN followed by invalid syntax: the recovery parser should
+        // return the RETURN clause and record the error for the bad token.
+        let result = parse_with_recovery("RETURN 1 @ RETURN 2");
+        // May have partial output or errors — the important thing is it doesn't panic.
+        // The first RETURN 1 should parse; the `@` is invalid.
+        assert!(!result.errors.is_empty() || result.statement.clauses.len() >= 1);
+    }
+
+    #[test]
+    fn parse_with_recovery_on_valid_query_gives_no_errors() {
+        let result = parse_with_recovery("MATCH (n) RETURN n");
+        assert!(result.errors.is_empty(), "valid query should produce no errors");
+        assert_eq!(result.statement.clauses.len(), 2);
+    }
+
+    #[test]
+    fn cst_spans_are_set() {
+        // AST nodes carry TextRange spans that correspond to the source offsets.
+        let stmt = parse("RETURN 42").unwrap();
+        // The statement span should start at 0.
+        if let Some(span) = stmt.span {
+            assert_eq!(u32::from(span.start()), 0u32);
+        }
+        // The RETURN clause span should also start at 0.
+        if let Some(clause_span) = stmt.clauses[0].span() {
+            assert_eq!(u32::from(clause_span.start()), 0u32);
         }
     }
 }

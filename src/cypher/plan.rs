@@ -22,6 +22,9 @@ pub struct LogicalPlan {
 /// variable names to [`Value`](crate::cypher::value::Value).
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalOperator {
+    /// Yields exactly one empty row (used as the implicit input for RETURN-only queries).
+    SingleRow,
+
     /// Scan every node in the graph.
     AllNodesScan,
 
@@ -43,6 +46,20 @@ pub enum LogicalOperator {
         end_node_variable: Option<String>,
         // The variable in the input row that holds the start node.
         from_variable: String,
+    },
+
+    /// Variable-length path expansion (BFS/DFS with hop bounds).
+    VarLenExpand {
+        input: Box<LogicalOperator>,
+        direction: Direction,
+        rel_types: Vec<String>,
+        rel_variable: Option<String>,
+        end_node_variable: Option<String>,
+        from_variable: String,
+        /// Minimum number of hops (inclusive; default 1).
+        min_hops: u32,
+        /// Maximum number of hops (inclusive; `None` = unbounded).
+        max_hops: Option<u32>,
     },
 
     /// Apply a predicate to each input row and keep only matching rows.
@@ -190,6 +207,9 @@ impl LogicalOperator {
     fn explain_inner(&self, out: &mut String, depth: usize) {
         let indent = "  ".repeat(depth);
         match self {
+            LogicalOperator::SingleRow => {
+                out.push_str(&format!("{}SingleRow\n", indent));
+            }
             LogicalOperator::AllNodesScan => {
                 out.push_str(&format!("{}AllNodesScan\n", indent));
             }
@@ -227,6 +247,12 @@ impl LogicalOperator {
                 if let Some(ev) = end_node_variable {
                     out.push_str(&format!("{}  end: {}\n", indent, ev));
                 }
+                input.explain_inner(out, depth + 1);
+            }
+            LogicalOperator::VarLenExpand { input, direction, rel_types, min_hops, max_hops, from_variable, .. } => {
+                let dir_str = match direction { Direction::Outgoing => "->", Direction::Incoming => "<-", Direction::Both => "--" };
+                let max_str = max_hops.map(|m| m.to_string()).unwrap_or_else(|| "*".to_string());
+                out.push_str(&format!("{}VarLenExpand {} [{}] *{}..{} from {}\n", indent, dir_str, rel_types.join(":"), min_hops, max_str, from_variable));
                 input.explain_inner(out, depth + 1);
             }
             LogicalOperator::Filter { input, predicate } => {
@@ -319,6 +345,7 @@ impl LogicalOperator {
     pub fn output_variables(&self) -> Vec<String> {
         let mut vars = Vec::new();
         match self {
+            LogicalOperator::SingleRow => {}
             LogicalOperator::AllNodesScan => {}
             LogicalOperator::NodeByLabelScan { .. } => {}
             LogicalOperator::NodeByIdScan { .. } => {}
@@ -333,6 +360,10 @@ impl LogicalOperator {
                 if let Some(ev) = end_node_variable {
                     vars.push(ev.clone());
                 }
+            }
+            LogicalOperator::VarLenExpand { rel_variable, end_node_variable, .. } => {
+                if let Some(rv) = rel_variable { vars.push(rv.clone()); }
+                if let Some(ev) = end_node_variable { vars.push(ev.clone()); }
             }
             LogicalOperator::Filter { .. } => {}
             LogicalOperator::Project { projections, .. } => {
@@ -398,10 +429,14 @@ impl LogicalOperator {
     pub fn required_variables(&self) -> Vec<String> {
         let mut vars = Vec::new();
         match self {
+            LogicalOperator::SingleRow => {}
             LogicalOperator::AllNodesScan => {}
             LogicalOperator::NodeByLabelScan { .. } => {}
             LogicalOperator::NodeByIdScan { .. } => {}
             LogicalOperator::Expand { from_variable, .. } => {
+                vars.push(from_variable.clone());
+            }
+            LogicalOperator::VarLenExpand { from_variable, .. } => {
                 vars.push(from_variable.clone());
             }
             LogicalOperator::Filter { predicate, .. } => {

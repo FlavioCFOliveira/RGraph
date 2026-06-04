@@ -132,6 +132,24 @@ impl<'a> ExecutionContext<'a> {
 // Operator implementations
 // ------------------------------------------------------------------
 
+/// Yields exactly one empty row — used as the implicit input for RETURN-only queries.
+pub struct SingleRowOp {
+    emitted: bool,
+}
+
+impl SingleRowOp {
+    pub fn new() -> Self { Self { emitted: false } }
+}
+
+impl PhysicalOperator for SingleRowOp {
+    fn next_row(&mut self, _ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
+        if self.emitted { return Ok(None); }
+        self.emitted = true;
+        Ok(Some(empty_row()))
+    }
+    fn reset(&mut self) { self.emitted = false; }
+}
+
 /// Scan every node in the graph, binding each to `node_variable`.
 pub struct AllNodesScanOp {
     /// Pattern variable to bind the matched node under.
@@ -860,6 +878,169 @@ impl PhysicalOperator for EagerOp {
     fn reset(&mut self) {
         self.buffer = None;
         self.idx = 0;
+        self.input.reset();
+    }
+}
+
+/// Variable-length path expansion using BFS.
+///
+/// For each input row, expands from the bound start node through `min_hops`
+/// to `max_hops` relationships.  No repeated relationship edges (openCypher
+/// semantics for `[*m..n]`).
+pub struct VarLenExpandOp {
+    input: Box<dyn PhysicalOperator>,
+    direction: crate::cypher::ast::Direction,
+    rel_types: Vec<String>,
+    from_variable: String,
+    rel_variable: Option<String>,
+    end_node_variable: Option<String>,
+    min_hops: u32,
+    max_hops: Option<u32>,
+    /// Pending result rows.
+    pending: Vec<(u64, Vec<crate::graph::record::EdgeRecord>, Row)>,
+    pending_idx: usize,
+}
+
+impl VarLenExpandOp {
+    pub fn new(
+        input: Box<dyn PhysicalOperator>,
+        direction: crate::cypher::ast::Direction,
+        rel_types: Vec<String>,
+        from_variable: impl Into<String>,
+        rel_variable: Option<String>,
+        end_node_variable: Option<String>,
+        min_hops: u32,
+        max_hops: Option<u32>,
+    ) -> Self {
+        Self {
+            input,
+            direction,
+            rel_types,
+            from_variable: from_variable.into(),
+            rel_variable,
+            end_node_variable,
+            min_hops,
+            max_hops,
+            pending: Vec::new(),
+            pending_idx: 0,
+        }
+    }
+
+    /// BFS from `start_id`, collecting all reachable (end_node_id, path_edges)
+    /// pairs within the hop bounds.
+    fn bfs(
+        &self,
+        start_id: u64,
+        type_ids: &[u64],
+        ctx: &ExecutionContext,
+        input_row: &Row,
+    ) -> Result<Vec<(u64, Vec<crate::graph::record::EdgeRecord>, Row)>, ExecError> {
+        use std::collections::VecDeque;
+        let max = self.max_hops.unwrap_or(u32::MAX);
+
+        // Queue entries: (current_node_id, path_edges, visited_edge_ids).
+        let mut queue: VecDeque<(u64, Vec<crate::graph::record::EdgeRecord>, std::collections::HashSet<u64>)> = VecDeque::new();
+        queue.push_back((start_id, Vec::new(), std::collections::HashSet::new()));
+
+        let mut results = Vec::new();
+
+        while let Some((node_id, path, visited)) = queue.pop_front() {
+            let hops = path.len() as u32;
+            if hops >= max {
+                if hops >= self.min_hops {
+                    results.push((node_id, path, input_row.clone()));
+                }
+                continue;
+            }
+
+            if hops >= self.min_hops {
+                results.push((node_id, path.clone(), input_row.clone()));
+            }
+
+            // Expand edges.
+            let edges = match self.direction {
+                crate::cypher::ast::Direction::Outgoing =>
+                    ctx.engine.scan_outgoing_edges(node_id, type_ids, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?,
+                crate::cypher::ast::Direction::Incoming =>
+                    ctx.engine.scan_incoming_edges(node_id, type_ids, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?,
+                crate::cypher::ast::Direction::Both => {
+                    let mut o = ctx.engine.scan_outgoing_edges(node_id, type_ids, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?;
+                    let i = ctx.engine.scan_incoming_edges(node_id, type_ids, ctx.fs)
+                        .map_err(|e| ExecError::Eval(e.to_string()))?;
+                    o.extend(i);
+                    o
+                }
+            };
+
+            for (edge, end_id) in edges {
+                if visited.contains(&edge.edge_id) {
+                    continue; // no repeated relationships
+                }
+                let mut new_path = path.clone();
+                new_path.push(edge.clone());
+                let mut new_visited = visited.clone();
+                new_visited.insert(edge.edge_id);
+                queue.push_back((end_id, new_path, new_visited));
+            }
+        }
+
+        Ok(results)
+    }
+}
+
+impl PhysicalOperator for VarLenExpandOp {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
+        loop {
+            // Yield from pending first.
+            if self.pending_idx < self.pending.len() {
+                let (end_node_id, ref path, ref base_row) = self.pending[self.pending_idx].clone();
+                self.pending_idx += 1;
+                let mut row = base_row.clone();
+
+                if let Some(ev) = &self.end_node_variable {
+                    if let Ok(Some(nv)) = load_node_value(ctx.engine, end_node_id, ctx.fs) {
+                        row.insert(ev.clone(), nv);
+                    }
+                }
+
+                if let Some(rv) = &self.rel_variable {
+                    // Bind the path as a list of relationship values.
+                    let rels: Vec<Value> = path.iter()
+                        .map(|e| edge_record_to_value(e, ctx.engine, ctx.fs))
+                        .collect();
+                    row.insert(rv.clone(), Value::List(rels));
+                }
+                return Ok(Some(row));
+            }
+
+            // Need more input.
+            let Some(input_row) = self.input.next_row(ctx)? else {
+                return Ok(None);
+            };
+
+            let start_id = match input_row.get(&self.from_variable) {
+                Some(Value::Node(n)) => n.id,
+                Some(Value::Integer(id)) => *id as u64,
+                _ => continue,
+            };
+
+            let type_ids: Vec<u64> = self.rel_types.iter()
+                .filter_map(|t| ctx.engine.storage_label_id_for(t)
+                    .or_else(|| ctx.engine.catalog().read().ok()
+                        .and_then(|c| c.rel_type_id(t))
+                        .map(|id| id as u64)))
+                .collect();
+
+            self.pending = self.bfs(start_id, &type_ids, ctx, &input_row)?;
+            self.pending_idx = 0;
+        }
+    }
+    fn reset(&mut self) {
+        self.pending.clear();
+        self.pending_idx = 0;
         self.input.reset();
     }
 }
@@ -1686,6 +1867,7 @@ pub fn build_physical_plan(plan: &LogicalPlan) -> Box<dyn PhysicalOperator> {
 
 fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
     match op {
+        LogicalOperator::SingleRow => Box::new(SingleRowOp::new()),
         LogicalOperator::AllNodesScan => Box::new(AllNodesScanOp::new("_node")),
         LogicalOperator::NodeByLabelScan { label } => {
             Box::new(NodeByLabelScanOp::new("_node", label.clone()))
@@ -1708,6 +1890,25 @@ fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
             from_variable.clone(),
             rel_variable.clone(),
             end_node_variable.clone(),
+        )),
+        LogicalOperator::VarLenExpand {
+            input,
+            direction,
+            rel_types,
+            from_variable,
+            rel_variable,
+            end_node_variable,
+            min_hops,
+            max_hops,
+        } => Box::new(VarLenExpandOp::new(
+            build_physical_operator(input),
+            *direction,
+            rel_types.clone(),
+            from_variable.clone(),
+            rel_variable.clone(),
+            end_node_variable.clone(),
+            *min_hops,
+            *max_hops,
         )),
         LogicalOperator::Filter { input, predicate } => Box::new(FilterOp::new(
             predicate.clone(),
