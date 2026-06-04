@@ -1344,6 +1344,72 @@ impl GraphStorageEngine {
             Ok(None)
         }
     }
+
+    // ------------------------------------------------------------------
+    // Full-graph enumeration (used by CLI export / bulk dump — Task 179)
+    // ------------------------------------------------------------------
+
+    /// Enumerate every live node in the graph, in ascending `node_id` order.
+    ///
+    /// Range-scans the primary `node_index` over the full id space and
+    /// resolves each entry to its on-disk [`NodeRecord`].  Tombstoned records
+    /// (those whose index entry was dropped on delete) are not returned because
+    /// `delete_node` removes them from the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::IndexError`] if an index value cannot be decoded,
+    /// or propagates page-read failures.
+    pub fn scan_all_nodes(
+        &self,
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<NodeRecord>, StorageError> {
+        let start = node_id_key(0);
+        let end = node_id_key(u128::MAX);
+        let entries = self.node_index.range_search(&start, &end);
+        let mut results = Vec::with_capacity(entries.len());
+        for (_key, value) in entries {
+            let slot_ref = decode_slot_ref(&value).ok_or(StorageError::IndexError)?;
+            if let Some(record) = Self::read_record(&self.page_manager, slot_ref, fs)? {
+                if let Some(node) = NodeRecord::decode(&record) {
+                    if node.node_id != 0 && node.flags & node_flags::DELETED == 0 {
+                        results.push(node);
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Enumerate every live edge in the graph, in ascending `edge_id` order.
+    ///
+    /// Range-scans the primary `edge_index` over the full id space and resolves
+    /// each entry to its on-disk [`EdgeRecord`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::IndexError`] if an index value cannot be decoded,
+    /// or propagates page-read failures.
+    pub fn scan_all_edges(
+        &self,
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<EdgeRecord>, StorageError> {
+        let start = edge_id_key(0);
+        let end = edge_id_key(u128::MAX);
+        let entries = self.edge_index.range_search(&start, &end);
+        let mut results = Vec::with_capacity(entries.len());
+        for (_key, value) in entries {
+            let slot_ref = decode_slot_ref(&value).ok_or(StorageError::IndexError)?;
+            if let Some(record) = Self::read_record(&self.page_manager, slot_ref, fs)? {
+                if let Some(edge) = EdgeRecord::decode(&record) {
+                    if edge.edge_id != 0 && edge.flags & edge_flags::DELETED == 0 {
+                        results.push(edge);
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
 }
 
 /// Derive a lock-table resource ID for a node from its logical `node_id`.

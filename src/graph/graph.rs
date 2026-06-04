@@ -369,6 +369,48 @@ impl Graph {
         Ok(rels)
     }
 
+    /// Enumerate every live node in the graph with its materialised properties.
+    ///
+    /// Backed by [`GraphStorageEngine::scan_all_nodes`]; used by the CLI export
+    /// path (Task 179) to dump the full graph.
+    pub fn scan_all_nodes(&self, fs: &dyn FileSystem) -> Result<Vec<Node>, StorageError> {
+        let records = self.engine.scan_all_nodes(fs)?;
+        let mut nodes = Vec::with_capacity(records.len());
+        for r in records {
+            let properties = self.read_property_chain(r.first_property, fs)?;
+            nodes.push(Node {
+                node_id: r.node_id,
+                label_id: r.label_id,
+                properties,
+            });
+        }
+        Ok(nodes)
+    }
+
+    /// Enumerate every live relationship in the graph with its materialised
+    /// properties.
+    ///
+    /// Backed by [`GraphStorageEngine::scan_all_edges`]; used by the CLI export
+    /// path (Task 179).
+    pub fn scan_all_relationships(
+        &self,
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        let records = self.engine.scan_all_edges(fs)?;
+        let mut rels = Vec::with_capacity(records.len());
+        for r in records {
+            let properties = self.read_property_chain(r.first_property, fs)?;
+            rels.push(Relationship {
+                edge_id: r.edge_id,
+                type_id: r.type_id,
+                source_id: r.source_id,
+                target_id: r.target_id,
+                properties,
+            });
+        }
+        Ok(rels)
+    }
+
     /// Insert an entry into the property secondary index.
     ///
     /// This is a low-level operation exposed for testing; in production the

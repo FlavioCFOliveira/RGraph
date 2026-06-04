@@ -15,6 +15,8 @@ use rgraph::cypher::semantic::analyse;
 use rgraph::cypher::planner::plan;
 use rgraph::cypher::physical::{execute_plan, ExecutionContext};
 use rgraph::graph::engine::GraphStorageEngine;
+use rgraph::graph::graph::Graph;
+use rgraph::cli::{self, Format};
 
 #[derive(Parser)]
 #[command(name = "rgraph")]
@@ -93,8 +95,9 @@ enum Command {
         /// Input file to import.
         #[arg(short, long)]
         file: PathBuf,
-        /// Format: csv, jsonl, turtle.
-        #[arg(short, long, default_value = "csv")]
+        /// Format: csv, jsonl, turtle.  Inferred from the file extension when
+        /// the supplied value is not a recognised format name.
+        #[arg(long, default_value = "csv")]
         format: String,
     },
     /// Export data to Cypher or Turtle.
@@ -426,28 +429,151 @@ fn main() {
         }
         Command::Import { path, file, format } => {
             let _span = tracing::info_span!("cmd", command = "import", file = %file.display(), format = %format).entered();
-            info!("Importing {:?} as {} into {:?}", file, format, path);
-            println!("Import from {:?} (format: {}) into {:?}", file, format, path);
-            println!("Import is a stub — full implementation depends on the query execution engine (Sprint 21).");
+            if let Err(e) = run_import(&path, &file, &format, &fs) {
+                tracing::error!("import failed: {}", e);
+                eprintln!("Error: {}", e);
+                std::process::exit(8);
+            }
         }
         Command::Export { path, output, format, label } => {
             let _span = tracing::info_span!("cmd", command = "export", output = %output.display(), format = %format).entered();
-            info!("Exporting {:?} as {} to {:?}", path, format, output);
-            println!("Export to {:?} (format: {}) from {:?}", output, format, path);
-            if let Some(l) = label {
-                println!("  label filter: {}", l);
+            if let Err(e) = run_export(&path, &output, &format, label.as_deref(), &fs) {
+                tracing::error!("export failed: {}", e);
+                eprintln!("Error: {}", e);
+                std::process::exit(8);
             }
-            println!("Export is a stub — full implementation depends on the query execution engine (Sprint 21).");
         }
         Command::Benchmark { path, iterations, concurrency } => {
             let _span = tracing::info_span!("cmd", command = "benchmark", iterations = iterations, concurrency = concurrency).entered();
-            info!("Running benchmark on {:?} (iterations={}, concurrency={})", path, iterations, concurrency);
-            println!("Benchmark on {:?}", path);
-            println!("  iterations: {}", iterations);
-            println!("  concurrency: {}", concurrency);
-            println!("Benchmark is a stub — full implementation depends on the query execution engine (Sprint 21).");
+            if let Err(e) = run_benchmark(&path, iterations, concurrency, &fs) {
+                tracing::error!("benchmark failed: {}", e);
+                eprintln!("Error: {}", e);
+                std::process::exit(8);
+            }
         }
     }
+}
+
+/// Open or initialise a [`Graph`] at the database directory `path`.
+///
+/// `rgraph.db` lives inside `path`; if it does not exist a fresh engine is
+/// initialised so that `import` and `benchmark` work against an empty database.
+fn open_or_init_graph(
+    path: &std::path::Path,
+    fs: &impl rgraph::io::FileSystem,
+) -> Result<Graph, cli::CliError> {
+    let data_path = path.join("rgraph.db");
+    if !data_path.exists() {
+        if let Some(parent) = data_path.parent() {
+            fs.create_dir_all(parent)?;
+        }
+        let engine = GraphStorageEngine::init(data_path, fs)
+            .map_err(cli::CliError::Io)?;
+        Ok(Graph::new(engine))
+    } else {
+        let engine = GraphStorageEngine::open(data_path, fs)
+            .map_err(cli::CliError::Io)?;
+        Ok(Graph::new(engine))
+    }
+}
+
+/// Execute the `import` subcommand: parse `file` in `format` and load it.
+fn run_import(
+    path: &std::path::Path,
+    file: &std::path::Path,
+    format: &str,
+    fs: &impl rgraph::io::FileSystem,
+) -> Result<(), cli::CliError> {
+    // Explicit --format wins; otherwise infer from the file extension.
+    let fmt = match Format::parse(format) {
+        Ok(f) => f,
+        Err(_) => Format::from_extension(file)
+            .ok_or_else(|| cli::CliError::UnknownFormat(format.to_owned()))?,
+    };
+
+    let content = std::fs::read_to_string(file)?;
+    let records = cli::import::parse(&content, fmt)?;
+
+    let mut graph = open_or_init_graph(path, fs)?;
+    let counts = cli::import::apply_records(&mut graph, &records, fs)?;
+
+    info!(
+        "imported {} nodes and {} edges from {:?}",
+        counts.nodes, counts.edges, file
+    );
+    println!(
+        "Imported {} node(s) and {} edge(s) from {:?} (format: {:?})",
+        counts.nodes, counts.edges, file, fmt
+    );
+    Ok(())
+}
+
+/// Execute the `export` subcommand: dump the graph at `path` to `output`.
+///
+/// The optional `_label` filter is reserved for future use; the current
+/// exporter dumps the full graph.
+fn run_export(
+    path: &std::path::Path,
+    output: &std::path::Path,
+    format: &str,
+    _label: Option<&str>,
+    fs: &impl rgraph::io::FileSystem,
+) -> Result<(), cli::CliError> {
+    let fmt = match Format::parse(format) {
+        Ok(f) => f,
+        Err(_) => Format::from_extension(output)
+            .ok_or_else(|| cli::CliError::UnknownFormat(format.to_owned()))?,
+    };
+
+    let data_path = path.join("rgraph.db");
+    if !data_path.exists() {
+        return Err(cli::CliError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "database data file missing",
+        )));
+    }
+    let engine = GraphStorageEngine::open(data_path, fs).map_err(cli::CliError::Io)?;
+    let graph = Graph::new(engine);
+
+    // Stream to "-" (stdout) or to the named file.
+    let (nodes, edges) = if output == std::path::Path::new("-") {
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        cli::export::export(&graph, fmt, fs, &mut handle)?
+    } else {
+        let file = std::fs::File::create(output)?;
+        let mut writer = std::io::BufWriter::new(file);
+        let r = cli::export::export(&graph, fmt, fs, &mut writer)?;
+        use std::io::Write;
+        writer.flush()?;
+        r
+    };
+
+    info!("exported {} nodes and {} edges to {:?}", nodes, edges, output);
+    eprintln!(
+        "Exported {} node(s) and {} edge(s) to {:?} (format: {:?})",
+        nodes, edges, output, fmt
+    );
+    Ok(())
+}
+
+/// Execute the `benchmark` subcommand against the database at `path`.
+///
+/// `iterations` is split between an insert phase and an equal read phase;
+/// `concurrency` is recorded for context (the current loop is single-threaded
+/// to give a clean, low-variance latency baseline).
+fn run_benchmark(
+    path: &std::path::Path,
+    iterations: usize,
+    concurrency: usize,
+    fs: &impl rgraph::io::FileSystem,
+) -> Result<(), cli::CliError> {
+    let mut graph = open_or_init_graph(path, fs)?;
+    let report = cli::benchmark::run(&mut graph, iterations, iterations, fs)?;
+
+    println!("RGraph benchmark — {iterations} inserts, {iterations} reads (concurrency hint: {concurrency})");
+    print!("{}", report.render_table());
+    Ok(())
 }
 
 /// Resolve when the process receives a shutdown signal (Ctrl-C / SIGINT or
