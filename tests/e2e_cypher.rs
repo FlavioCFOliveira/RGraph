@@ -347,18 +347,135 @@ fn set_property_write_back_persists_across_statements_and_restart() {
 }
 
 // ------------------------------------------------------------------
-// MERGE is NOT asserted here.
+// Task 192: MERGE honours the inline property predicate in match-or-create.
 //
-// Verified during Task 185: against the real engine pipeline `MERGE (e:Person
-// {name: 'X'})` ignores the inline property predicate and matches the first
-// label-compatible node, so it never creates a node for an absent key and never
-// filters by properties (e.g. `MERGE (e:Person {name: 'Dave'})` against a graph
-// holding only Alice returns Alice instead of creating Dave).  Because MERGE
-// read-back does not work end-to-end, no MERGE behaviour is asserted as passing.
-// This gap is surfaced for its own rmp task (sibling to Tasks 189 and 190) and
-// will get a dedicated end-to-end MERGE test once the operator binds and honours
-// the pattern's property predicate.
+// `MERGE (e:Person {name: 'Dave'})` against a graph holding only Alice CREATES
+// Dave (no full match); merging an existing node matches it (no duplicate); a
+// repeated identical MERGE is idempotent; a partial property match still
+// creates a new node.
 // ------------------------------------------------------------------
+
+#[test]
+fn merge_honours_inline_property_predicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rgraph.db");
+    let fs = PosixFileSystem::new(false);
+    init_db(&db_path, &fs);
+
+    run_write(&db_path, "CREATE (a:Person {name: 'Alice', age: 30})", &fs);
+
+    // No node equals {name: 'Dave'} -> CREATE Dave, persisting the property.
+    let created = run_write(
+        &db_path,
+        "MERGE (e:Person {name: 'Dave'}) RETURN e.name AS name",
+        &fs,
+    );
+    assert_eq!(
+        string_column(&created, "name"),
+        vec!["Dave".to_string()],
+        "MERGE creates a node when no full-pattern match exists"
+    );
+    let after_create = run_write(
+        &db_path,
+        "MATCH (n) RETURN n.name AS name ORDER BY n.name",
+        &fs,
+    );
+    assert_eq!(
+        string_column(&after_create, "name"),
+        vec!["Alice".to_string(), "Dave".to_string()],
+        "Dave is now persisted alongside Alice"
+    );
+
+    // {name: 'Alice'} matches the existing node -> NO new node created.
+    let matched = run_write(
+        &db_path,
+        "MERGE (e:Person {name: 'Alice'}) RETURN e.name AS name",
+        &fs,
+    );
+    assert_eq!(string_column(&matched, "name"), vec!["Alice".to_string()]);
+    let after_match = run_write(
+        &db_path,
+        "MATCH (n) RETURN n.name AS name ORDER BY n.name",
+        &fs,
+    );
+    assert_eq!(
+        string_column(&after_match, "name"),
+        vec!["Alice".to_string(), "Dave".to_string()],
+        "matching MERGE must not create a duplicate"
+    );
+
+    // A second identical MERGE is idempotent — no duplicate Dave.
+    run_write(&db_path, "MERGE (e:Person {name: 'Dave'})", &fs);
+    let after_idempotent = run_write(
+        &db_path,
+        "MATCH (n) RETURN n.name AS name ORDER BY n.name",
+        &fs,
+    );
+    assert_eq!(
+        string_column(&after_idempotent, "name"),
+        vec!["Alice".to_string(), "Dave".to_string()],
+        "a repeated identical MERGE is idempotent"
+    );
+
+    // Partial match: Alice exists with age 30; {name:'Alice', age:99} differs on
+    // age, so it does NOT match and a new node is created.
+    let partial = run_write(
+        &db_path,
+        "MERGE (e:Person {name: 'Alice', age: 99}) RETURN e.age AS age",
+        &fs,
+    );
+    assert_eq!(
+        integer_column(&partial, "age"),
+        vec![99],
+        "a node differing on any inline property is not a match"
+    );
+    let after_partial = run_write(
+        &db_path,
+        "MATCH (n) WHERE n.name = 'Alice' RETURN n.age AS age ORDER BY n.age",
+        &fs,
+    );
+    assert_eq!(
+        integer_column(&after_partial, "age"),
+        vec![30, 99],
+        "MERGE on a full property predicate creates a second Alice (age 99)"
+    );
+}
+
+// ------------------------------------------------------------------
+// Task 192: MERGE created nodes (and their inline properties) survive a restart.
+// ------------------------------------------------------------------
+
+#[test]
+fn merge_created_node_persists_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rgraph.db");
+    let fs = PosixFileSystem::new(false);
+    init_db(&db_path, &fs);
+
+    run_write(&db_path, "MERGE (e:Person {name: 'Dave', age: 42})", &fs);
+
+    // Reopen, then a labelled MATCH must find Dave with his persisted property.
+    {
+        let mut engine = GraphStorageEngine::open(db_path.clone(), &fs).expect("reopen");
+        engine.sync(&fs).expect("sync");
+    }
+    let result = run_write(
+        &db_path,
+        "MATCH (n:Person) RETURN n.name AS name, n.age AS age",
+        &fs,
+    );
+    assert_eq!(string_column(&result, "name"), vec!["Dave".to_string()]);
+    assert_eq!(integer_column(&result, "age"), vec![42]);
+
+    // A MERGE after restart must MATCH the persisted Dave, not create a second.
+    run_write(&db_path, "MERGE (e:Person {name: 'Dave', age: 42})", &fs);
+    let count_check = run_write(&db_path, "MATCH (n) RETURN n.name AS name", &fs);
+    assert_eq!(
+        count_check.rows.len(),
+        1,
+        "MERGE after restart matches the persisted node (no duplicate)"
+    );
+}
 
 // ------------------------------------------------------------------
 // Persistence across a restart: CREATE -> sync -> drop -> reopen -> MATCH (n).

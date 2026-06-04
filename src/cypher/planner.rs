@@ -74,7 +74,7 @@ pub fn optimize(root: LogicalOperator) -> LogicalOperator {
     // Pass 1: push predicates into scans.
     let root = predicate_pushdown(root);
     // Pass 2: replace AllNodesScan + label filter with NodeByLabelScan.
-    
+
     label_scan_preference(root)
 }
 
@@ -118,7 +118,10 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
                     for np in &c.patterns {
                         elements.extend(np.pattern.elements.clone());
                     }
-                    Pattern { elements, span: None }
+                    Pattern {
+                        elements,
+                        span: None,
+                    }
                 };
                 current = Some(LogicalOperator::Create {
                     input: current.map(Box::new),
@@ -148,7 +151,12 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
                 });
             }
             Clause::Merge(m) => {
-                let input = current.unwrap_or(LogicalOperator::AllNodesScan);
+                // A standalone MERGE (no preceding read clause) must run exactly
+                // once, like a standalone CREATE — driven by a single empty row,
+                // NOT by an AllNodesScan (which would attempt the MERGE once per
+                // existing node).  When MERGE follows a read clause (e.g.
+                // `MATCH ... MERGE ...`), it runs once per upstream row.
+                let input = current.unwrap_or(LogicalOperator::SingleRow);
                 current = Some(LogicalOperator::Merge {
                     input: Box::new(input),
                     pattern: m.pattern.clone(),
@@ -189,8 +197,11 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
                 current = Some(LogicalOperator::Apply {
                     left: Box::new(input),
                     right: Box::new(LogicalOperator::NodeByLabelScan {
-                        label: format!("__UNWIND_{}_{}", u.variable,
-                            u.expression.to_string().replace(' ', "_")),
+                        label: format!(
+                            "__UNWIND_{}_{}",
+                            u.variable,
+                            u.expression.to_string().replace(' ', "_")
+                        ),
                     }),
                 });
             }
@@ -202,7 +213,10 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
             Clause::Call(c) => {
                 // Inline subquery: plan the sub-clauses.
                 if let Some(sub) = &c.subquery {
-                    let sub_stmt = Statement { clauses: sub.clone(), span: None };
+                    let sub_stmt = Statement {
+                        clauses: sub.clone(),
+                        span: None,
+                    };
                     let sub_plan = plan(&sub_stmt)?;
                     let input = current.unwrap_or(LogicalOperator::AllNodesScan);
                     current = Some(LogicalOperator::Apply {
@@ -216,7 +230,10 @@ pub fn plan(stmt: &Statement) -> Result<LogicalPlan, PlanError> {
                 // FOREACH: iterate list and execute body writes.
                 // Model as a nested Apply over the body plan.
                 let input = current.unwrap_or(LogicalOperator::AllNodesScan);
-                let body_stmt = Statement { clauses: fe.body.clone(), span: None };
+                let body_stmt = Statement {
+                    clauses: fe.body.clone(),
+                    span: None,
+                };
                 if let Ok(body_plan) = plan(&body_stmt) {
                     current = Some(LogicalOperator::Apply {
                         left: Box::new(input),
@@ -265,10 +282,14 @@ fn build_match_plan(
                 // If we have an incoming current_op from a previous pattern segment,
                 // wrap it — otherwise build a fresh scan.
                 if current_op.is_none() {
-                    let node_var = node.variable.clone()
+                    let node_var = node
+                        .variable
+                        .clone()
                         .unwrap_or_else(|| format!("__anon_{}", i));
                     let scan = if let Some(label) = node.labels.first() {
-                        LogicalOperator::NodeByLabelScan { label: label.clone() }
+                        LogicalOperator::NodeByLabelScan {
+                            label: label.clone(),
+                        }
                     } else {
                         LogicalOperator::AllNodesScan
                     };
@@ -285,7 +306,9 @@ fn build_match_plan(
                     current_op = Some(renamed);
                     last_node_var = Some(node_var);
                 } else {
-                    last_node_var = node.variable.clone()
+                    last_node_var = node
+                        .variable
+                        .clone()
                         .or_else(|| Some(format!("__anon_{}", i)));
                 }
                 i += 1;
@@ -294,7 +317,11 @@ fn build_match_plan(
                 let from_var = last_node_var.clone().unwrap_or_else(|| "_".to_string());
                 // Peek the next node.
                 let end_node_var = elems.get(i + 1).and_then(|e| {
-                    if let PatternElement::Node(n) = e { n.variable.clone() } else { None }
+                    if let PatternElement::Node(n) = e {
+                        n.variable.clone()
+                    } else {
+                        None
+                    }
                 });
 
                 let input_op = Box::new(current_op.unwrap_or(LogicalOperator::AllNodesScan));
@@ -342,7 +369,6 @@ fn build_match_plan(
         message: "empty MATCH pattern".to_string(),
     })
 }
-
 
 // ------------------------------------------------------------------
 // Return planning
@@ -455,12 +481,16 @@ fn is_aggregate_expression(expr: &Expression) -> bool {
 }
 
 /// Extract aggregate function details from an expression.
-fn extract_aggregate(expr: &Expression) -> Option<(
-    crate::cypher::plan::AggregateFunction,
-    Expression,
-    bool,
-)> {
-    if let Expression::FunctionCall { name, args, distinct, .. } = expr {
+fn extract_aggregate(
+    expr: &Expression,
+) -> Option<(crate::cypher::plan::AggregateFunction, Expression, bool)> {
+    if let Expression::FunctionCall {
+        name,
+        args,
+        distinct,
+        ..
+    } = expr
+    {
         let func = match name.to_ascii_uppercase().as_str() {
             "COUNT" => crate::cypher::plan::AggregateFunction::Count,
             "COLLECT" => crate::cypher::plan::AggregateFunction::Collect,
@@ -470,9 +500,10 @@ fn extract_aggregate(expr: &Expression) -> Option<(
             "MAX" => crate::cypher::plan::AggregateFunction::Max,
             _ => return None,
         };
-        let arg = args.first().cloned().unwrap_or(Expression::Literal(
-            crate::cypher::ast::Literal::Null,
-        ));
+        let arg = args
+            .first()
+            .cloned()
+            .unwrap_or(Expression::Literal(crate::cypher::ast::Literal::Null));
         return Some((func, arg, *distinct));
     }
     None
@@ -576,10 +607,23 @@ fn insert_eager(op: LogicalOperator) -> LogicalOperator {
             projections,
         },
         LogicalOperator::VarLenExpand {
-            input, direction, rel_types, rel_variable, end_node_variable, from_variable, min_hops, max_hops,
+            input,
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+            min_hops,
+            max_hops,
         } => LogicalOperator::VarLenExpand {
             input: Box::new(insert_eager(*input)),
-            direction, rel_types, rel_variable, end_node_variable, from_variable, min_hops, max_hops,
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+            min_hops,
+            max_hops,
         },
         LogicalOperator::Expand {
             input,
@@ -653,12 +697,8 @@ fn insert_eager(op: LogicalOperator) -> LogicalOperator {
         // Leaf scans — nothing to rewrite.
         LogicalOperator::SingleRow => LogicalOperator::SingleRow,
         LogicalOperator::AllNodesScan => LogicalOperator::AllNodesScan,
-        LogicalOperator::NodeByLabelScan { label } => {
-            LogicalOperator::NodeByLabelScan { label }
-        }
-        LogicalOperator::NodeByIdScan { node_id } => {
-            LogicalOperator::NodeByIdScan { node_id }
-        }
+        LogicalOperator::NodeByLabelScan { label } => LogicalOperator::NodeByLabelScan { label },
+        LogicalOperator::NodeByIdScan { node_id } => LogicalOperator::NodeByIdScan { node_id },
     }
 }
 
@@ -738,8 +778,12 @@ fn collect_read_footprint(op: &LogicalOperator, fp: &mut ReadFootprint) {
         // A by-id lookup targets one pre-existing node; a freshly created node
         // gets a brand-new id, so it can never satisfy this scan.
         LogicalOperator::NodeByIdScan { .. } => {}
-        LogicalOperator::Expand { input, rel_types, .. }
-        | LogicalOperator::VarLenExpand { input, rel_types, .. } => {
+        LogicalOperator::Expand {
+            input, rel_types, ..
+        }
+        | LogicalOperator::VarLenExpand {
+            input, rel_types, ..
+        } => {
             if rel_types.is_empty() {
                 fp.any_rel = true;
             } else {
@@ -765,8 +809,7 @@ fn collect_read_footprint(op: &LogicalOperator, fp: &mut ReadFootprint) {
                 collect_read_footprint(inp, fp);
             }
         }
-        LogicalOperator::Apply { left, right }
-        | LogicalOperator::HashJoin { left, right, .. } => {
+        LogicalOperator::Apply { left, right } | LogicalOperator::HashJoin { left, right, .. } => {
             collect_read_footprint(left, fp);
             collect_read_footprint(right, fp);
         }
@@ -834,24 +877,51 @@ fn predicate_pushdown(op: LogicalOperator) -> LogicalOperator {
             input: Box::new(predicate_pushdown(*input)),
             expression,
         },
-        LogicalOperator::Expand { input, direction, rel_types, rel_variable, end_node_variable, from_variable } => {
-            LogicalOperator::Expand {
-                input: Box::new(predicate_pushdown(*input)),
-                direction, rel_types, rel_variable, end_node_variable, from_variable,
-            }
-        }
-        LogicalOperator::VarLenExpand { input, direction, rel_types, rel_variable, end_node_variable, from_variable, min_hops, max_hops } => {
-            LogicalOperator::VarLenExpand {
-                input: Box::new(predicate_pushdown(*input)),
-                direction, rel_types, rel_variable, end_node_variable, from_variable, min_hops, max_hops,
-            }
-        }
+        LogicalOperator::Expand {
+            input,
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+        } => LogicalOperator::Expand {
+            input: Box::new(predicate_pushdown(*input)),
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+        },
+        LogicalOperator::VarLenExpand {
+            input,
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+            min_hops,
+            max_hops,
+        } => LogicalOperator::VarLenExpand {
+            input: Box::new(predicate_pushdown(*input)),
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+            min_hops,
+            max_hops,
+        },
         LogicalOperator::Eager { input } => LogicalOperator::Eager {
             input: Box::new(predicate_pushdown(*input)),
         },
-        LogicalOperator::Aggregate { input, grouping_keys, aggregations } => LogicalOperator::Aggregate {
+        LogicalOperator::Aggregate {
+            input,
+            grouping_keys,
+            aggregations,
+        } => LogicalOperator::Aggregate {
             input: Box::new(predicate_pushdown(*input)),
-            grouping_keys, aggregations,
+            grouping_keys,
+            aggregations,
         },
         // Write operators and leaf scans: no child recursion needed.
         other => other,
@@ -893,21 +963,48 @@ fn label_scan_preference(op: LogicalOperator) -> LogicalOperator {
             input: Box::new(label_scan_preference(*input)),
             expression,
         },
-        LogicalOperator::Expand { input, direction, rel_types, rel_variable, end_node_variable, from_variable } => {
-            LogicalOperator::Expand {
-                input: Box::new(label_scan_preference(*input)),
-                direction, rel_types, rel_variable, end_node_variable, from_variable,
-            }
-        }
-        LogicalOperator::VarLenExpand { input, direction, rel_types, rel_variable, end_node_variable, from_variable, min_hops, max_hops } => {
-            LogicalOperator::VarLenExpand {
-                input: Box::new(label_scan_preference(*input)),
-                direction, rel_types, rel_variable, end_node_variable, from_variable, min_hops, max_hops,
-            }
-        }
-        LogicalOperator::Aggregate { input, grouping_keys, aggregations } => LogicalOperator::Aggregate {
+        LogicalOperator::Expand {
+            input,
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+        } => LogicalOperator::Expand {
             input: Box::new(label_scan_preference(*input)),
-            grouping_keys, aggregations,
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+        },
+        LogicalOperator::VarLenExpand {
+            input,
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+            min_hops,
+            max_hops,
+        } => LogicalOperator::VarLenExpand {
+            input: Box::new(label_scan_preference(*input)),
+            direction,
+            rel_types,
+            rel_variable,
+            end_node_variable,
+            from_variable,
+            min_hops,
+            max_hops,
+        },
+        LogicalOperator::Aggregate {
+            input,
+            grouping_keys,
+            aggregations,
+        } => LogicalOperator::Aggregate {
+            input: Box::new(label_scan_preference(*input)),
+            grouping_keys,
+            aggregations,
         },
         LogicalOperator::Eager { input } => LogicalOperator::Eager {
             input: Box::new(label_scan_preference(*input)),

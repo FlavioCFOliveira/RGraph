@@ -1408,134 +1408,10 @@ impl SetOp {
 
 impl PhysicalOperator for SetOp {
     fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
-        use crate::cypher::ast::{Expression, SetItem};
-        use crate::cypher::interpreter::evaluate;
         match self.input.next_row(ctx)? {
             None => Ok(None),
             Some(mut row) => {
-                // Track which row variables had their properties mutated so we
-                // can flush each entity's full property map to storage once,
-                // after applying every SET item, within this statement.
-                let mut mutated: Vec<String> = Vec::new();
-                let mark_mutated = |var: &str, mutated: &mut Vec<String>| {
-                    if !mutated.iter().any(|v| v == var) {
-                        mutated.push(var.to_string());
-                    }
-                };
-
-                for item in &self.items {
-                    let eval_ctx = row_to_eval_context(&row, ctx);
-                    match item {
-                        SetItem::Property { target, value } => {
-                            let new_val = evaluate(value, &eval_ctx)
-                                .map_err(|e| ExecError::Eval(e.to_string()))?;
-                            if let Expression::PropertyAccess { base, property, .. } =
-                                target.as_ref()
-                                && let Expression::Variable(var) = base.as_ref()
-                                && let Some(val) = row.get_mut(var)
-                            {
-                                match val {
-                                    Value::Node(n) => {
-                                        // SET n.prop = NULL removes the property
-                                        // (openCypher semantics).
-                                        if matches!(new_val, Value::Null) {
-                                            n.properties.remove(property);
-                                        } else {
-                                            n.properties.insert(property.clone(), new_val);
-                                        }
-                                        mark_mutated(var, &mut mutated);
-                                    }
-                                    Value::Relationship(r) => {
-                                        if matches!(new_val, Value::Null) {
-                                            r.properties.remove(property);
-                                        } else {
-                                            r.properties.insert(property.clone(), new_val);
-                                        }
-                                        mark_mutated(var, &mut mutated);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        SetItem::Label { variable, labels } => {
-                            // Label addition updates the in-row value; durable
-                            // multi-label storage is not yet modelled (the node
-                            // record carries a single label_id), so this remains
-                            // an in-statement projection only.
-                            if let Some(Value::Node(n)) = row.get_mut(variable) {
-                                for label in labels {
-                                    if !n.labels.contains(label) {
-                                        n.labels.push(label.clone());
-                                    }
-                                }
-                            }
-                        }
-                        SetItem::Merge { variable, value } => {
-                            // `n += {map}`: merge the map's entries on top of the
-                            // existing properties.
-                            let new_val = evaluate(value, &eval_ctx)
-                                .map_err(|e| ExecError::Eval(e.to_string()))?;
-                            if let Value::Map(props) = new_val
-                                && let Some(Value::Node(n)) = row.get_mut(variable)
-                            {
-                                for (k, v) in props {
-                                    if matches!(v, Value::Null) {
-                                        n.properties.remove(&k);
-                                    } else {
-                                        n.properties.insert(k, v);
-                                    }
-                                }
-                                mark_mutated(variable, &mut mutated);
-                            }
-                        }
-                        SetItem::Replace { variable, value } => {
-                            // `n = {map}`: replace ALL properties with the map.
-                            let new_val = evaluate(value, &eval_ctx)
-                                .map_err(|e| ExecError::Eval(e.to_string()))?;
-                            if let Value::Map(props) = new_val
-                                && let Some(Value::Node(n)) = row.get_mut(variable)
-                            {
-                                n.properties.clear();
-                                for (k, v) in props {
-                                    if !matches!(v, Value::Null) {
-                                        n.properties.insert(k, v);
-                                    }
-                                }
-                                mark_mutated(variable, &mut mutated);
-                            }
-                        }
-                    }
-                }
-
-                // Flush mutated entities' full property maps to durable storage
-                // so a later MATCH (and a restart) reads the new values
-                // (rmp Task 191).
-                if !mutated.is_empty() {
-                    // SAFETY: single-threaded execution; the context holds the
-                    // sole mutable engine borrow. See ExecutionContext::
-                    // engine_ptr_mut for the invariants.
-                    let engine = unsafe { &mut *ctx.engine_ptr_mut() };
-                    for var in &mutated {
-                        match row.get(var) {
-                            Some(Value::Node(n)) => {
-                                let props = node_properties_to_storage(&n.properties);
-                                crate::graph::graph::rewrite_node_properties_engine(
-                                    engine, n.id, props, ctx.fs,
-                                )
-                                .map_err(|e| ExecError::Eval(e.to_string()))?;
-                            }
-                            Some(Value::Relationship(r)) => {
-                                let props = node_properties_to_storage(&r.properties);
-                                crate::graph::graph::rewrite_edge_properties_engine(
-                                    engine, r.id, props, ctx.fs,
-                                )
-                                .map_err(|e| ExecError::Eval(e.to_string()))?;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
+                apply_set_items_durable(&mut row, &self.items, ctx)?;
                 Ok(Some(row))
             }
         }
@@ -1544,6 +1420,137 @@ impl PhysicalOperator for SetOp {
     fn reset(&mut self) {
         self.input.reset();
     }
+}
+
+/// Apply a list of `SET` items to `row`, mutating the in-row entity values and
+/// flushing every touched node/relationship's full property map to durable
+/// storage within the current statement (rmp Task 191).
+///
+/// Shared by [`SetOp`] and [`MergeOp`]'s ON CREATE / ON MATCH branches.
+///
+/// Property values that evaluate to `NULL` remove the property (openCypher
+/// semantics).  `SET :Label` updates the in-row labels only — durable
+/// multi-label storage is not yet modelled (the node record carries a single
+/// `label_id`).  Map forms `n += {map}` (merge) and `n = {map}` (replace) are
+/// supported.
+fn apply_set_items_durable(
+    row: &mut Row,
+    items: &[SetItem],
+    ctx: &ExecutionContext,
+) -> Result<(), ExecError> {
+    use crate::cypher::ast::Expression;
+    use crate::cypher::interpreter::evaluate;
+
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    // Track which row variables had their properties mutated so each entity's
+    // full property map is flushed exactly once, after all items are applied.
+    let mut mutated: Vec<String> = Vec::new();
+    let mark_mutated = |var: &str, mutated: &mut Vec<String>| {
+        if !mutated.iter().any(|v| v == var) {
+            mutated.push(var.to_string());
+        }
+    };
+
+    for item in items {
+        let eval_ctx = row_to_eval_context(row, ctx);
+        match item {
+            SetItem::Property { target, value } => {
+                let new_val =
+                    evaluate(value, &eval_ctx).map_err(|e| ExecError::Eval(e.to_string()))?;
+                if let Expression::PropertyAccess { base, property, .. } = target.as_ref()
+                    && let Expression::Variable(var) = base.as_ref()
+                    && let Some(val) = row.get_mut(var)
+                {
+                    match val {
+                        Value::Node(n) => {
+                            if matches!(new_val, Value::Null) {
+                                n.properties.remove(property);
+                            } else {
+                                n.properties.insert(property.clone(), new_val);
+                            }
+                            mark_mutated(var, &mut mutated);
+                        }
+                        Value::Relationship(r) => {
+                            if matches!(new_val, Value::Null) {
+                                r.properties.remove(property);
+                            } else {
+                                r.properties.insert(property.clone(), new_val);
+                            }
+                            mark_mutated(var, &mut mutated);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            SetItem::Label { variable, labels } => {
+                if let Some(Value::Node(n)) = row.get_mut(variable) {
+                    for label in labels {
+                        if !n.labels.contains(label) {
+                            n.labels.push(label.clone());
+                        }
+                    }
+                }
+            }
+            SetItem::Merge { variable, value } => {
+                let new_val =
+                    evaluate(value, &eval_ctx).map_err(|e| ExecError::Eval(e.to_string()))?;
+                if let Value::Map(props) = new_val
+                    && let Some(Value::Node(n)) = row.get_mut(variable)
+                {
+                    for (k, v) in props {
+                        if matches!(v, Value::Null) {
+                            n.properties.remove(&k);
+                        } else {
+                            n.properties.insert(k, v);
+                        }
+                    }
+                    mark_mutated(variable, &mut mutated);
+                }
+            }
+            SetItem::Replace { variable, value } => {
+                let new_val =
+                    evaluate(value, &eval_ctx).map_err(|e| ExecError::Eval(e.to_string()))?;
+                if let Value::Map(props) = new_val
+                    && let Some(Value::Node(n)) = row.get_mut(variable)
+                {
+                    n.properties.clear();
+                    for (k, v) in props {
+                        if !matches!(v, Value::Null) {
+                            n.properties.insert(k, v);
+                        }
+                    }
+                    mark_mutated(variable, &mut mutated);
+                }
+            }
+        }
+    }
+
+    if mutated.is_empty() {
+        return Ok(());
+    }
+
+    // SAFETY: single-threaded execution; the context holds the sole mutable
+    // engine borrow. See ExecutionContext::engine_ptr_mut for the invariants.
+    let engine = unsafe { &mut *ctx.engine_ptr_mut() };
+    for var in &mutated {
+        match row.get(var) {
+            Some(Value::Node(n)) => {
+                let props = node_properties_to_storage(&n.properties);
+                crate::graph::graph::rewrite_node_properties_engine(engine, n.id, props, ctx.fs)
+                    .map_err(|e| ExecError::Eval(e.to_string()))?;
+            }
+            Some(Value::Relationship(r)) => {
+                let props = node_properties_to_storage(&r.properties);
+                crate::graph::graph::rewrite_edge_properties_engine(engine, r.id, props, ctx.fs)
+                    .map_err(|e| ExecError::Eval(e.to_string()))?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Remove properties or labels from existing entities.
@@ -1602,16 +1609,14 @@ impl PhysicalOperator for RemoveOp {
 }
 
 /// MERGE pattern with ON CREATE / ON MATCH actions.
+///
+/// Implements the single-node MERGE: match an existing node that equals the
+/// pattern on its label *and every inline property*, otherwise create one with
+/// those properties (persisted).  ON CREATE / ON MATCH SET items are then
+/// applied durably via the same write path as `SET` (rmp Task 191).
 pub struct MergeOp {
     pattern: crate::cypher::ast::Pattern,
-    // TODO(cypher-merge): ON CREATE / ON MATCH SET items are carried from the
-    // logical plan but not yet applied by `next_row` (the current operator only
-    // implements the match-or-create core). Wiring these into the create/match
-    // branches is tracked as the MERGE write-back work; keep the fields so the
-    // plan data is preserved until then.
-    #[allow(dead_code)]
     on_create: Vec<SetItem>,
-    #[allow(dead_code)]
     on_match: Vec<SetItem>,
     input: Box<dyn PhysicalOperator>,
 }
@@ -1630,85 +1635,141 @@ impl MergeOp {
             input,
         }
     }
+
+    /// Evaluate the inline property map of a MERGE node pattern against the
+    /// surrounding row, returning `(key, value)` pairs (skipping entries that
+    /// evaluate to an error).
+    fn eval_inline_properties(
+        node: &crate::cypher::ast::NodePattern,
+        row: &Row,
+        ctx: &ExecutionContext,
+    ) -> Result<Vec<(String, Value)>, ExecError> {
+        let eval_ctx = row_to_eval_context(row, ctx);
+        let mut out = Vec::with_capacity(node.properties.len());
+        for (k, expr) in &node.properties {
+            let v = evaluate(expr, &eval_ctx).map_err(|e| ExecError::Eval(e.to_string()))?;
+            out.push((k.clone(), v));
+        }
+        Ok(out)
+    }
+
+    /// Find an existing live node matching `label` (if any) and equal on *every*
+    /// inline property in `wanted`.  Returns the bound node value, or `None`.
+    fn find_full_match(
+        node: &crate::cypher::ast::NodePattern,
+        wanted: &[(String, Value)],
+        ctx: &ExecutionContext,
+    ) -> Result<Option<Value>, ExecError> {
+        use crate::graph::record::node_flags;
+
+        // Candidate set: nodes carrying the requested label, or every node when
+        // the pattern is unlabelled.
+        let records = match node.labels.first() {
+            Some(label) => {
+                let label_id = ctx.engine.storage_label_id_for(label).unwrap_or(0u64);
+                ctx.engine
+                    .scan_nodes_by_label(label_id, ctx.fs)
+                    .map_err(|e| ExecError::Eval(e.to_string()))?
+            }
+            None => ctx
+                .engine
+                .scan_all_nodes(ctx.fs)
+                .map_err(|e| ExecError::Eval(e.to_string()))?,
+        };
+
+        for record in records {
+            if record.flags & node_flags::DELETED != 0 {
+                continue;
+            }
+            let Some(Value::Node(candidate)) = load_node_value(ctx.engine, record.node_id, ctx.fs)?
+            else {
+                continue;
+            };
+            // Every inline property must be present and equal.
+            let all_match = wanted.iter().all(|(k, want)| {
+                candidate
+                    .properties
+                    .get(k)
+                    .is_some_and(|have| values_equal_for_merge(have, want))
+            });
+            if all_match {
+                return Ok(Some(Value::Node(candidate)));
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl PhysicalOperator for MergeOp {
     fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
-        // MERGE: try to MATCH the pattern; on failure, CREATE it.
-        // This is a simplified single-node MERGE for now.
-        // Full relationship MERGE support will be added in Sprint D.
+        use crate::cypher::ast::PatternElement;
+        use crate::graph::builder::NodeBuilder;
+        use crate::graph::graph::Graph;
+
         let Some(input_row) = self.input.next_row(ctx)? else {
             return Ok(None);
         };
 
-        // Check if pattern already matches.
-        let mut matched_row = input_row.clone();
-        let mut any_matched = false;
+        // Locate the single node element of the MERGE pattern.  Relationship
+        // MERGE is not yet modelled; a pattern with no node element passes the
+        // row through unchanged.
+        let Some(PatternElement::Node(node)) = self
+            .pattern
+            .elements
+            .iter()
+            .find(|e| matches!(e, PatternElement::Node(_)))
+        else {
+            return Ok(Some(input_row));
+        };
 
-        for elem in &self.pattern.elements {
-            if let crate::cypher::ast::PatternElement::Node(n) = elem
-                && let Some(var) = &n.variable
-            {
-                // Skip if variable already bound in input.
-                if input_row.contains_key(var) {
-                    any_matched = true;
-                    continue;
-                }
-                // Try to find a matching node.
-                let label_id = n
-                    .labels
-                    .first()
-                    .and_then(|l| ctx.engine.storage_label_id_for(l))
-                    .unwrap_or(0u64);
-                let nodes = ctx
-                    .engine
-                    .scan_nodes_by_label(label_id, ctx.fs)
-                    .map_err(|e| ExecError::Eval(e.to_string()))?;
+        let mut row = input_row;
 
-                let found = nodes
-                    .into_iter()
-                    .find(|r| r.flags & crate::graph::record::node_flags::DELETED == 0);
-
-                if let Some(record) = found
-                    && let Ok(Some(nv)) = load_node_value(ctx.engine, record.node_id, ctx.fs)
-                {
-                    matched_row.insert(var.clone(), nv);
-                    any_matched = true;
-                }
-            }
+        // If the node variable is already bound upstream, treat it as a match
+        // and keep the binding (MERGE over an already-bound variable).
+        if let Some(var) = &node.variable
+            && row.contains_key(var)
+        {
+            apply_set_items_durable(&mut row, &self.on_match, ctx)?;
+            return Ok(Some(row));
         }
 
-        if any_matched {
-            // ON MATCH: apply set items.
-            // (In-memory only for now — durable write in Sprint D.)
-            Ok(Some(matched_row))
+        // Evaluate the inline property predicate and look for a full match.
+        let wanted = Self::eval_inline_properties(node, &row, ctx)?;
+        let matched = Self::find_full_match(node, &wanted, ctx)?;
+
+        if let Some(node_value) = matched {
+            // MATCH branch: bind the existing node, apply ON MATCH.
+            if let Some(var) = &node.variable {
+                row.insert(var.clone(), node_value);
+            }
+            apply_set_items_durable(&mut row, &self.on_match, ctx)?;
+            Ok(Some(row))
         } else {
-            // ON CREATE: create the pattern.
-            use crate::graph::builder::NodeBuilder;
-            use crate::graph::graph::Graph;
-            let mut row = input_row;
-            // SAFETY: single-threaded execution.
+            // CREATE branch: build the node with its inline properties so they
+            // are persisted, bind it, then apply ON CREATE.
+            // SAFETY: single-threaded execution; the context holds the sole
+            // mutable engine borrow. See ExecutionContext::engine_ptr_mut.
             let engine = unsafe { &mut *ctx.engine_ptr_mut() };
-            for elem in &self.pattern.elements {
-                if let crate::cypher::ast::PatternElement::Node(n) = elem {
-                    let label_id = n
-                        .labels
-                        .first()
-                        .map(|l| engine.catalog_label_id(l))
-                        .unwrap_or(0u32);
-                    let builder = NodeBuilder::new().label(label_id);
-                    let mut g = Graph::new_ref(engine);
-                    let (_, node_id) = g
-                        .create_node(builder, ctx.fs)
-                        .map_err(|e| ExecError::Eval(e.to_string()))?;
-                    if let Some(var) = &n.variable
-                        && let Some(nv) = load_node_value(engine, node_id, ctx.fs)?
-                    {
-                        row.insert(var.clone(), nv);
-                    }
+            let label_id = node
+                .labels
+                .first()
+                .map(|l| engine.catalog_label_id(l))
+                .unwrap_or(0u32);
+            let mut builder = NodeBuilder::new().label(label_id);
+            for (k, v) in &wanted {
+                if let Some(prop) = value_to_property(v) {
+                    builder = builder.property(k.clone(), prop);
                 }
             }
-            // Apply ON CREATE set items (in-memory for now).
+            let (_, node_id) = Graph::new_ref(engine)
+                .create_node(builder, ctx.fs)
+                .map_err(|e| ExecError::Eval(e.to_string()))?;
+            if let Some(var) = &node.variable
+                && let Some(nv) = load_node_value(engine, node_id, ctx.fs)?
+            {
+                row.insert(var.clone(), nv);
+            }
+            apply_set_items_durable(&mut row, &self.on_create, ctx)?;
             Ok(Some(row))
         }
     }
@@ -2021,6 +2082,14 @@ pub(crate) fn eval_context_with_params(exec_ctx: &ExecutionContext) -> EvalConte
         ctx = ctx.bind_parameter(k.clone(), v.clone());
     }
     ctx
+}
+
+/// Cypher value equality used to match a stored property against a MERGE inline
+/// property predicate.  Returns `true` only when both sides are non-null and
+/// compare equal under Cypher semantics (so `1 = 1.0`), matching how a MERGE
+/// pattern's inline map filters candidate nodes.
+fn values_equal_for_merge(have: &Value, want: &Value) -> bool {
+    matches!(have.cypher_eq(want), Some(Value::Boolean(true)))
 }
 
 pub(crate) fn compare_values(a: &Value, b: &Value, ascending: bool) -> std::cmp::Ordering {
