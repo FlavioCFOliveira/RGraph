@@ -13,9 +13,9 @@ pub mod runtime;
 pub mod storage;
 pub mod stress;
 
-pub use acceptor::{ConnectionAcceptor, Protocol, ProtocolMultiplexer};
+pub use acceptor::{ConnectionAcceptor, MeteredStream, Protocol, ProtocolMultiplexer};
 pub use dispatcher::{CpuPool, RequestDispatcher};
-pub use grpc::GraphGrpcServer;
+pub use grpc::{GraphGrpcServer, ServeLimits};
 pub use metrics::{HealthService, MetricsCollector, MetricsExporter};
 pub use runtime::{ServerConfig, ServerRuntime};
 pub use storage::{

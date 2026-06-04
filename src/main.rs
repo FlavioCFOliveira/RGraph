@@ -3,11 +3,10 @@ use rgraph::db::database::Database;
 use rgraph::io::posix::PosixFileSystem;
 use rgraph::server::{
     AsyncGraphEngine, ConnectionAcceptor, GraphEngineAdapter, GraphGrpcServer, MetricsCollector,
-    RequestDispatcher, ServerConfig, ServerRuntime,
+    RequestDispatcher, ServeLimits, ServerConfig, ServerRuntime,
 };
 use rgraph::storage::page::{PageType, SlottedPage};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tracing::info;
 use rgraph::cypher::executor::execute_expression_query;
@@ -320,7 +319,6 @@ fn main() {
             };
 
             let runtime = ServerRuntime::new(config.clone()).expect("create runtime");
-            let in_flight = Arc::new(AtomicUsize::new(0));
 
             let data_path = path.join("rgraph.db");
             let engine: Arc<dyn AsyncGraphEngine> =
@@ -345,26 +343,43 @@ fn main() {
             let tls_cert_clone = config.tls_cert_path.clone();
             let tls_key_clone = config.tls_key_path.clone();
 
-            runtime.block_on(
-                async move {
-                    let acceptor = ConnectionAcceptor::bind(
-                        &format!("{}:{}", host_clone, port_clone),
-                        tls_cert_clone,
-                        tls_key_clone,
-                        max_connections_clone,
-                    )
-                    .await?;
+            let limits = ServeLimits {
+                request_timeout: std::time::Duration::from_secs(30),
+                concurrency_per_connection: 256,
+                global_concurrency: max_connections.saturating_mul(4).max(1),
+            };
 
-                    info!("listening on port {}", acceptor.local_port);
+            let serve_result = runtime.runtime.block_on(async move {
+                let acceptor = ConnectionAcceptor::bind(
+                    &format!("{}:{}", host_clone, port_clone),
+                    tls_cert_clone,
+                    tls_key_clone,
+                    max_connections_clone,
+                )
+                .await?;
 
-                    let grpc_routes = GraphGrpcServer::routes(engine, metrics);
-                    let addr = format!("{}:{}", host_clone, port_clone).parse().unwrap();
-                    grpc_routes.serve(addr).await.map_err(|e| {
-                        rgraph::error::RGraphError::Io(format!("grpc serve failed: {e}"))
-                    })
-                },
-                in_flight,
-            );
+                info!("listening on port {}", acceptor.local_port);
+
+                // Graceful-shutdown signal: resolves on Ctrl-C or SIGTERM.  When
+                // it fires, tonic stops accepting new connections and drains the
+                // in-flight requests before `serve_with_acceptor` returns.
+                let shutdown = async {
+                    wait_for_shutdown_signal().await;
+                    info!("shutdown signal received; draining in-flight requests");
+                };
+
+                GraphGrpcServer::serve_with_acceptor(
+                    engine, metrics, acceptor, limits, shutdown,
+                )
+                .await
+            });
+
+            if let Err(e) = serve_result {
+                tracing::error!("server terminated with error: {}", e);
+                eprintln!("Error: {}", e);
+                std::process::exit(exit_code_for(&e));
+            }
+            info!("server stopped cleanly");
         }
         Command::Query { path, query, json } => {
             let _span = tracing::info_span!("cmd", command = "query", path = %path.display()).entered();
@@ -418,6 +433,37 @@ fn main() {
             println!("  concurrency: {}", concurrency);
             println!("Benchmark is a stub — full implementation depends on the query execution engine (Sprint 21).");
         }
+    }
+}
+
+/// Resolve when the process receives a shutdown signal (Ctrl-C / SIGINT or
+/// SIGTERM), used to trigger graceful server shutdown.
+///
+/// On non-Unix platforms only Ctrl-C is observed.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // INVARIANT: signal handler installation only fails on resource
+        // exhaustion at process start; treat that as "no SIGTERM path" rather
+        // than aborting the server.
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("could not install SIGTERM handler: {e}");
+                // Fall back to Ctrl-C only.
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

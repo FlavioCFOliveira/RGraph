@@ -73,6 +73,8 @@ impl ProtocolMultiplexer {
 /// only when the stream is dropped.
 pub struct ServerStream {
     inner: ServerStreamInner,
+    local_addr: Option<std::net::SocketAddr>,
+    peer_addr: Option<std::net::SocketAddr>,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -82,10 +84,40 @@ enum ServerStreamInner {
 }
 
 impl ServerStream {
-    fn new(inner: ServerStreamInner, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+    fn new(
+        inner: ServerStreamInner,
+        local_addr: Option<std::net::SocketAddr>,
+        peer_addr: Option<std::net::SocketAddr>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
         Self {
             inner,
+            local_addr,
+            peer_addr,
             _permit: Some(permit),
+        }
+    }
+
+    /// The local address this connection was accepted on, if known.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.local_addr
+    }
+
+    /// The remote peer address of this connection, if known.
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer_addr
+    }
+}
+
+// tonic requires the incoming IO type to implement `Connected` so it can
+// surface connection metadata (peer/local address) via request extensions.
+impl tonic::transport::server::Connected for ServerStream {
+    type ConnectInfo = tonic::transport::server::TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        tonic::transport::server::TcpConnectInfo {
+            local_addr: self.local_addr,
+            remote_addr: self.peer_addr,
         }
     }
 }
@@ -130,6 +162,64 @@ impl AsyncWrite for ServerStream {
             ServerStreamInner::Plain(s) => Pin::new(s).poll_shutdown(cx),
             ServerStreamInner::Tls(s) => Pin::new(s).poll_shutdown(cx),
         }
+    }
+}
+
+/// A [`ServerStream`] wrapper that records connection-lifecycle metrics.
+///
+/// The active-connection gauge is incremented when the underlying stream is
+/// accepted (see [`ConnectionAcceptor::into_incoming`]) and decremented when
+/// this wrapper is dropped, i.e. when tonic finishes serving the connection.
+pub struct MeteredStream {
+    inner: ServerStream,
+    metrics: Arc<crate::server::metrics::MetricsCollector>,
+}
+
+impl MeteredStream {
+    fn new(inner: ServerStream, metrics: Arc<crate::server::metrics::MetricsCollector>) -> Self {
+        Self { inner, metrics }
+    }
+}
+
+impl Drop for MeteredStream {
+    fn drop(&mut self) {
+        self.metrics.observe_connection_closed();
+    }
+}
+
+impl AsyncRead for MeteredStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for MeteredStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl tonic::transport::server::Connected for MeteredStream {
+    type ConnectInfo = tonic::transport::server::TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.inner.connect_info()
     }
 }
 
@@ -207,6 +297,9 @@ impl ConnectionAcceptor {
             }
         };
 
+        let local_addr = stream.local_addr().ok();
+        let peer_addr = Some(peer);
+
         // Detect protocol before TLS handshake so we can route correctly.
         let protocol = ProtocolMultiplexer::detect(&mut stream).await?;
 
@@ -225,13 +318,63 @@ impl ConnectionAcceptor {
 
         // The permit is moved into the stream so the connection slot is held
         // for the lifetime of the stream and released on drop.
-        let stream = ServerStream::new(inner, permit);
+        let stream = ServerStream::new(inner, local_addr, peer_addr, permit);
         Ok(Some((protocol, stream)))
     }
 
     /// Close the acceptor so that no new connections are accepted.
     pub fn close(&self) {
         self.connection_limit.close();
+    }
+
+    /// Number of connection slots currently available.
+    ///
+    /// Exposed primarily for tests asserting backpressure behaviour.
+    pub fn available_permits(&self) -> usize {
+        self.connection_limit.available_permits()
+    }
+
+    /// Convert the acceptor into a [`Stream`](futures::Stream) of accepted,
+    /// gRPC-protocol connections suitable for `tonic::Server::serve_with_incoming`.
+    ///
+    /// The stream:
+    /// * enforces the global connection limit (via the acceptor's semaphore);
+    /// * performs the TLS handshake when configured;
+    /// * filters out non-gRPC (e.g. Bolt) and failed connections — these are
+    ///   skipped, not surfaced as stream errors, so a single bad client cannot
+    ///   tear down the listener;
+    /// * records connection-open/close metrics against `metrics`.
+    ///
+    /// The stream ends (`None`) once [`close`](ConnectionAcceptor::close) has
+    /// been called and the semaphore is drained, which is how graceful
+    /// shutdown stops the acceptance loop.
+    pub fn into_incoming(
+        self,
+        metrics: Arc<crate::server::metrics::MetricsCollector>,
+    ) -> impl futures::Stream<Item = Result<MeteredStream, io::Error>> {
+        futures::stream::unfold((self, metrics), |(acceptor, metrics)| async move {
+            loop {
+                match acceptor.accept().await {
+                    // Only gRPC connections are routed to tonic; other protocols
+                    // are dropped (the permit is released on stream drop).
+                    Ok(Some((Protocol::Grpc, stream))) => {
+                        metrics.observe_connection_opened();
+                        let metered = MeteredStream::new(stream, metrics.clone());
+                        return Some((Ok(metered), (acceptor, metrics)));
+                    }
+                    // Non-gRPC or skipped connection: keep looping.
+                    Ok(Some(_)) => continue,
+                    // Acceptor closed (shutdown) — terminate the stream.
+                    Ok(None) => return None,
+                    // Transient error (e.g. TLS detect): surface it but keep the
+                    // listener alive; tonic logs and continues.
+                    Err(e) => {
+                        warn!("connection acceptance error: {e}");
+                        continue;
+                    }
+                }
+            }
+        })
     }
 
     fn load_tls_config(
