@@ -667,6 +667,65 @@ impl GraphStorageEngine {
         Ok(sref)
     }
 
+    /// Read a record by [`SlotRef`], preferring the in-flight `pending` image
+    /// over the on-disk page (used by no-steal multi-page mutations).
+    fn read_record_pending(
+        page_manager: &PageManager,
+        pending: &std::collections::HashMap<PageId, AlignedBuffer>,
+        slot: SlotRef,
+        fs: &dyn FileSystem,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let page_id = slot.page_id() as u64;
+        let slot_idx = slot.slot_index();
+        let page = match pending.get(&page_id) {
+            Some(buf) => SlottedPage::new(buf.clone()),
+            None => {
+                let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+                page_manager.read_page(fs, page_id, &mut buf)?;
+                SlottedPage::new(buf)
+            }
+        };
+        Ok(page.read(slot_idx as u16).map(|s| s.to_vec()))
+    }
+
+    /// Overwrite a record at `slot` in place within the in-flight `pending`
+    /// image (loading the page from `pending` or disk).  The record must fit in
+    /// the existing slot length.  No disk write happens here — the image is
+    /// written only after the transaction commits.
+    fn overwrite_into_pending(
+        page_manager: &PageManager,
+        pending: &mut std::collections::HashMap<PageId, AlignedBuffer>,
+        slot: SlotRef,
+        record: &[u8],
+        fs: &dyn FileSystem,
+    ) -> Result<(), StorageError> {
+        let page_id = slot.page_id() as u64;
+        let slot_idx = slot.slot_index();
+        let image = match pending.get(&page_id) {
+            Some(buf) => buf.clone(),
+            None => {
+                let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+                page_manager.read_page(fs, page_id, &mut buf)?;
+                buf
+            }
+        };
+        let mut page = SlottedPage::new(image);
+        let existing_slot = page.slot(slot_idx as u16).ok_or(StorageError::NotFound)?;
+        if existing_slot.is_deleted() {
+            return Err(StorageError::NotFound);
+        }
+        let existing_len = existing_slot.length as usize;
+        let existing_offset = existing_slot.offset as usize;
+        if record.len() > existing_len {
+            return Err(StorageError::PageFull);
+        }
+        let start = SlottedPage::HEADER_SIZE + existing_offset;
+        page.buf[start..start + record.len()].copy_from_slice(record);
+        page.update_checksum();
+        pending.insert(page_id, page.buf);
+        Ok(())
+    }
+
     /// Atomically create a node together with its property chain in a single
     /// no-steal/no-force transaction (findings C1/C3).
     ///
@@ -812,6 +871,174 @@ impl GraphStorageEngine {
         }
 
         Ok(node_slot)
+    }
+
+    /// Atomically create an edge together with its property chain AND its
+    /// source/target adjacency wiring in a single no-steal/no-force transaction
+    /// (findings C1/C3b).
+    ///
+    /// `edge.source_node` / `edge.target_node` must already be resolved by the
+    /// caller.  The edge record, the property pages, the two endpoint node
+    /// records and any old adjacency-list heads are all built in memory, logged
+    /// as physical `PageInsert` redo records, committed (flush WAL), and only
+    /// then written.  A crash before commit leaves no half-linked graph (no
+    /// steal); a committed edge — record, properties and both adjacency links —
+    /// is reconstructable by REDO (no force).  This replaces the previous
+    /// put_edge sequence that wrote up to five pages with independent fsyncs and
+    /// logged the edge only afterward.
+    pub fn create_edge_atomic(
+        &mut self,
+        edge: &EdgeRecord,
+        properties: &[PropertyRecord],
+        fs: &dyn FileSystem,
+    ) -> Result<SlotRef, StorageError> {
+        if edge.edge_id == 0 {
+            return Err(StorageError::InvalidId);
+        }
+        let key = edge_id_key(edge.edge_id as u128);
+        if self.edge_index.search(&key).is_some() {
+            return Err(StorageError::AlreadyExists);
+        }
+
+        let resource_id = edge_resource_id(edge.edge_id);
+        let txn_mgr = Arc::clone(&self.txn_manager);
+        let mut tx = txn_mgr.begin();
+        if let Err(e) = txn_mgr.acquire_lock(&mut tx, resource_id, LockMode::Exclusive) {
+            let _ = txn_mgr.rollback(&mut tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
+        let txid = tx.txid;
+
+        let mut pending: std::collections::HashMap<PageId, AlignedBuffer> =
+            std::collections::HashMap::new();
+
+        // ── Phase 1: build all page images in memory (no steal) ──────────────
+        // Property chain (reverse-linked) → edge.first_property.
+        let mut next_slot = SlotRef::NULL;
+        let mut prop_index: Vec<(ValueType, Vec<u8>, SlotRef)> = Vec::new();
+        for prop in properties.iter().rev() {
+            let mut p = prop.clone();
+            p.next_property = next_slot;
+            let bytes = p.encode();
+            let slot = match Self::prepare_into_pending(
+                &mut self.page_manager,
+                &mut pending,
+                &bytes,
+                &mut self.property_pages,
+                PageType::SlottedData,
+                fs,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = txn_mgr.rollback(&mut tx, &mut self.wal_writer, &*self.wal_fs);
+                    return Err(e);
+                }
+            };
+            next_slot = slot;
+            if let Some(vt) = ValueType::from_u8(p.header.value_type) {
+                prop_index.push((vt, p.payload.clone(), slot));
+            }
+        }
+
+        // Edge record (with first_property set).
+        let mut edge_rec = *edge;
+        edge_rec.first_property = next_slot;
+        let mut edge_buf = [0u8; EdgeRecord::SIZE];
+        edge_rec.encode(&mut edge_buf);
+        let edge_slot = match Self::prepare_into_pending(
+            &mut self.page_manager,
+            &mut pending,
+            &edge_buf,
+            &mut self.edge_pages,
+            PageType::SlottedData,
+            fs,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = txn_mgr.rollback(&mut tx, &mut self.wal_writer, &*self.wal_fs);
+                return Err(e);
+            }
+        };
+
+        // Adjacency wiring (modifies the edge, the endpoint nodes and any old
+        // list heads) — all accumulated in `pending`.
+        if !edge.source_node.is_null()
+            && let Err(e) = Self::wire_source_adjacency_pending(
+                &self.page_manager,
+                &mut pending,
+                edge_slot,
+                edge.source_node,
+                fs,
+            )
+        {
+            let _ = txn_mgr.rollback(&mut tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
+        }
+        if !edge.target_node.is_null()
+            && let Err(e) = Self::wire_target_adjacency_pending(
+                &self.page_manager,
+                &mut pending,
+                edge_slot,
+                edge.target_node,
+                fs,
+            )
+        {
+            let _ = txn_mgr.rollback(&mut tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
+        }
+
+        // ── Phase 2: log a physical PageInsert per page (page-id order) ──────
+        let mut page_ids: Vec<PageId> = pending.keys().copied().collect();
+        page_ids.sort_unstable();
+        let mut lsns: std::collections::HashMap<PageId, u64> = std::collections::HashMap::new();
+        for &page_id in &page_ids {
+            let mut payload = Vec::with_capacity(8 + PAGE_SIZE);
+            payload.extend_from_slice(&page_id.to_be_bytes());
+            payload.extend_from_slice(pending[&page_id].as_ref());
+            let lsn = match Self::log(
+                &mut self.page_manager,
+                &mut self.wal_writer,
+                fs,
+                RecordType::PageInsert,
+                txid,
+                payload,
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = txn_mgr.rollback(&mut tx, &mut self.wal_writer, &*self.wal_fs);
+                    return Err(e);
+                }
+            };
+            lsns.insert(page_id, lsn);
+        }
+
+        // ── Phase 3: commit (append Commit, flush WAL) ───────────────────────
+        let wal_fs = Arc::clone(&self.wal_fs);
+        txn_mgr
+            .commit(&mut tx, &mut self.wal_writer, wal_fs.as_ref())
+            .map_err(StorageError::from)?;
+
+        // ── Phase 4: commit durable — write all pages, then derived state ────
+        for page_id in page_ids {
+            let mut image = pending.remove(&page_id).expect("pending image present");
+            let lsn = lsns[&page_id];
+            image.as_mut()[0..8].copy_from_slice(&lsn.to_be_bytes());
+            self.page_manager.write_page(fs, page_id, &mut image)?;
+        }
+
+        let value = edge_slot.raw.to_be_bytes().to_vec();
+        self.edge_index
+            .insert(&key, &value)
+            .map_err(StorageError::from)?;
+        let type_key = type_index_key(edge.type_id as u64, edge.edge_id as u128);
+        self.type_index
+            .insert(&type_key, &value)
+            .map_err(StorageError::from)?;
+        for (vt, payload, slot) in prop_index {
+            let _ = self.insert_property_index(edge.edge_id as u128, 0, vt, &payload, slot);
+        }
+
+        Ok(edge_slot)
     }
 
     /// Read a raw record from a [`SlotRef`].
@@ -1585,6 +1812,86 @@ impl GraphStorageEngine {
         let mut node_buf = [0u8; NodeRecord::SIZE];
         node.encode(&mut node_buf);
         Self::overwrite_record(pm, node_slot, &node_buf, fs)
+    }
+
+    /// No-steal counterpart of [`Self::wire_source_adjacency`]: links
+    /// `edge_slot` at the head of the source node's outgoing list, accumulating
+    /// every touched page image in `pending` instead of writing to disk.
+    fn wire_source_adjacency_pending(
+        pm: &PageManager,
+        pending: &mut std::collections::HashMap<PageId, AlignedBuffer>,
+        edge_slot: SlotRef,
+        node_slot: SlotRef,
+        fs: &dyn FileSystem,
+    ) -> Result<(), StorageError> {
+        let node_bytes =
+            Self::read_record_pending(pm, pending, node_slot, fs)?.ok_or(StorageError::NotFound)?;
+        let mut node = NodeRecord::decode(&node_bytes).ok_or(StorageError::NotFound)?;
+        let old_head = node.first_outgoing_edge;
+
+        let edge_bytes =
+            Self::read_record_pending(pm, pending, edge_slot, fs)?.ok_or(StorageError::NotFound)?;
+        let mut edge = EdgeRecord::decode(&edge_bytes).ok_or(StorageError::NotFound)?;
+        edge.next_source_edge = old_head;
+        edge.prev_source_edge = SlotRef::NULL;
+        let mut edge_buf = [0u8; EdgeRecord::SIZE];
+        edge.encode(&mut edge_buf);
+        Self::overwrite_into_pending(pm, pending, edge_slot, &edge_buf, fs)?;
+
+        if !old_head.is_null() {
+            let head_bytes = Self::read_record_pending(pm, pending, old_head, fs)?
+                .ok_or(StorageError::NotFound)?;
+            let mut head_edge = EdgeRecord::decode(&head_bytes).ok_or(StorageError::NotFound)?;
+            head_edge.prev_source_edge = edge_slot;
+            let mut head_buf = [0u8; EdgeRecord::SIZE];
+            head_edge.encode(&mut head_buf);
+            Self::overwrite_into_pending(pm, pending, old_head, &head_buf, fs)?;
+        }
+
+        node.first_outgoing_edge = edge_slot;
+        node.generation += 1;
+        let mut node_buf = [0u8; NodeRecord::SIZE];
+        node.encode(&mut node_buf);
+        Self::overwrite_into_pending(pm, pending, node_slot, &node_buf, fs)
+    }
+
+    /// No-steal counterpart of [`Self::wire_target_adjacency`].
+    fn wire_target_adjacency_pending(
+        pm: &PageManager,
+        pending: &mut std::collections::HashMap<PageId, AlignedBuffer>,
+        edge_slot: SlotRef,
+        node_slot: SlotRef,
+        fs: &dyn FileSystem,
+    ) -> Result<(), StorageError> {
+        let node_bytes =
+            Self::read_record_pending(pm, pending, node_slot, fs)?.ok_or(StorageError::NotFound)?;
+        let mut node = NodeRecord::decode(&node_bytes).ok_or(StorageError::NotFound)?;
+        let old_head = node.first_incoming_edge;
+
+        let edge_bytes =
+            Self::read_record_pending(pm, pending, edge_slot, fs)?.ok_or(StorageError::NotFound)?;
+        let mut edge = EdgeRecord::decode(&edge_bytes).ok_or(StorageError::NotFound)?;
+        edge.next_target_edge = old_head;
+        edge.prev_target_edge = SlotRef::NULL;
+        let mut edge_buf = [0u8; EdgeRecord::SIZE];
+        edge.encode(&mut edge_buf);
+        Self::overwrite_into_pending(pm, pending, edge_slot, &edge_buf, fs)?;
+
+        if !old_head.is_null() {
+            let head_bytes = Self::read_record_pending(pm, pending, old_head, fs)?
+                .ok_or(StorageError::NotFound)?;
+            let mut head_edge = EdgeRecord::decode(&head_bytes).ok_or(StorageError::NotFound)?;
+            head_edge.prev_target_edge = edge_slot;
+            let mut head_buf = [0u8; EdgeRecord::SIZE];
+            head_edge.encode(&mut head_buf);
+            Self::overwrite_into_pending(pm, pending, old_head, &head_buf, fs)?;
+        }
+
+        node.first_incoming_edge = edge_slot;
+        node.generation += 1;
+        let mut node_buf = [0u8; NodeRecord::SIZE];
+        node.encode(&mut node_buf);
+        Self::overwrite_into_pending(pm, pending, node_slot, &node_buf, fs)
     }
 
     /// Unlink an edge from the source node's adjacency list, patching

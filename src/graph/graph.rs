@@ -120,56 +120,16 @@ impl Graph {
         record.source_node = source_slot;
         record.target_node = target_slot;
 
-        let slot = self.engine.put_edge(&record, fs)?;
-
-        // Persist properties as a linked chain attached to the edge.
-        self.attach_properties_to_edge(id, slot, properties, fs)?;
-
+        // Atomic no-steal/no-force create: the edge record, its property chain
+        // and both adjacency links commit as a single transaction (C1/C3b).
+        let props = build_property_records(properties);
+        let slot = self.engine.create_edge_atomic(&record, &props, fs)?;
         Ok((slot, id))
     }
 
     // ------------------------------------------------------------------
     // Property persistence helpers
     // ------------------------------------------------------------------
-
-    /// Persist a property map as a linked `PropertyRecord` chain and attach
-    /// the chain to an edge.
-    fn attach_properties_to_edge(
-        &mut self,
-        edge_id: u64,
-        _edge_slot: SlotRef,
-        properties: HashMap<String, Property>,
-        fs: &dyn FileSystem,
-    ) -> Result<(), StorageError> {
-        if properties.is_empty() {
-            return Ok(());
-        }
-
-        let mut entries: Vec<(String, Property)> = properties.into_iter().collect();
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        let mut next_slot = SlotRef::NULL;
-
-        for (key, value) in entries.into_iter().rev() {
-            let (vtype, payload) = value
-                .to_value_type_payload()
-                .unwrap_or((ValueType::Null, Vec::new()));
-            let mut prop = PropertyRecord::inline(&key, 0, vtype, payload.clone());
-            prop.next_property = next_slot;
-
-            let prop_slot = self.engine.put_property(&prop, fs)?;
-            next_slot = prop_slot;
-
-            let _ =
-                self.engine
-                    .insert_property_index(edge_id as u128, 0, vtype, &payload, prop_slot);
-        }
-
-        self.engine
-            .attach_property_to_edge(edge_id, next_slot, fs)?;
-
-        Ok(())
-    }
 
     /// Retrieve a node by its `node_id`.
     ///
@@ -551,8 +511,9 @@ impl<'a> GraphMut<'a> {
         record.source_node = source_slot;
         record.target_node = target_slot;
 
-        let slot = self.engine.put_edge(&record, fs)?;
-        attach_properties_to_edge_engine(self.engine, id, slot, properties, fs)?;
+        // Atomic no-steal/no-force create (C1/C3b).
+        let props = build_property_records(properties);
+        let slot = self.engine.create_edge_atomic(&record, &props, fs)?;
         Ok((slot, id))
     }
 
@@ -607,33 +568,6 @@ fn build_property_records(properties: HashMap<String, Property>) -> Vec<Property
             PropertyRecord::inline(&key, 0, vtype, payload)
         })
         .collect()
-}
-
-fn attach_properties_to_edge_engine(
-    engine: &mut GraphStorageEngine,
-    edge_id: u64,
-    _slot: SlotRef,
-    properties: HashMap<String, Property>,
-    fs: &dyn FileSystem,
-) -> Result<(), StorageError> {
-    if properties.is_empty() {
-        return Ok(());
-    }
-    let mut entries: Vec<(String, Property)> = properties.into_iter().collect();
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let mut next_slot = SlotRef::NULL;
-    for (key, value) in entries.into_iter().rev() {
-        let (vtype, payload) = value
-            .to_value_type_payload()
-            .unwrap_or((ValueType::Null, Vec::new()));
-        let mut prop = PropertyRecord::inline(&key, 0, vtype, payload.clone());
-        prop.next_property = next_slot;
-        let prop_slot = engine.put_property(&prop, fs)?;
-        next_slot = prop_slot;
-        let _ = engine.insert_property_index(edge_id as u128, 0, vtype, &payload, prop_slot);
-    }
-    engine.attach_property_to_edge(edge_id, next_slot, fs)?;
-    Ok(())
 }
 
 /// Replace a node's entire property chain with `properties`, persisting the new

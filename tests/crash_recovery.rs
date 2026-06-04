@@ -22,7 +22,7 @@
 use rgraph::config::GraphMode;
 use rgraph::db::database::Database;
 use rgraph::graph::Property;
-use rgraph::graph::builder::NodeBuilder;
+use rgraph::graph::builder::{NodeBuilder, RelationshipBuilder};
 use rgraph::io::posix::PosixFileSystem;
 use rgraph::io::{
     AlignedBuffer, FaultConfig, FaultInjectFileSystem, FaultKind, FaultRule, FileSystem, OpMask,
@@ -371,4 +371,73 @@ fn create_node_with_properties_survives_crash_atomically() {
         Some(&Property::String("alice".to_string()))
     );
     assert_eq!(node.properties.get("age"), Some(&Property::Integer(30)));
+}
+
+// ---------------------------------------------------------------------------
+// 6. Atomic edge create: a CREATE (a)-[:R]->(b) commits the edge record AND
+//    both adjacency links as ONE no-steal transaction; after a reopen the edge
+//    is present and traversable in BOTH directions (never half-linked).
+// ---------------------------------------------------------------------------
+
+/// Create two nodes and a relationship between them (with a property), sync,
+/// drop, and reopen.  Under the no-steal/no-force policy (finding C3b) the edge
+/// record, its property page and BOTH endpoint adjacency lists commit as one
+/// transaction, so after the restart the edge must be reachable from the
+/// source's outgoing list and the target's incoming list — there is no window
+/// where the graph is half-linked.
+#[test]
+fn create_relationship_survives_crash_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("db");
+    let fs = fault_fs();
+
+    let (src, tgt, edge_id) = {
+        let mut db = Database::init(&db_path, &fs, GraphMode::Lpg).unwrap();
+        let (_s, src) = db.create_node(NodeBuilder::new().label(1), &fs).unwrap();
+        let (_s, tgt) = db.create_node(NodeBuilder::new().label(2), &fs).unwrap();
+        let (_e, edge_id) = db
+            .create_relationship(
+                RelationshipBuilder::new()
+                    .from(src)
+                    .to(tgt)
+                    .type_id(7)
+                    .property("weight", 5i64),
+                &fs,
+            )
+            .unwrap();
+        db.sync(&fs).unwrap();
+        drop(db);
+        (src, tgt, edge_id)
+    };
+
+    let db = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap();
+
+    // The edge record survives with its endpoints and type intact.
+    let edge = db
+        .get_relationship(edge_id, &fs)
+        .unwrap()
+        .expect("edge must survive restart");
+    assert_eq!(edge.type_id, 7);
+    assert_eq!(edge.source_id, src);
+    assert_eq!(edge.target_id, tgt);
+
+    // Adjacency is consistent in BOTH directions (the two links committed atomically).
+    let out = db
+        .graph()
+        .engine()
+        .scan_outgoing_edges(src, &[], &fs)
+        .unwrap();
+    assert!(
+        out.iter().any(|(e, _)| e.edge_id == edge_id),
+        "edge must be in the source's outgoing adjacency after restart"
+    );
+    let inc = db
+        .graph()
+        .engine()
+        .scan_incoming_edges(tgt, &[], &fs)
+        .unwrap();
+    assert!(
+        inc.iter().any(|(e, _)| e.edge_id == edge_id),
+        "edge must be in the target's incoming adjacency after restart"
+    );
 }
