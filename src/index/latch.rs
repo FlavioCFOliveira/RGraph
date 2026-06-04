@@ -22,6 +22,15 @@
 
 use crate::storage::page::PageId;
 use std::collections::HashMap;
+
+// Concurrency primitives are sourced from `loom` under `--cfg rgraph_loom` so
+// the model checker can explore every interleaving of the latch protocol; the
+// production build uses the standard library types unchanged.  A crate-private
+// cfg name (rather than the bare `loom`) keeps the flag from leaking into
+// dependencies such as tokio, which have their own `loom` cfg handling.
+#[cfg(rgraph_loom)]
+use loom::sync::{Condvar, Mutex};
+#[cfg(not(rgraph_loom))]
 use std::sync::{Condvar, Mutex};
 
 /// Mode of latch acquisition.

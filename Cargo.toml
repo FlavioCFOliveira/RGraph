@@ -3,6 +3,12 @@ name = "rgraph"
 version = "0.1.0"
 edition = "2024"
 
+# Declare the crate-private `rgraph_loom` cfg so `--cfg rgraph_loom` builds do
+# not trip the `unexpected_cfgs` lint.  Only set by the loom model-check run:
+#   RUSTFLAGS="--cfg rgraph_loom" cargo test --test loom_concurrency --release
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rgraph_loom)'] }
+
 [features]
 # Off by default: experimental, not yet wired into the B+ tree hot path.
 #
@@ -84,5 +90,23 @@ harness = false
 name = "csr_bench"
 harness = false
 
+[[bench]]
+name = "query_dispatch_bench"
+harness = false
+
+# `loom` is only compiled under `--cfg rgraph_loom`, so it never enters the
+# normal build or the regular test graph.  A crate-private cfg name (not the
+# bare `loom`) prevents the flag leaking into dependencies such as tokio.  Run
+# the concurrency models with:
+#   RUSTFLAGS="--cfg rgraph_loom" cargo test --test loom_concurrency --release
+[target.'cfg(rgraph_loom)'.dependencies]
+loom = "0.7"
+
 [build-dependencies]
 tonic-build = "0.12"
+
+# The loom concurrency models only build under `--cfg loom`; mark the harness
+# as standard (libtest) so `cargo test --test loom_concurrency` discovers them.
+[[test]]
+name = "loom_concurrency"
+harness = true
