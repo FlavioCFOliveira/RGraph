@@ -93,6 +93,14 @@ impl Default for RdfTripleStore {
     }
 }
 
+/// A quad whose term/triple records have been built into a pending page-image
+/// set by [`RdfTripleStore::prepare_quad`], awaiting a durable commit before the
+/// in-memory permutation index is updated (no-steal RDF inserts, finding C1).
+pub struct PreparedQuad {
+    key: (u64, u64, u64, u64),
+    triple_slot: SlotRef,
+}
+
 impl RdfTripleStore {
     /// Create an empty store.
     pub fn new() -> Self {
@@ -538,6 +546,105 @@ impl RdfTripleStore {
         self.rdf_pages.push(page_id);
         let slot_ref = Self::slot_ref(page_id, slot)?;
         Self::log(pm, wal, fs, RecordType::RdfTripleInsert, record.to_vec())?;
+        Ok(slot_ref)
+    }
+
+    /// Prepare a quad for an atomic no-steal commit: intern its terms and build
+    /// the (new) term records plus the triple record into the `pending`
+    /// page-image map WITHOUT writing to disk.  Returns `None` if the triple
+    /// already exists (idempotent).  The caller logs one physical `PageInsert`
+    /// per pending page, commits, writes the pages, and then calls
+    /// [`Self::commit_prepared`] to update the in-memory index (findings C1).
+    pub fn prepare_quad(
+        &mut self,
+        pm: &mut PageManager,
+        pending: &mut std::collections::HashMap<PageId, AlignedBuffer>,
+        quad: &Quad,
+        fs: &dyn FileSystem,
+    ) -> Result<Option<PreparedQuad>, RdfError> {
+        let s_id = self.intern_pending(pm, pending, &quad.triple.subject, fs)?;
+        let p_id = self.intern_pending(pm, pending, &quad.triple.predicate, fs)?;
+        let o_id = self.intern_pending(pm, pending, &quad.triple.object, fs)?;
+        let g_id = match &quad.graph {
+            Some(g) => self.intern_pending(pm, pending, g, fs)?,
+            None => 0,
+        };
+
+        let key = (s_id, p_id, o_id, g_id);
+        if self.triples.contains_key(&key) {
+            return Ok(None);
+        }
+
+        let record = TripleRecord::new(s_id, p_id, o_id, g_id);
+        let triple_slot = self.persist_into_pending(pm, pending, &record.encode(), fs)?;
+        Ok(Some(PreparedQuad { key, triple_slot }))
+    }
+
+    /// Update the in-memory permutation index and triple mirror for a quad whose
+    /// pages have been durably committed.  Call only after the commit succeeds.
+    pub fn commit_prepared(&mut self, prepared: PreparedQuad) -> Result<(), RdfError> {
+        let (s_id, p_id, o_id, g_id) = prepared.key;
+        self.index_insert(s_id, p_id, o_id, g_id, prepared.triple_slot)?;
+        self.triples.insert(prepared.key, prepared.triple_slot);
+        Ok(())
+    }
+
+    /// Intern a term, building a [`TermRecord`] into `pending` when it is new
+    /// (no disk write).
+    fn intern_pending(
+        &mut self,
+        pm: &mut PageManager,
+        pending: &mut std::collections::HashMap<PageId, AlignedBuffer>,
+        term: &Term,
+        fs: &dyn FileSystem,
+    ) -> Result<u64, RdfError> {
+        let (id, is_new) = self.dictionary.intern(term.clone());
+        if is_new {
+            let rec = TermRecord {
+                id,
+                term: term.clone(),
+            };
+            let bytes = rec.encode();
+            let _slot = self.persist_into_pending(pm, pending, &bytes, fs)?;
+        }
+        Ok(id)
+    }
+
+    /// No-steal counterpart of [`Self::persist_record`]: place `record` into the
+    /// in-flight `pending` image for an RDF page (preferring an already-touched
+    /// page) without writing to disk or logging.  Returns the record's slot.
+    fn persist_into_pending(
+        &mut self,
+        pm: &mut PageManager,
+        pending: &mut std::collections::HashMap<PageId, AlignedBuffer>,
+        record: &[u8],
+        fs: &dyn FileSystem,
+    ) -> Result<SlotRef, RdfError> {
+        for &page_id in self.rdf_pages.iter().rev() {
+            let image = match pending.get(&page_id) {
+                Some(buf) => buf.clone(),
+                None => {
+                    let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+                    pm.read_page(fs, page_id, &mut buf).map_err(|_| RdfError::Io)?;
+                    buf
+                }
+            };
+            let mut page = SlottedPage::new(image);
+            if let Some(slot) = page.insert(record) {
+                page.update_checksum();
+                let slot_ref = Self::slot_ref(page_id, slot)?;
+                pending.insert(page_id, page.buf);
+                return Ok(slot_ref);
+            }
+        }
+
+        let page_id = pm.allocate_page();
+        let mut page = SlottedPage::init(page_id, PageType::SlottedData);
+        let slot = page.insert(record).ok_or(RdfError::PageFull)?;
+        page.update_checksum();
+        self.rdf_pages.push(page_id);
+        let slot_ref = Self::slot_ref(page_id, slot)?;
+        pending.insert(page_id, page.buf);
         Ok(slot_ref)
     }
 

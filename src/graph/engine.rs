@@ -1484,21 +1484,77 @@ impl GraphStorageEngine {
         triple: &crate::rdf::Triple,
         fs: &dyn FileSystem,
     ) -> Result<bool, StorageError> {
-        self.rdf_store
-            .insert_triple(&mut self.page_manager, &mut self.wal_writer, triple, fs)
-            .map_err(|_| StorageError::IndexError)
+        self.add_quad(&crate::rdf::Quad::triple(triple.clone()), fs)
     }
 
-    /// Insert an RDF quad (triple plus optional named graph).  See
-    /// [`add_triple`](GraphStorageEngine::add_triple).
+    /// Insert an RDF quad (triple plus optional named graph) atomically under
+    /// the no-steal/no-force policy (finding C1): intern its terms and build the
+    /// term/triple records into a pending page set, log a physical `PageInsert`
+    /// per page, commit (flush WAL), then write the pages and update the
+    /// in-memory permutation index.  A crash before commit writes nothing; a
+    /// committed quad is reconstructable by REDO and re-indexed on open.
+    /// Returns `false` if the quad already exists.
     pub fn add_quad(
         &mut self,
         quad: &crate::rdf::Quad,
         fs: &dyn FileSystem,
     ) -> Result<bool, StorageError> {
+        let mut pending: std::collections::HashMap<PageId, AlignedBuffer> =
+            std::collections::HashMap::new();
+        let prepared = match self
+            .rdf_store
+            .prepare_quad(&mut self.page_manager, &mut pending, quad, fs)
+        {
+            Ok(Some(p)) => p,
+            Ok(None) => return Ok(false),
+            Err(_) => return Err(StorageError::IndexError),
+        };
+
+        let txn_mgr = Arc::clone(&self.txn_manager);
+        let mut tx = txn_mgr.begin();
+        let txid = tx.txid;
+
+        // Log a physical PageInsert per pending page (page-id order).
+        let mut page_ids: Vec<PageId> = pending.keys().copied().collect();
+        page_ids.sort_unstable();
+        let mut lsns: std::collections::HashMap<PageId, u64> = std::collections::HashMap::new();
+        for &page_id in &page_ids {
+            let mut payload = Vec::with_capacity(8 + PAGE_SIZE);
+            payload.extend_from_slice(&page_id.to_be_bytes());
+            payload.extend_from_slice(pending[&page_id].as_ref());
+            let lsn = match Self::log(
+                &mut self.page_manager,
+                &mut self.wal_writer,
+                fs,
+                RecordType::PageInsert,
+                txid,
+                payload,
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = txn_mgr.rollback(&mut tx, &mut self.wal_writer, &*self.wal_fs);
+                    return Err(e);
+                }
+            };
+            lsns.insert(page_id, lsn);
+        }
+
+        let wal_fs = Arc::clone(&self.wal_fs);
+        txn_mgr
+            .commit(&mut tx, &mut self.wal_writer, wal_fs.as_ref())
+            .map_err(StorageError::from)?;
+
+        for page_id in page_ids {
+            let mut image = pending.remove(&page_id).expect("pending image present");
+            let lsn = lsns[&page_id];
+            image.as_mut()[0..8].copy_from_slice(&lsn.to_be_bytes());
+            self.page_manager.write_page(fs, page_id, &mut image)?;
+        }
+
         self.rdf_store
-            .insert_quad(&mut self.page_manager, &mut self.wal_writer, quad, fs)
-            .map_err(|_| StorageError::IndexError)
+            .commit_prepared(prepared)
+            .map_err(|_| StorageError::IndexError)?;
+        Ok(true)
     }
 
     /// Delete an RDF triple from the default graph.  Returns `true` if it
@@ -3339,6 +3395,36 @@ mod tests {
     }
     fn p_name() -> Term {
         Term::iri("http://xmlns.com/foaf/0.1/name")
+    }
+
+    #[test]
+    fn rdf_triples_survive_reopen() {
+        // Regression gate for finding C1 (no-steal/no-force RDF inserts):
+        // committed triples survive a reopen — their pages are reconstructable by
+        // REDO and re-indexed by the RDF rebuild on open.
+        let (_dir, fs, path) = temp_fs();
+        let t1 = Triple::new(t_alice(), p_knows(), t_bob());
+        let t2 = Triple::new(t_bob(), p_knows(), t_alice());
+        {
+            let mut engine = GraphStorageEngine::init(path.clone(), &fs).unwrap();
+            engine.add_triple(&t1, &fs).unwrap();
+            engine.add_triple(&t2, &fs).unwrap();
+            engine.sync(&fs).unwrap();
+        }
+        let engine = GraphStorageEngine::open(path, &fs).unwrap();
+        assert_eq!(
+            engine.rdf_triple_count(),
+            2,
+            "both triples must survive the reopen"
+        );
+        assert_eq!(
+            engine.match_triples(Some(&t_alice()), Some(&p_knows()), Some(&t_bob())),
+            vec![t1.clone()]
+        );
+        assert_eq!(
+            engine.match_triples(Some(&t_bob()), Some(&p_knows()), Some(&t_alice())),
+            vec![t2.clone()]
+        );
     }
 
     #[test]
