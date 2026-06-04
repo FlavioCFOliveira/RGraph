@@ -899,22 +899,29 @@ fn seed_dpt_from_checkpoint(payload: &[u8], dpt: &mut HashMap<u64, DptEntry>) {
         return;
     }
     let count = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    let required_len = 4 + count * 16;
+    // The `count` field comes from a CheckpointEnd record that passed only the
+    // record-level CRC; a corrupt/torn record could claim an arbitrary value.
+    // Compute the required length with checked arithmetic (no overflow even on
+    // 32-bit) and bail on any inconsistency rather than trusting the field or
+    // panicking on the recovery path (finding L8).
+    let Some(required_len) = count.checked_mul(16).and_then(|n| n.checked_add(4)) else {
+        return; // count * 16 + 4 overflows usize → impossible record; ignore
+    };
     if payload.len() < required_len {
-        return; // truncated checkpoint record; ignore
+        return; // truncated/inconsistent checkpoint record; ignore
     }
     for i in 0..count {
         let base = 4 + i * 16;
-        let page_id = u64::from_be_bytes(
-            payload[base..base + 8]
-                .try_into()
-                .expect("slice is 8 bytes"),
-        );
-        let rec_lsn = u64::from_be_bytes(
-            payload[base + 8..base + 16]
-                .try_into()
-                .expect("slice is 8 bytes"),
-        );
+        // The slices are guaranteed to be 8 bytes by the length check above, but
+        // read them totally (no `expect`) so the recovery path can never panic.
+        let (Ok(page_bytes), Ok(lsn_bytes)) = (
+            <[u8; 8]>::try_from(&payload[base..base + 8]),
+            <[u8; 8]>::try_from(&payload[base + 8..base + 16]),
+        ) else {
+            return;
+        };
+        let page_id = u64::from_be_bytes(page_bytes);
+        let rec_lsn = u64::from_be_bytes(lsn_bytes);
         // Only insert if not already present; oldest rec_lsn wins.
         dpt.entry(page_id).or_insert(DptEntry { page_id, rec_lsn });
     }
@@ -1202,6 +1209,38 @@ mod tests {
             buf.iter().all(|&b| b == 0),
             "page must be zeroed after insert undo"
         );
+    }
+
+    #[test]
+    fn seed_dpt_tolerates_corrupt_checkpoint_payloads() {
+        // Regression gate for finding L8 (2026-06-04): a corrupt CheckpointEnd
+        // payload must never panic and must not do unbounded work, whatever the
+        // claimed count.
+        // (a) Huge count with a tiny payload → ignored by the length guard.
+        let mut p = u32::MAX.to_be_bytes().to_vec(); // count = 4_294_967_295
+        p.extend_from_slice(&[0u8; 8]);
+        let mut dpt = HashMap::new();
+        seed_dpt_from_checkpoint(&p, &mut dpt);
+        assert!(dpt.is_empty(), "huge count must not seed any entries");
+
+        // (b) Assorted short payloads never panic.
+        for len in 0..80usize {
+            let payload: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37)).collect();
+            let mut d = HashMap::new();
+            seed_dpt_from_checkpoint(&payload, &mut d); // must not panic
+        }
+
+        // (c) A well-formed payload with count = 2 seeds exactly 2 entries.
+        let mut good = 2u32.to_be_bytes().to_vec();
+        good.extend_from_slice(&10u64.to_be_bytes());
+        good.extend_from_slice(&100u64.to_be_bytes());
+        good.extend_from_slice(&20u64.to_be_bytes());
+        good.extend_from_slice(&200u64.to_be_bytes());
+        let mut d2 = HashMap::new();
+        seed_dpt_from_checkpoint(&good, &mut d2);
+        assert_eq!(d2.len(), 2);
+        assert_eq!(d2[&10].rec_lsn, 100);
+        assert_eq!(d2[&20].rec_lsn, 200);
     }
 
     #[test]
