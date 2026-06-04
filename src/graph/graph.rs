@@ -4,9 +4,9 @@
 //! openCypher-friendly interface for creating and querying graph elements.
 
 use crate::graph::builder::{NodeBuilder, RelationshipBuilder};
-use crate::graph::property::Property;
-use crate::graph::record::{PropertyRecord, SlotRef, ValueType, node_flags, edge_flags};
 use crate::graph::engine::{GraphStorageEngine, StorageEngine, StorageError};
+use crate::graph::property::Property;
+use crate::graph::record::{PropertyRecord, SlotRef, ValueType, edge_flags, node_flags};
 use crate::io::FileSystem;
 use std::collections::HashMap;
 
@@ -110,9 +110,13 @@ impl Graph {
         let id = self.engine.id_allocator.allocate();
         record.edge_id = id;
 
-        let source_slot = self.engine.lookup_node_slot(record.source_id)?
+        let source_slot = self
+            .engine
+            .lookup_node_slot(record.source_id)?
             .ok_or(StorageError::NotFound)?;
-        let target_slot = self.engine.lookup_node_slot(record.target_id)?
+        let target_slot = self
+            .engine
+            .lookup_node_slot(record.target_id)?
             .ok_or(StorageError::NotFound)?;
         record.source_node = source_slot;
         record.target_node = target_slot;
@@ -154,7 +158,8 @@ impl Graph {
         let mut next_slot = SlotRef::NULL; // pointer to the next record in chain
 
         for (key, value) in entries.into_iter().rev() {
-            let (vtype, payload) = value.to_value_type_payload()
+            let (vtype, payload) = value
+                .to_value_type_payload()
                 .unwrap_or((ValueType::Null, Vec::new()));
             let mut prop = PropertyRecord::inline(&key, 0, vtype, payload.clone());
             // Point this record to the previously stored (successor) record.
@@ -174,7 +179,8 @@ impl Graph {
         }
 
         // `next_slot` now points to the head of the chain (first property alphabetically).
-        self.engine.attach_property_to_node(node_id, next_slot, fs)?;
+        self.engine
+            .attach_property_to_node(node_id, next_slot, fs)?;
 
         Ok(())
     }
@@ -198,7 +204,8 @@ impl Graph {
         let mut next_slot = SlotRef::NULL;
 
         for (key, value) in entries.into_iter().rev() {
-            let (vtype, payload) = value.to_value_type_payload()
+            let (vtype, payload) = value
+                .to_value_type_payload()
                 .unwrap_or((ValueType::Null, Vec::new()));
             let mut prop = PropertyRecord::inline(&key, 0, vtype, payload.clone());
             prop.next_property = next_slot;
@@ -206,16 +213,13 @@ impl Graph {
             let prop_slot = self.engine.put_property(&prop, fs)?;
             next_slot = prop_slot;
 
-            let _ = self.engine.insert_property_index(
-                edge_id as u128,
-                0,
-                vtype,
-                &payload,
-                prop_slot,
-            );
+            let _ =
+                self.engine
+                    .insert_property_index(edge_id as u128, 0, vtype, &payload, prop_slot);
         }
 
-        self.engine.attach_property_to_edge(edge_id, next_slot, fs)?;
+        self.engine
+            .attach_property_to_edge(edge_id, next_slot, fs)?;
 
         Ok(())
     }
@@ -304,11 +308,7 @@ impl Graph {
     }
 
     /// Delete a node (leaves a tombstone).
-    pub fn delete_node(
-        &mut self,
-        node_id: u64,
-        fs: &dyn FileSystem,
-    ) -> Result<(), StorageError> {
+    pub fn delete_node(&mut self, node_id: u64, fs: &dyn FileSystem) -> Result<(), StorageError> {
         self.engine.delete_node(node_id, fs)
     }
 
@@ -322,10 +322,7 @@ impl Graph {
     }
 
     /// Flush all durable state to disk.
-    pub fn sync(
-        &mut self,
-        fs: &dyn FileSystem,
-    ) -> Result<(), StorageError> {
+    pub fn sync(&mut self, fs: &dyn FileSystem) -> Result<(), StorageError> {
         self.engine.sync(fs)
     }
 
@@ -489,7 +486,8 @@ impl Graph {
         payload: &[u8],
         slot: SlotRef,
     ) -> Result<(), StorageError> {
-        self.engine.insert_property_index(entity_id as u128, property_id, value_type, payload, slot)
+        self.engine
+            .insert_property_index(entity_id as u128, property_id, value_type, payload, slot)
     }
 
     /// Build and publish a frozen CSR adjacency snapshot (Task 58).
@@ -537,7 +535,9 @@ impl Graph {
         payload: &[u8],
         fs: &dyn FileSystem,
     ) -> Result<Vec<Node>, StorageError> {
-        let entries = self.engine.scan_property_index(property_id, value_type, payload);
+        let entries = self
+            .engine
+            .scan_property_index(property_id, value_type, payload);
         let mut nodes = Vec::new();
         for (entity_id, _prop_slot) in entries {
             let node_id = entity_id as u64;
@@ -592,9 +592,13 @@ impl<'a> GraphMut<'a> {
         let id = self.engine.id_allocator.allocate();
         record.edge_id = id;
 
-        let source_slot = self.engine.lookup_node_slot(record.source_id)?
+        let source_slot = self
+            .engine
+            .lookup_node_slot(record.source_id)?
             .ok_or(StorageError::NotFound)?;
-        let target_slot = self.engine.lookup_node_slot(record.target_id)?
+        let target_slot = self
+            .engine
+            .lookup_node_slot(record.target_id)?
             .ok_or(StorageError::NotFound)?;
         record.source_node = source_slot;
         record.target_node = target_slot;
@@ -615,12 +619,20 @@ impl<'a> GraphMut<'a> {
     }
 
     /// Read a node with its properties.
-    pub fn get_node(&self, node_id: u64, fs: &dyn FileSystem) -> Result<Option<Node>, StorageError> {
+    pub fn get_node(
+        &self,
+        node_id: u64,
+        fs: &dyn FileSystem,
+    ) -> Result<Option<Node>, StorageError> {
         let record = self.engine.get_node(node_id, fs)?;
         match record {
             Some(r) if r.flags & node_flags::DELETED == 0 => {
                 let properties = read_property_chain_engine(self.engine, r.first_property, fs)?;
-                Ok(Some(Node { node_id: r.node_id, label_id: r.label_id, properties }))
+                Ok(Some(Node {
+                    node_id: r.node_id,
+                    label_id: r.label_id,
+                    properties,
+                }))
             }
             _ => Ok(None),
         }
@@ -645,7 +657,8 @@ fn attach_properties_to_node_engine(
     entries.sort_by(|(a, _), (b, _)| a.cmp(b));
     let mut next_slot = SlotRef::NULL;
     for (key, value) in entries.into_iter().rev() {
-        let (vtype, payload) = value.to_value_type_payload()
+        let (vtype, payload) = value
+            .to_value_type_payload()
             .unwrap_or((ValueType::Null, Vec::new()));
         let mut prop = PropertyRecord::inline(&key, 0, vtype, payload.clone());
         prop.next_property = next_slot;
@@ -671,7 +684,8 @@ fn attach_properties_to_edge_engine(
     entries.sort_by(|(a, _), (b, _)| a.cmp(b));
     let mut next_slot = SlotRef::NULL;
     for (key, value) in entries.into_iter().rev() {
-        let (vtype, payload) = value.to_value_type_payload()
+        let (vtype, payload) = value
+            .to_value_type_payload()
             .unwrap_or((ValueType::Null, Vec::new()));
         let mut prop = PropertyRecord::inline(&key, 0, vtype, payload.clone());
         prop.next_property = next_slot;
@@ -681,6 +695,79 @@ fn attach_properties_to_edge_engine(
     }
     engine.attach_property_to_edge(edge_id, next_slot, fs)?;
     Ok(())
+}
+
+/// Replace a node's entire property chain with `properties`, persisting the new
+/// values durably and re-pointing the node's `first_property` head.
+///
+/// The previous chain becomes garbage (reclaimed on compaction), mirroring the
+/// append-only model the rest of the engine uses.  Each new property is also
+/// inserted into the secondary property index so property look-ups see the new
+/// value.  An empty map clears the chain (`first_property = NULL`).
+///
+/// This is the durable write path used by Cypher `SET` (rmp Task 191): the
+/// caller reads the current chain, applies the mutation, and passes the full
+/// resulting map here so the on-disk record reflects the change after commit
+/// and across a restart.
+///
+/// # Errors
+///
+/// Propagates [`StorageError`] on page or WAL I/O failure.
+pub fn rewrite_node_properties_engine(
+    engine: &mut GraphStorageEngine,
+    node_id: u64,
+    properties: HashMap<String, Property>,
+    fs: &dyn FileSystem,
+) -> Result<(), StorageError> {
+    let head = write_property_chain(engine, node_id as u128, properties, fs)?;
+    engine.attach_property_to_node(node_id, head, fs)
+}
+
+/// Replace a relationship's entire property chain with `properties`.  See
+/// [`rewrite_node_properties_engine`] for the semantics.
+///
+/// # Errors
+///
+/// Propagates [`StorageError`] on page or WAL I/O failure.
+pub fn rewrite_edge_properties_engine(
+    engine: &mut GraphStorageEngine,
+    edge_id: u64,
+    properties: HashMap<String, Property>,
+    fs: &dyn FileSystem,
+) -> Result<(), StorageError> {
+    let head = write_property_chain(engine, edge_id as u128, properties, fs)?;
+    engine.attach_property_to_edge(edge_id, head, fs)
+}
+
+/// Persist `properties` as a fresh linked `PropertyRecord` chain and return the
+/// head [`SlotRef`] (or [`SlotRef::NULL`] for an empty map).
+///
+/// Properties are written in reverse sorted-key order so the resulting chain
+/// reads back in a deterministic key order, matching the create path.  Each
+/// entry is also added to the secondary property index keyed by `entity_id`.
+fn write_property_chain(
+    engine: &mut GraphStorageEngine,
+    entity_id: u128,
+    properties: HashMap<String, Property>,
+    fs: &dyn FileSystem,
+) -> Result<SlotRef, StorageError> {
+    if properties.is_empty() {
+        return Ok(SlotRef::NULL);
+    }
+    let mut entries: Vec<(String, Property)> = properties.into_iter().collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let mut next_slot = SlotRef::NULL;
+    for (key, value) in entries.into_iter().rev() {
+        let (vtype, payload) = value
+            .to_value_type_payload()
+            .unwrap_or((ValueType::Null, Vec::new()));
+        let mut prop = PropertyRecord::inline(&key, 0, vtype, payload.clone());
+        prop.next_property = next_slot;
+        let prop_slot = engine.put_property(&prop, fs)?;
+        next_slot = prop_slot;
+        let _ = engine.insert_property_index(entity_id, 0, vtype, &payload, prop_slot);
+    }
+    Ok(next_slot)
 }
 
 pub fn read_property_chain_engine(
@@ -730,8 +817,8 @@ fn decode_property_value(vtype: ValueType, payload: &[u8]) -> Property {
         ValueType::Int64 => {
             if payload.len() >= 8 {
                 let v = i64::from_be_bytes([
-                    payload[0], payload[1], payload[2], payload[3],
-                    payload[4], payload[5], payload[6], payload[7],
+                    payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    payload[6], payload[7],
                 ]);
                 Property::Integer(v)
             } else {
@@ -741,20 +828,18 @@ fn decode_property_value(vtype: ValueType, payload: &[u8]) -> Property {
         ValueType::Float64 => {
             if payload.len() >= 8 {
                 let bits = u64::from_be_bytes([
-                    payload[0], payload[1], payload[2], payload[3],
-                    payload[4], payload[5], payload[6], payload[7],
+                    payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    payload[6], payload[7],
                 ]);
                 Property::Float(OrderedF64(f64::from_bits(bits)))
             } else {
                 Property::Null
             }
         }
-        ValueType::String => {
-            match std::str::from_utf8(payload) {
-                Ok(s) => Property::String(s.to_owned()),
-                Err(_) => Property::Null,
-            }
-        }
+        ValueType::String => match std::str::from_utf8(payload) {
+            Ok(s) => Property::String(s.to_owned()),
+            Err(_) => Property::Null,
+        },
         // Composite types (List, Map) are not yet supported in the codec.
         ValueType::List | ValueType::Map => Property::Null,
     }
@@ -788,6 +873,55 @@ mod tests {
         let node = node.unwrap();
         assert_eq!(node.node_id, node_id);
         assert_eq!(node.label_id, 42);
+    }
+
+    #[test]
+    fn rewrite_node_properties_overwrites_and_adds_and_persists() {
+        let (_dir, fs, path, mut graph) = temp_graph();
+
+        // Create a node with two properties via the builder path.
+        let builder = NodeBuilder::new()
+            .label(1)
+            .property("name".to_string(), Property::String("Alice".to_string()))
+            .property("age".to_string(), Property::Integer(30));
+        let (_, node_id) = graph.create_node(builder, &fs).unwrap();
+
+        // Rewrite: overwrite age, add city, keep name.
+        let engine = graph.engine_mut();
+        let head = engine
+            .get_node(node_id, &fs)
+            .unwrap()
+            .unwrap()
+            .first_property;
+        let mut props = read_property_chain_engine(engine, head, &fs).unwrap();
+        props.insert("age".to_string(), Property::Integer(99));
+        props.insert("city".to_string(), Property::String("NYC".to_string()));
+        rewrite_node_properties_engine(engine, node_id, props, &fs).unwrap();
+        engine.sync(&fs).unwrap();
+
+        // Read back in-process.
+        let node = graph.get_node(node_id, &fs).unwrap().unwrap();
+        assert_eq!(node.properties.get("age"), Some(&Property::Integer(99)));
+        assert_eq!(
+            node.properties.get("city"),
+            Some(&Property::String("NYC".to_string()))
+        );
+        assert_eq!(
+            node.properties.get("name"),
+            Some(&Property::String("Alice".to_string())),
+            "unmodified property is preserved"
+        );
+        drop(graph);
+
+        // Read back after a full reopen.
+        let reopened = GraphStorageEngine::open(path, &fs).unwrap();
+        let g2 = Graph::new(reopened);
+        let node = g2.get_node(node_id, &fs).unwrap().unwrap();
+        assert_eq!(node.properties.get("age"), Some(&Property::Integer(99)));
+        assert_eq!(
+            node.properties.get("city"),
+            Some(&Property::String("NYC".to_string()))
+        );
     }
 
     #[test]
@@ -875,16 +1009,25 @@ mod tests {
         assert_eq!(node.node_id, node_id);
         assert_eq!(node.label_id, 42);
         // Properties are persisted and returned from disk.
-        assert_eq!(node.properties.get("name"), Some(&Property::String("Alice".to_owned())));
+        assert_eq!(
+            node.properties.get("name"),
+            Some(&Property::String("Alice".to_owned()))
+        );
         assert_eq!(node.properties.get("age"), Some(&Property::Integer(30)));
     }
 
     #[test]
     fn scan_nodes_by_label_returns_matching_nodes() {
         let (_dir, fs, _path, mut graph) = temp_graph();
-        let (_, id1) = graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
-        let (_, _id2) = graph.create_node(NodeBuilder::new().label(20), &fs).unwrap();
-        let (_, id3) = graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
+        let (_, id1) = graph
+            .create_node(NodeBuilder::new().label(10), &fs)
+            .unwrap();
+        let (_, _id2) = graph
+            .create_node(NodeBuilder::new().label(20), &fs)
+            .unwrap();
+        let (_, id3) = graph
+            .create_node(NodeBuilder::new().label(10), &fs)
+            .unwrap();
 
         let nodes = graph.scan_by_label(10, &fs).unwrap();
         assert_eq!(nodes.len(), 2);
@@ -896,8 +1039,12 @@ mod tests {
     #[test]
     fn scan_nodes_by_label_excludes_deleted() {
         let (_dir, fs, _path, mut graph) = temp_graph();
-        let (_, id1) = graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
-        let (_, id2) = graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
+        let (_, id1) = graph
+            .create_node(NodeBuilder::new().label(10), &fs)
+            .unwrap();
+        let (_, id2) = graph
+            .create_node(NodeBuilder::new().label(10), &fs)
+            .unwrap();
         graph.delete_node(id1, &fs).unwrap();
 
         let nodes = graph.scan_by_label(10, &fs).unwrap();
@@ -911,15 +1058,33 @@ mod tests {
         let (_, src_id) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
         let (_, tgt_id) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
 
-        let (_, eid1) = graph.create_relationship(
-            RelationshipBuilder::new().from(src_id).to(tgt_id).type_id(5), &fs
-        ).unwrap();
-        let (_, _eid2) = graph.create_relationship(
-            RelationshipBuilder::new().from(tgt_id).to(src_id).type_id(7), &fs
-        ).unwrap();
-        let (_, eid3) = graph.create_relationship(
-            RelationshipBuilder::new().from(src_id).to(tgt_id).type_id(5), &fs
-        ).unwrap();
+        let (_, eid1) = graph
+            .create_relationship(
+                RelationshipBuilder::new()
+                    .from(src_id)
+                    .to(tgt_id)
+                    .type_id(5),
+                &fs,
+            )
+            .unwrap();
+        let (_, _eid2) = graph
+            .create_relationship(
+                RelationshipBuilder::new()
+                    .from(tgt_id)
+                    .to(src_id)
+                    .type_id(7),
+                &fs,
+            )
+            .unwrap();
+        let (_, eid3) = graph
+            .create_relationship(
+                RelationshipBuilder::new()
+                    .from(src_id)
+                    .to(tgt_id)
+                    .type_id(5),
+                &fs,
+            )
+            .unwrap();
 
         let rels = graph.scan_by_type(5, &fs).unwrap();
         assert_eq!(rels.len(), 2);
@@ -934,12 +1099,24 @@ mod tests {
         let (_, src_id) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
         let (_, tgt_id) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
 
-        let (_, eid1) = graph.create_relationship(
-            RelationshipBuilder::new().from(src_id).to(tgt_id).type_id(5), &fs
-        ).unwrap();
-        let (_, eid2) = graph.create_relationship(
-            RelationshipBuilder::new().from(tgt_id).to(src_id).type_id(5), &fs
-        ).unwrap();
+        let (_, eid1) = graph
+            .create_relationship(
+                RelationshipBuilder::new()
+                    .from(src_id)
+                    .to(tgt_id)
+                    .type_id(5),
+                &fs,
+            )
+            .unwrap();
+        let (_, eid2) = graph
+            .create_relationship(
+                RelationshipBuilder::new()
+                    .from(tgt_id)
+                    .to(src_id)
+                    .type_id(5),
+                &fs,
+            )
+            .unwrap();
         graph.delete_relationship(eid1, &fs).unwrap();
 
         let rels = graph.scan_by_type(5, &fs).unwrap();
@@ -950,17 +1127,54 @@ mod tests {
     #[test]
     fn scan_nodes_by_property_returns_matching_nodes() {
         let (_dir, fs, _path, mut graph) = temp_graph();
-        let (_, id1) = graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
-        let (_, id2) = graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
-        let (_, id3) = graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
+        let (_, id1) = graph
+            .create_node(NodeBuilder::new().label(10), &fs)
+            .unwrap();
+        let (_, id2) = graph
+            .create_node(NodeBuilder::new().label(10), &fs)
+            .unwrap();
+        let (_, id3) = graph
+            .create_node(NodeBuilder::new().label(10), &fs)
+            .unwrap();
 
         // Manually insert property index entries.
         let slot = SlotRef::new(1, 0);
-        graph.insert_property_index(id1, 42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), slot).unwrap();
-        graph.insert_property_index(id2, 42, crate::graph::record::ValueType::Int64, &20i64.to_be_bytes(), slot).unwrap();
-        graph.insert_property_index(id3, 42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), slot).unwrap();
+        graph
+            .insert_property_index(
+                id1,
+                42,
+                crate::graph::record::ValueType::Int64,
+                &10i64.to_be_bytes(),
+                slot,
+            )
+            .unwrap();
+        graph
+            .insert_property_index(
+                id2,
+                42,
+                crate::graph::record::ValueType::Int64,
+                &20i64.to_be_bytes(),
+                slot,
+            )
+            .unwrap();
+        graph
+            .insert_property_index(
+                id3,
+                42,
+                crate::graph::record::ValueType::Int64,
+                &10i64.to_be_bytes(),
+                slot,
+            )
+            .unwrap();
 
-        let nodes = graph.scan_nodes_by_property(42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), &fs).unwrap();
+        let nodes = graph
+            .scan_nodes_by_property(
+                42,
+                crate::graph::record::ValueType::Int64,
+                &10i64.to_be_bytes(),
+                &fs,
+            )
+            .unwrap();
         assert_eq!(nodes.len(), 2);
         let ids: Vec<u64> = nodes.iter().map(|n| n.node_id).collect();
         assert!(ids.contains(&id1));
@@ -970,16 +1184,43 @@ mod tests {
     #[test]
     fn scan_nodes_by_property_excludes_deleted() {
         let (_dir, fs, _path, mut graph) = temp_graph();
-        let (_, id1) = graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
-        let (_, id2) = graph.create_node(NodeBuilder::new().label(10), &fs).unwrap();
+        let (_, id1) = graph
+            .create_node(NodeBuilder::new().label(10), &fs)
+            .unwrap();
+        let (_, id2) = graph
+            .create_node(NodeBuilder::new().label(10), &fs)
+            .unwrap();
 
         let slot = SlotRef::new(1, 0);
-        graph.insert_property_index(id1, 42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), slot).unwrap();
-        graph.insert_property_index(id2, 42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), slot).unwrap();
+        graph
+            .insert_property_index(
+                id1,
+                42,
+                crate::graph::record::ValueType::Int64,
+                &10i64.to_be_bytes(),
+                slot,
+            )
+            .unwrap();
+        graph
+            .insert_property_index(
+                id2,
+                42,
+                crate::graph::record::ValueType::Int64,
+                &10i64.to_be_bytes(),
+                slot,
+            )
+            .unwrap();
 
         graph.delete_node(id1, &fs).unwrap();
 
-        let nodes = graph.scan_nodes_by_property(42, crate::graph::record::ValueType::Int64, &10i64.to_be_bytes(), &fs).unwrap();
+        let nodes = graph
+            .scan_nodes_by_property(
+                42,
+                crate::graph::record::ValueType::Int64,
+                &10i64.to_be_bytes(),
+                &fs,
+            )
+            .unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_id, id2);
     }
@@ -1027,7 +1268,10 @@ mod tests {
     fn id_zero_is_rejected_at_engine_put_edge() {
         let (_dir, fs, _path, mut graph) = temp_graph();
         let edge = crate::graph::record::EdgeRecord::new(
-            0, 5, 1, 2,
+            0,
+            5,
+            1,
+            2,
             crate::graph::record::SlotRef::new(1, 0),
             crate::graph::record::SlotRef::new(2, 0),
         );
@@ -1038,7 +1282,9 @@ mod tests {
     #[test]
     fn deleted_record_slot_is_reclaimable() {
         let (_dir, fs, _path, mut graph) = temp_graph();
-        let (_, id1) = graph.create_node(NodeBuilder::new().label(42), &fs).unwrap();
+        let (_, id1) = graph
+            .create_node(NodeBuilder::new().label(42), &fs)
+            .unwrap();
         let slot1 = graph.engine().lookup_node_slot(id1).unwrap().unwrap();
         let page_id = slot1.page_id() as u64;
 
@@ -1046,11 +1292,17 @@ mod tests {
 
         // Insert another node of the same size; the slotted page should
         // reuse the deleted slot via best-fit.
-        let (_, id2) = graph.create_node(NodeBuilder::new().label(99), &fs).unwrap();
+        let (_, id2) = graph
+            .create_node(NodeBuilder::new().label(99), &fs)
+            .unwrap();
         let slot2 = graph.engine().lookup_node_slot(id2).unwrap().unwrap();
 
         // slot2 should be on the same page, and ideally reuse the same slot index.
-        assert_eq!(slot2.page_id(), page_id as u32, "deleted slot page should be reused");
+        assert_eq!(
+            slot2.page_id(),
+            page_id as u32,
+            "deleted slot page should be reused"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1128,23 +1380,24 @@ mod tests {
         let (_, src_id) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
         let (_, tgt_id) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
 
-        let rel = RelationshipBuilder::new().from(src_id).to(tgt_id).type_id(5);
+        let rel = RelationshipBuilder::new()
+            .from(src_id)
+            .to(tgt_id)
+            .type_id(5);
         let (edge_slot, _eid) = graph.create_relationship(rel, &fs).unwrap();
         assert!(!edge_slot.is_null());
 
         // The source node's first_outgoing_edge should point to the edge slot.
         let src_node = graph.engine().get_node(src_id, &fs).unwrap().unwrap();
         assert_eq!(
-            src_node.first_outgoing_edge,
-            edge_slot,
+            src_node.first_outgoing_edge, edge_slot,
             "source node first_outgoing_edge must point to inserted edge"
         );
 
         // The target node's first_incoming_edge should point to the edge slot.
         let tgt_node = graph.engine().get_node(tgt_id, &fs).unwrap().unwrap();
         assert_eq!(
-            tgt_node.first_incoming_edge,
-            edge_slot,
+            tgt_node.first_incoming_edge, edge_slot,
             "target node first_incoming_edge must point to inserted edge"
         );
     }
@@ -1156,7 +1409,10 @@ mod tests {
         let (_, src_id) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
         let (_, tgt_id) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
 
-        let rel = RelationshipBuilder::new().from(src_id).to(tgt_id).type_id(5);
+        let rel = RelationshipBuilder::new()
+            .from(src_id)
+            .to(tgt_id)
+            .type_id(5);
         let (_, eid) = graph.create_relationship(rel, &fs).unwrap();
 
         graph.delete_relationship(eid, &fs).unwrap();
@@ -1182,22 +1438,37 @@ mod tests {
         let (_, tgt1) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
         let (_, tgt2) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
 
-        let (e1_slot, eid1) = graph.create_relationship(
-            RelationshipBuilder::new().from(src_id).to(tgt1).type_id(5), &fs
-        ).unwrap();
-        let (e2_slot, eid2) = graph.create_relationship(
-            RelationshipBuilder::new().from(src_id).to(tgt2).type_id(5), &fs
-        ).unwrap();
+        let (e1_slot, eid1) = graph
+            .create_relationship(
+                RelationshipBuilder::new().from(src_id).to(tgt1).type_id(5),
+                &fs,
+            )
+            .unwrap();
+        let (e2_slot, eid2) = graph
+            .create_relationship(
+                RelationshipBuilder::new().from(src_id).to(tgt2).type_id(5),
+                &fs,
+            )
+            .unwrap();
 
         let src_node = graph.engine().get_node(src_id, &fs).unwrap().unwrap();
         let head = src_node.first_outgoing_edge;
-        assert!(!head.is_null(), "source must have at least one outgoing edge");
+        assert!(
+            !head.is_null(),
+            "source must have at least one outgoing edge"
+        );
 
         // Scan by type to confirm both edges are reachable.
         let rels = graph.scan_by_type(5, &fs).unwrap();
         let edge_ids: Vec<u64> = rels.iter().map(|r| r.edge_id).collect();
-        assert!(edge_ids.contains(&eid1), "edge 1 must be reachable via type scan");
-        assert!(edge_ids.contains(&eid2), "edge 2 must be reachable via type scan");
+        assert!(
+            edge_ids.contains(&eid1),
+            "edge 1 must be reachable via type scan"
+        );
+        assert!(
+            edge_ids.contains(&eid2),
+            "edge 2 must be reachable via type scan"
+        );
 
         // The head slot must be one of the two inserted edges.
         let _ = (e1_slot, e2_slot); // used as sanity reference

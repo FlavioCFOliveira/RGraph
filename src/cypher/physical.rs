@@ -7,7 +7,7 @@
 
 use crate::cypher::ast::{Expression, Projection, RemoveItem, SetItem};
 use crate::cypher::executor::{ExecError, QueryResult};
-use crate::cypher::interpreter::{evaluate, eval_projections, EvalContext};
+use crate::cypher::interpreter::{EvalContext, eval_projections, evaluate};
 use crate::cypher::plan::{LogicalOperator, LogicalPlan};
 use crate::cypher::value::Value;
 use crate::graph::engine::{GraphStorageEngine, StorageEngine};
@@ -40,10 +40,7 @@ fn empty_row() -> Row {
 /// has no more rows to yield.
 pub trait PhysicalOperator {
     /// Yield the next result row, or `None` if exhausted.
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError>;
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError>;
 
     /// Reset the operator to its initial state (for sub-query re-execution).
     fn reset(&mut self);
@@ -148,16 +145,22 @@ impl Default for SingleRowOp {
 }
 
 impl SingleRowOp {
-    pub fn new() -> Self { Self { emitted: false } }
+    pub fn new() -> Self {
+        Self { emitted: false }
+    }
 }
 
 impl PhysicalOperator for SingleRowOp {
     fn next_row(&mut self, _ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
-        if self.emitted { return Ok(None); }
+        if self.emitted {
+            return Ok(None);
+        }
         self.emitted = true;
         Ok(Some(empty_row()))
     }
-    fn reset(&mut self) { self.emitted = false; }
+    fn reset(&mut self) {
+        self.emitted = false;
+    }
 }
 
 /// Scan every node in the graph, binding each to `node_variable`.
@@ -182,10 +185,7 @@ impl AllNodesScanOp {
 }
 
 impl PhysicalOperator for AllNodesScanOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         if self.cursor.is_empty() {
             let start = crate::index::key::node_id_key(0);
             let end = crate::index::key::node_id_key(u128::MAX);
@@ -197,9 +197,8 @@ impl PhysicalOperator for AllNodesScanOp {
             }
             let (key, _value_bytes) = &self.cursor[self.idx];
             self.idx += 1;
-            let node_id = u128::from_be_bytes(
-                key.as_slice()[..16].try_into().unwrap_or([0u8; 16])
-            ) as u64;
+            let node_id =
+                u128::from_be_bytes(key.as_slice()[..16].try_into().unwrap_or([0u8; 16])) as u64;
             match load_node_value(ctx.engine, node_id, ctx.fs)? {
                 Some(node_val) => {
                     let mut row = empty_row();
@@ -241,19 +240,16 @@ impl NodeByLabelScanOp {
 }
 
 impl PhysicalOperator for NodeByLabelScanOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         if self.cursor.is_empty() {
             // Resolve label name → catalog id → storage u64 label id.
-            let label_id = ctx.engine.storage_label_id_for(&self.label)
-                .unwrap_or(0u64);
+            let label_id = ctx.engine.storage_label_id_for(&self.label).unwrap_or(0u64);
             let records = ctx
                 .engine
                 .scan_nodes_by_label(label_id, ctx.fs)
                 .map_err(|e| ExecError::Eval(e.to_string()))?;
-            self.cursor = records.iter()
+            self.cursor = records
+                .iter()
                 .filter(|r| r.flags & crate::graph::record::node_flags::DELETED == 0)
                 .map(|r| r.node_id)
                 .collect();
@@ -318,10 +314,7 @@ impl ExpandOp {
 }
 
 impl PhysicalOperator for ExpandOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         loop {
             // Yield from pending buffer first.
             if self.pending_idx < self.pending.len() {
@@ -338,7 +331,9 @@ impl PhysicalOperator for ExpandOp {
                 // Bind end-node variable.
                 let end_var = self.end_node_variable.as_deref().unwrap_or("_end_node");
                 match load_node_value(ctx.engine, end_node_id, ctx.fs)? {
-                    Some(nv) => { row.insert(end_var.to_string(), nv); }
+                    Some(nv) => {
+                        row.insert(end_var.to_string(), nv);
+                    }
                     None => continue,
                 }
                 return Ok(Some(row));
@@ -357,30 +352,40 @@ impl PhysicalOperator for ExpandOp {
             };
 
             // Resolve type ids via catalog.
-            let type_ids: Vec<u64> = self.rel_types.iter()
-                .filter_map(|t| ctx.engine.storage_label_id_for(t)
-                    .or_else(|| {
+            let type_ids: Vec<u64> = self
+                .rel_types
+                .iter()
+                .filter_map(|t| {
+                    ctx.engine.storage_label_id_for(t).or_else(|| {
                         // Try rel-type catalog (label and rel-type share namespace in storage).
-                        ctx.engine.catalog().read().ok()
+                        ctx.engine
+                            .catalog()
+                            .read()
+                            .ok()
                             .and_then(|c| c.rel_type_id(t))
                             .map(|id| id as u64)
-                    }))
+                    })
+                })
                 .collect();
 
             // Traverse adjacency lists.
             let edges = match self.direction {
-                crate::cypher::ast::Direction::Outgoing => {
-                    ctx.engine.scan_outgoing_edges(start_node_id, &type_ids, ctx.fs)
-                        .map_err(|e| ExecError::Eval(e.to_string()))?
-                }
-                crate::cypher::ast::Direction::Incoming => {
-                    ctx.engine.scan_incoming_edges(start_node_id, &type_ids, ctx.fs)
-                        .map_err(|e| ExecError::Eval(e.to_string()))?
-                }
+                crate::cypher::ast::Direction::Outgoing => ctx
+                    .engine
+                    .scan_outgoing_edges(start_node_id, &type_ids, ctx.fs)
+                    .map_err(|e| ExecError::Eval(e.to_string()))?,
+                crate::cypher::ast::Direction::Incoming => ctx
+                    .engine
+                    .scan_incoming_edges(start_node_id, &type_ids, ctx.fs)
+                    .map_err(|e| ExecError::Eval(e.to_string()))?,
                 crate::cypher::ast::Direction::Both => {
-                    let mut out = ctx.engine.scan_outgoing_edges(start_node_id, &type_ids, ctx.fs)
+                    let mut out = ctx
+                        .engine
+                        .scan_outgoing_edges(start_node_id, &type_ids, ctx.fs)
                         .map_err(|e| ExecError::Eval(e.to_string()))?;
-                    let inc = ctx.engine.scan_incoming_edges(start_node_id, &type_ids, ctx.fs)
+                    let inc = ctx
+                        .engine
+                        .scan_incoming_edges(start_node_id, &type_ids, ctx.fs)
                         .map_err(|e| ExecError::Eval(e.to_string()))?;
                     out.extend(inc);
                     out
@@ -415,10 +420,7 @@ impl FilterOp {
 }
 
 impl PhysicalOperator for FilterOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         loop {
             match self.input.next_row(ctx)? {
                 None => return Ok(None),
@@ -432,7 +434,7 @@ impl PhysicalOperator for FilterOp {
                             return Err(ExecError::Eval(format!(
                                 "FILTER predicate returned '{}', expected Boolean",
                                 other.type_name()
-                            )))
+                            )));
                         }
                         Err(e) => return Err(ExecError::Eval(e.to_string())),
                     }
@@ -454,18 +456,12 @@ pub struct ProjectOp {
 
 impl ProjectOp {
     pub fn new(projections: Vec<Projection>, input: Box<dyn PhysicalOperator>) -> Self {
-        Self {
-            projections,
-            input,
-        }
+        Self { projections, input }
     }
 }
 
 impl PhysicalOperator for ProjectOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         match self.input.next_row(ctx)? {
             None => Ok(None),
             Some(row) => {
@@ -510,10 +506,7 @@ impl SortOp {
 }
 
 impl PhysicalOperator for SortOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         if self.buffer.is_none() {
             let mut rows = Vec::new();
             while let Some(row) = self.input.next_row(ctx)? {
@@ -570,10 +563,7 @@ impl SkipOp {
 }
 
 impl PhysicalOperator for SkipOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         if self.skip_count.is_none() {
             let eval_ctx = eval_context_with_params(ctx);
             let val = evaluate(&self.expression, &eval_ctx)
@@ -617,10 +607,7 @@ impl LimitOp {
 }
 
 impl PhysicalOperator for LimitOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         if self.limit_count.is_none() {
             let eval_ctx = eval_context_with_params(ctx);
             let val = evaluate(&self.expression, &eval_ctx)
@@ -674,9 +661,9 @@ impl CreateOp {
     /// Execute the CREATE pattern against storage, binding created entities in `row`.
     fn execute_create(&self, row: &mut Row, ctx: &ExecutionContext) -> Result<(), ExecError> {
         use crate::cypher::ast::PatternElement;
+        use crate::cypher::interpreter::evaluate;
         use crate::graph::builder::{NodeBuilder, RelationshipBuilder};
         use crate::graph::graph::Graph;
-        use crate::cypher::interpreter::evaluate;
 
         // SAFETY: we are the only caller deriving a `&mut` from the engine
         // pointer during this operator's next_row invocation, and execution is
@@ -693,7 +680,9 @@ impl CreateOp {
             match elem {
                 PatternElement::Node(n) => {
                     // Resolve label → catalog id.
-                    let label_id = n.labels.first()
+                    let label_id = n
+                        .labels
+                        .first()
                         .map(|l| engine.catalog_label_id(l))
                         .unwrap_or(0u32);
 
@@ -711,7 +700,8 @@ impl CreateOp {
                     }
 
                     let mut g = Graph::new_ref(engine);
-                    let (_, node_id) = g.create_node(builder, ctx.fs)
+                    let (_, node_id) = g
+                        .create_node(builder, ctx.fs)
                         .map_err(|e| ExecError::Eval(e.to_string()))?;
 
                     // Bind the created node.
@@ -737,16 +727,21 @@ impl CreateOp {
                 PatternElement::Node(src_node),
                 PatternElement::Relationship(rel),
                 PatternElement::Node(tgt_node),
-            ) = (&elems[i], &elems[i + 1], &elems[i + 2]) {
+            ) = (&elems[i], &elems[i + 1], &elems[i + 2])
+            {
                 // Get source and target node ids from the row.
-                let src_id = src_node.variable.as_ref()
+                let src_id = src_node
+                    .variable
+                    .as_ref()
                     .and_then(|v| row.get(v))
                     .and_then(|val| match val {
                         Value::Node(n) => Some(n.id),
                         Value::Integer(id) => Some(*id as u64),
                         _ => None,
                     });
-                let tgt_id = tgt_node.variable.as_ref()
+                let tgt_id = tgt_node
+                    .variable
+                    .as_ref()
                     .and_then(|v| row.get(v))
                     .and_then(|val| match val {
                         Value::Node(n) => Some(n.id),
@@ -755,9 +750,13 @@ impl CreateOp {
                     });
 
                 if let (Some(src_id), Some(tgt_id)) = (src_id, tgt_id) {
-                    let type_id = rel.types.first()
+                    let type_id = rel
+                        .types
+                        .first()
                         .map(|t| {
-                            engine.catalog().write()
+                            engine
+                                .catalog()
+                                .write()
                                 .expect("catalog write lock poisoned")
                                 .get_or_create_rel_type(t)
                         })
@@ -781,11 +780,15 @@ impl CreateOp {
                     }
 
                     let mut g = Graph::new_ref(engine);
-                    let (_, edge_id) = g.create_relationship(builder, ctx.fs)
+                    let (_, edge_id) = g
+                        .create_relationship(builder, ctx.fs)
                         .map_err(|e| ExecError::Eval(e.to_string()))?;
 
                     if let Some(rv) = &rel.variable {
-                        row.insert(rv.clone(), edge_record_id_to_value(edge_id, type_id, src_id, tgt_id));
+                        row.insert(
+                            rv.clone(),
+                            edge_record_id_to_value(edge_id, type_id, src_id, tgt_id),
+                        );
                     }
                 }
                 i += 2;
@@ -799,10 +802,7 @@ impl CreateOp {
 }
 
 impl PhysicalOperator for CreateOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         match &mut self.input {
             Some(input) => {
                 // Take input reference temporarily to avoid borrow conflict.
@@ -858,10 +858,7 @@ impl EagerOp {
 }
 
 impl PhysicalOperator for EagerOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         if self.buffer.is_none() {
             // Fully consume the input before yielding the first row.
             let mut rows = Vec::new();
@@ -948,7 +945,11 @@ impl VarLenExpandOp {
         let max = self.max_hops.unwrap_or(u32::MAX);
 
         // Queue entries: (current_node_id, path_edges, visited_edge_ids).
-        let mut queue: VecDeque<(u64, Vec<crate::graph::record::EdgeRecord>, std::collections::HashSet<u64>)> = VecDeque::new();
+        let mut queue: VecDeque<(
+            u64,
+            Vec<crate::graph::record::EdgeRecord>,
+            std::collections::HashSet<u64>,
+        )> = VecDeque::new();
         queue.push_back((start_id, Vec::new(), std::collections::HashSet::new()));
 
         let mut results = Vec::new();
@@ -968,16 +969,22 @@ impl VarLenExpandOp {
 
             // Expand edges.
             let edges = match self.direction {
-                crate::cypher::ast::Direction::Outgoing =>
-                    ctx.engine.scan_outgoing_edges(node_id, type_ids, ctx.fs)
-                        .map_err(|e| ExecError::Eval(e.to_string()))?,
-                crate::cypher::ast::Direction::Incoming =>
-                    ctx.engine.scan_incoming_edges(node_id, type_ids, ctx.fs)
-                        .map_err(|e| ExecError::Eval(e.to_string()))?,
+                crate::cypher::ast::Direction::Outgoing => ctx
+                    .engine
+                    .scan_outgoing_edges(node_id, type_ids, ctx.fs)
+                    .map_err(|e| ExecError::Eval(e.to_string()))?,
+                crate::cypher::ast::Direction::Incoming => ctx
+                    .engine
+                    .scan_incoming_edges(node_id, type_ids, ctx.fs)
+                    .map_err(|e| ExecError::Eval(e.to_string()))?,
                 crate::cypher::ast::Direction::Both => {
-                    let mut o = ctx.engine.scan_outgoing_edges(node_id, type_ids, ctx.fs)
+                    let mut o = ctx
+                        .engine
+                        .scan_outgoing_edges(node_id, type_ids, ctx.fs)
                         .map_err(|e| ExecError::Eval(e.to_string()))?;
-                    let i = ctx.engine.scan_incoming_edges(node_id, type_ids, ctx.fs)
+                    let i = ctx
+                        .engine
+                        .scan_incoming_edges(node_id, type_ids, ctx.fs)
                         .map_err(|e| ExecError::Eval(e.to_string()))?;
                     o.extend(i);
                     o
@@ -1017,7 +1024,8 @@ impl PhysicalOperator for VarLenExpandOp {
 
                 if let Some(rv) = &self.rel_variable {
                     // Bind the path as a list of relationship values.
-                    let rels: Vec<Value> = path.iter()
+                    let rels: Vec<Value> = path
+                        .iter()
                         .map(|e| edge_record_to_value(e, ctx.engine, ctx.fs))
                         .collect();
                     row.insert(rv.clone(), Value::List(rels));
@@ -1036,11 +1044,19 @@ impl PhysicalOperator for VarLenExpandOp {
                 _ => continue,
             };
 
-            let type_ids: Vec<u64> = self.rel_types.iter()
-                .filter_map(|t| ctx.engine.storage_label_id_for(t)
-                    .or_else(|| ctx.engine.catalog().read().ok()
-                        .and_then(|c| c.rel_type_id(t))
-                        .map(|id| id as u64)))
+            let type_ids: Vec<u64> = self
+                .rel_types
+                .iter()
+                .filter_map(|t| {
+                    ctx.engine.storage_label_id_for(t).or_else(|| {
+                        ctx.engine
+                            .catalog()
+                            .read()
+                            .ok()
+                            .and_then(|c| c.rel_type_id(t))
+                            .map(|id| id as u64)
+                    })
+                })
                 .collect();
 
             self.pending = self.bfs(start_id, &type_ids, ctx, &input_row)?;
@@ -1062,7 +1078,10 @@ pub struct NodeByIdScanOp {
 
 impl NodeByIdScanOp {
     pub fn new(node_id: u64) -> Self {
-        Self { node_id, emitted: false }
+        Self {
+            node_id,
+            emitted: false,
+        }
     }
 }
 
@@ -1081,7 +1100,9 @@ impl PhysicalOperator for NodeByIdScanOp {
             None => Ok(None),
         }
     }
-    fn reset(&mut self) { self.emitted = false; }
+    fn reset(&mut self) {
+        self.emitted = false;
+    }
 }
 
 /// Nested-loop Apply: for each outer row, iterate the inner plan (re-seeded).
@@ -1094,7 +1115,11 @@ pub struct ApplyOp {
 
 impl ApplyOp {
     pub fn new(outer: Box<dyn PhysicalOperator>, inner: Box<dyn PhysicalOperator>) -> Self {
-        Self { outer, inner, current_outer: None }
+        Self {
+            outer,
+            inner,
+            current_outer: None,
+        }
     }
 }
 
@@ -1167,7 +1192,9 @@ impl PhysicalOperator for HashJoinOp {
         if self.hash_table.is_none() {
             let mut ht: HashMap<Vec<String>, Vec<Row>> = HashMap::new();
             while let Some(row) = self.left.next_row(ctx)? {
-                let key: Vec<String> = self.join_keys.iter()
+                let key: Vec<String> = self
+                    .join_keys
+                    .iter()
                     .map(|k| row.get(k).map(|v| v.to_cypher_string()).unwrap_or_default())
                     .collect();
                 ht.entry(key).or_default().push(row);
@@ -1190,16 +1217,26 @@ impl PhysicalOperator for HashJoinOp {
             }
             let right_row = &self.right_rows[self.right_idx];
             self.right_idx += 1;
-            let key: Vec<String> = self.join_keys.iter()
-                .map(|k| right_row.get(k).map(|v| v.to_cypher_string()).unwrap_or_default())
+            let key: Vec<String> = self
+                .join_keys
+                .iter()
+                .map(|k| {
+                    right_row
+                        .get(k)
+                        .map(|v| v.to_cypher_string())
+                        .unwrap_or_default()
+                })
                 .collect();
             let ht = self.hash_table.as_ref().unwrap();
             if let Some(left_rows) = ht.get(&key) {
-                self.current_matches = left_rows.iter().map(|lr| {
-                    let mut merged = lr.clone();
-                    merged.extend(right_row.clone());
-                    merged
-                }).collect();
+                self.current_matches = left_rows
+                    .iter()
+                    .map(|lr| {
+                        let mut merged = lr.clone();
+                        merged.extend(right_row.clone());
+                        merged
+                    })
+                    .collect();
                 self.current_match_idx = 0;
             } else {
                 self.current_matches.clear();
@@ -1229,12 +1266,14 @@ pub struct UnwindOp {
 }
 
 impl UnwindOp {
-    pub fn new(
-        expression: Expression,
-        variable: String,
-        input: Box<dyn PhysicalOperator>,
-    ) -> Self {
-        Self { expression, variable, input, pending: Vec::new(), pending_idx: 0 }
+    pub fn new(expression: Expression, variable: String, input: Box<dyn PhysicalOperator>) -> Self {
+        Self {
+            expression,
+            variable,
+            input,
+            pending: Vec::new(),
+            pending_idx: 0,
+        }
     }
 }
 
@@ -1288,16 +1327,21 @@ pub struct DeleteOp {
 }
 
 impl DeleteOp {
-    pub fn new(expressions: Vec<Expression>, detach: bool, input: Box<dyn PhysicalOperator>) -> Self {
-        Self { expressions, detach, input }
+    pub fn new(
+        expressions: Vec<Expression>,
+        detach: bool,
+        input: Box<dyn PhysicalOperator>,
+    ) -> Self {
+        Self {
+            expressions,
+            detach,
+            input,
+        }
     }
 }
 
 impl PhysicalOperator for DeleteOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         use crate::cypher::interpreter::evaluate;
         // Process each input row and delete the targeted entities.
         while let Some(row) = self.input.next_row(ctx)? {
@@ -1305,35 +1349,40 @@ impl PhysicalOperator for DeleteOp {
             // SAFETY: single-threaded execution; exclusive engine access.
             let engine = unsafe { &mut *ctx.engine_ptr_mut() };
             for expr in &self.expressions {
-                let val = evaluate(expr, &eval_ctx)
-                    .map_err(|e| ExecError::Eval(e.to_string()))?;
+                let val = evaluate(expr, &eval_ctx).map_err(|e| ExecError::Eval(e.to_string()))?;
                 match val {
                     Value::Node(n) => {
                         if self.detach {
                             // DETACH: delete all outgoing + incoming edges first.
-                            let out = engine.scan_outgoing_edges(n.id, &[], ctx.fs)
+                            let out = engine
+                                .scan_outgoing_edges(n.id, &[], ctx.fs)
                                 .map_err(|e| ExecError::Eval(e.to_string()))?;
                             for (edge, _) in out {
                                 let _ = engine.delete_edge(edge.edge_id, ctx.fs);
                             }
-                            let inc = engine.scan_incoming_edges(n.id, &[], ctx.fs)
+                            let inc = engine
+                                .scan_incoming_edges(n.id, &[], ctx.fs)
                                 .map_err(|e| ExecError::Eval(e.to_string()))?;
                             for (edge, _) in inc {
                                 let _ = engine.delete_edge(edge.edge_id, ctx.fs);
                             }
                         }
-                        engine.delete_node(n.id, ctx.fs)
+                        engine
+                            .delete_node(n.id, ctx.fs)
                             .map_err(|e| ExecError::Eval(e.to_string()))?;
                     }
                     Value::Relationship(r) => {
-                        engine.delete_edge(r.id, ctx.fs)
+                        engine
+                            .delete_edge(r.id, ctx.fs)
                             .map_err(|e| ExecError::Eval(e.to_string()))?;
                     }
                     Value::Null => {} // silently skip NULL
-                    other => return Err(ExecError::Eval(format!(
-                        "DELETE requires a node or relationship, got '{}'",
-                        other.type_name()
-                    ))),
+                    other => {
+                        return Err(ExecError::Eval(format!(
+                            "DELETE requires a node or relationship, got '{}'",
+                            other.type_name()
+                        )));
+                    }
                 }
             }
         }
@@ -1358,41 +1407,62 @@ impl SetOp {
 }
 
 impl PhysicalOperator for SetOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
-        use crate::cypher::ast::SetItem;
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
+        use crate::cypher::ast::{Expression, SetItem};
         use crate::cypher::interpreter::evaluate;
         match self.input.next_row(ctx)? {
             None => Ok(None),
             Some(mut row) => {
-                let eval_ctx = row_to_eval_context(&row, ctx);
+                // Track which row variables had their properties mutated so we
+                // can flush each entity's full property map to storage once,
+                // after applying every SET item, within this statement.
+                let mut mutated: Vec<String> = Vec::new();
+                let mark_mutated = |var: &str, mutated: &mut Vec<String>| {
+                    if !mutated.iter().any(|v| v == var) {
+                        mutated.push(var.to_string());
+                    }
+                };
+
                 for item in &self.items {
+                    let eval_ctx = row_to_eval_context(&row, ctx);
                     match item {
                         SetItem::Property { target, value } => {
-                            // Evaluate the target to get node/rel id, then update property.
-                            let _target_val = evaluate(target, &eval_ctx)
-                                .map_err(|e| ExecError::Eval(e.to_string()))?;
                             let new_val = evaluate(value, &eval_ctx)
                                 .map_err(|e| ExecError::Eval(e.to_string()))?;
-                            // For now, update the in-row value (full durable write deferred to Sprint D).
-                            if let crate::cypher::ast::Expression::PropertyAccess { base, property, .. } = target.as_ref()
-                                && let crate::cypher::ast::Expression::Variable(var) = base.as_ref()
+                            if let Expression::PropertyAccess { base, property, .. } =
+                                target.as_ref()
+                                && let Expression::Variable(var) = base.as_ref()
                                 && let Some(val) = row.get_mut(var)
                             {
-                                if let Value::Node(n) = val {
-                                    n.properties.insert(property.clone(), new_val);
-                                } else if let Value::Relationship(r) = val {
-                                    r.properties.insert(property.clone(), new_val);
+                                match val {
+                                    Value::Node(n) => {
+                                        // SET n.prop = NULL removes the property
+                                        // (openCypher semantics).
+                                        if matches!(new_val, Value::Null) {
+                                            n.properties.remove(property);
+                                        } else {
+                                            n.properties.insert(property.clone(), new_val);
+                                        }
+                                        mark_mutated(var, &mut mutated);
+                                    }
+                                    Value::Relationship(r) => {
+                                        if matches!(new_val, Value::Null) {
+                                            r.properties.remove(property);
+                                        } else {
+                                            r.properties.insert(property.clone(), new_val);
+                                        }
+                                        mark_mutated(var, &mut mutated);
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
                         SetItem::Label { variable, labels } => {
-                            // Label addition is an in-memory update for now.
-                            if let Some(val) = row.get_mut(variable)
-                                && let Value::Node(n) = val
-                            {
+                            // Label addition updates the in-row value; durable
+                            // multi-label storage is not yet modelled (the node
+                            // record carries a single label_id), so this remains
+                            // an in-statement projection only.
+                            if let Some(Value::Node(n)) = row.get_mut(variable) {
                                 for label in labels {
                                     if !n.labels.contains(label) {
                                         n.labels.push(label.clone());
@@ -1400,20 +1470,72 @@ impl PhysicalOperator for SetOp {
                                 }
                             }
                         }
-                        SetItem::Merge { variable, value } | SetItem::Replace { variable, value } => {
+                        SetItem::Merge { variable, value } => {
+                            // `n += {map}`: merge the map's entries on top of the
+                            // existing properties.
                             let new_val = evaluate(value, &eval_ctx)
                                 .map_err(|e| ExecError::Eval(e.to_string()))?;
-                            if let Some(entity) = row.get_mut(variable)
-                                && let Value::Map(ref props) = new_val.clone()
-                                && let Value::Node(n) = entity
+                            if let Value::Map(props) = new_val
+                                && let Some(Value::Node(n)) = row.get_mut(variable)
                             {
                                 for (k, v) in props {
-                                    n.properties.insert(k.clone(), v.clone());
+                                    if matches!(v, Value::Null) {
+                                        n.properties.remove(&k);
+                                    } else {
+                                        n.properties.insert(k, v);
+                                    }
                                 }
+                                mark_mutated(variable, &mut mutated);
+                            }
+                        }
+                        SetItem::Replace { variable, value } => {
+                            // `n = {map}`: replace ALL properties with the map.
+                            let new_val = evaluate(value, &eval_ctx)
+                                .map_err(|e| ExecError::Eval(e.to_string()))?;
+                            if let Value::Map(props) = new_val
+                                && let Some(Value::Node(n)) = row.get_mut(variable)
+                            {
+                                n.properties.clear();
+                                for (k, v) in props {
+                                    if !matches!(v, Value::Null) {
+                                        n.properties.insert(k, v);
+                                    }
+                                }
+                                mark_mutated(variable, &mut mutated);
                             }
                         }
                     }
                 }
+
+                // Flush mutated entities' full property maps to durable storage
+                // so a later MATCH (and a restart) reads the new values
+                // (rmp Task 191).
+                if !mutated.is_empty() {
+                    // SAFETY: single-threaded execution; the context holds the
+                    // sole mutable engine borrow. See ExecutionContext::
+                    // engine_ptr_mut for the invariants.
+                    let engine = unsafe { &mut *ctx.engine_ptr_mut() };
+                    for var in &mutated {
+                        match row.get(var) {
+                            Some(Value::Node(n)) => {
+                                let props = node_properties_to_storage(&n.properties);
+                                crate::graph::graph::rewrite_node_properties_engine(
+                                    engine, n.id, props, ctx.fs,
+                                )
+                                .map_err(|e| ExecError::Eval(e.to_string()))?;
+                            }
+                            Some(Value::Relationship(r)) => {
+                                let props = node_properties_to_storage(&r.properties);
+                                crate::graph::graph::rewrite_edge_properties_engine(
+                                    engine, r.id, props, ctx.fs,
+                                )
+                                .map_err(|e| ExecError::Eval(e.to_string()))?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 Ok(Some(row))
             }
         }
@@ -1437,10 +1559,7 @@ impl RemoveOp {
 }
 
 impl PhysicalOperator for RemoveOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         use crate::cypher::ast::RemoveItem;
         match self.input.next_row(ctx)? {
             None => Ok(None),
@@ -1448,7 +1567,11 @@ impl PhysicalOperator for RemoveOp {
                 for item in &self.items {
                     match item {
                         RemoveItem::Property { target } => {
-                            if let crate::cypher::ast::Expression::PropertyAccess { base, property, .. } = target.as_ref()
+                            if let crate::cypher::ast::Expression::PropertyAccess {
+                                base,
+                                property,
+                                ..
+                            } = target.as_ref()
                                 && let crate::cypher::ast::Expression::Variable(var) = base.as_ref()
                                 && let Some(val) = row.get_mut(var)
                             {
@@ -1500,15 +1623,17 @@ impl MergeOp {
         on_match: Vec<SetItem>,
         input: Box<dyn PhysicalOperator>,
     ) -> Self {
-        Self { pattern, on_create, on_match, input }
+        Self {
+            pattern,
+            on_create,
+            on_match,
+            input,
+        }
     }
 }
 
 impl PhysicalOperator for MergeOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         // MERGE: try to MATCH the pattern; on failure, CREATE it.
         // This is a simplified single-node MERGE for now.
         // Full relationship MERGE support will be added in Sprint D.
@@ -1530,15 +1655,19 @@ impl PhysicalOperator for MergeOp {
                     continue;
                 }
                 // Try to find a matching node.
-                let label_id = n.labels.first()
+                let label_id = n
+                    .labels
+                    .first()
                     .and_then(|l| ctx.engine.storage_label_id_for(l))
                     .unwrap_or(0u64);
-                let nodes = ctx.engine.scan_nodes_by_label(label_id, ctx.fs)
+                let nodes = ctx
+                    .engine
+                    .scan_nodes_by_label(label_id, ctx.fs)
                     .map_err(|e| ExecError::Eval(e.to_string()))?;
 
-                let found = nodes.into_iter().find(|r| {
-                    r.flags & crate::graph::record::node_flags::DELETED == 0
-                });
+                let found = nodes
+                    .into_iter()
+                    .find(|r| r.flags & crate::graph::record::node_flags::DELETED == 0);
 
                 if let Some(record) = found
                     && let Ok(Some(nv)) = load_node_value(ctx.engine, record.node_id, ctx.fs)
@@ -1562,12 +1691,15 @@ impl PhysicalOperator for MergeOp {
             let engine = unsafe { &mut *ctx.engine_ptr_mut() };
             for elem in &self.pattern.elements {
                 if let crate::cypher::ast::PatternElement::Node(n) = elem {
-                    let label_id = n.labels.first()
+                    let label_id = n
+                        .labels
+                        .first()
                         .map(|l| engine.catalog_label_id(l))
                         .unwrap_or(0u32);
                     let builder = NodeBuilder::new().label(label_id);
                     let mut g = Graph::new_ref(engine);
-                    let (_, node_id) = g.create_node(builder, ctx.fs)
+                    let (_, node_id) = g
+                        .create_node(builder, ctx.fs)
                         .map_err(|e| ExecError::Eval(e.to_string()))?;
                     if let Some(var) = &n.variable
                         && let Some(nv) = load_node_value(engine, node_id, ctx.fs)?
@@ -1613,10 +1745,7 @@ impl AggregateOp {
 }
 
 impl PhysicalOperator for AggregateOp {
-    fn next_row(
-        &mut self,
-        ctx: &ExecutionContext,
-    ) -> Result<Option<Row>, ExecError> {
+    fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         if self.buffer.is_none() {
             let mut groups: Vec<(Vec<Value>, Vec<Row>)> = Vec::new();
 
@@ -1645,7 +1774,8 @@ impl PhysicalOperator for AggregateOp {
                 }
                 // Compute each aggregate.
                 for agg in &self.aggregations {
-                    let val = compute_aggregate(&agg.function, &agg.argument, &rows, agg.distinct, ctx)?;
+                    let val =
+                        compute_aggregate(&agg.function, &agg.argument, &rows, agg.distinct, ctx)?;
                     result_row.insert(agg.alias.clone(), val);
                 }
                 out.push(result_row);
@@ -1713,9 +1843,9 @@ fn compute_aggregate(
         AggregateFunction::Sum => {
             let mut sum = Value::Integer(0);
             for v in values {
-                sum = sum.add(&v).ok_or_else(|| ExecError::Eval(
-                    "type mismatch in sum".to_string()
-                ))?;
+                sum = sum
+                    .add(&v)
+                    .ok_or_else(|| ExecError::Eval("type mismatch in sum".to_string()))?;
             }
             Ok(sum)
         }
@@ -1725,14 +1855,13 @@ fn compute_aggregate(
             }
             let mut sum = Value::Float(crate::graph::property::OrderedF64(0.0));
             for v in &values {
-                sum = sum.add(v).ok_or_else(|| ExecError::Eval(
-                    "type mismatch in avg".to_string()
-                ))?;
+                sum = sum
+                    .add(v)
+                    .ok_or_else(|| ExecError::Eval("type mismatch in avg".to_string()))?;
             }
             let count = Value::Integer(values.len() as i64);
-            sum.div(&count).ok_or_else(|| ExecError::Eval(
-                "type mismatch in avg".to_string()
-            ))
+            sum.div(&count)
+                .ok_or_else(|| ExecError::Eval("type mismatch in avg".to_string()))
         }
         AggregateFunction::Min => {
             if values.is_empty() {
@@ -1773,15 +1902,19 @@ pub(crate) fn load_node_value(
 ) -> Result<Option<Value>, ExecError> {
     use crate::graph::graph::read_property_chain_engine;
     use crate::graph::record::node_flags;
-    let record = match engine.get_node(node_id, fs)
-        .map_err(|e| ExecError::Eval(e.to_string()))? {
+    let record = match engine
+        .get_node(node_id, fs)
+        .map_err(|e| ExecError::Eval(e.to_string()))?
+    {
         Some(r) if r.flags & node_flags::DELETED == 0 => r,
         _ => return Ok(None),
     };
     let raw_props = read_property_chain_engine(engine, record.first_property, fs)
         .map_err(|e| ExecError::Eval(e.to_string()))?;
     // Convert label_id to label name via catalog.
-    let label_name = engine.catalog().read()
+    let label_name = engine
+        .catalog()
+        .read()
         .expect("catalog read lock poisoned")
         .label_name(record.label_id)
         .map(|s| s.to_string());
@@ -1804,13 +1937,14 @@ fn edge_record_to_value(
     fs: &dyn FileSystem,
 ) -> Value {
     use crate::graph::graph::read_property_chain_engine;
-    let type_name = engine.catalog().read()
+    let type_name = engine
+        .catalog()
+        .read()
         .expect("catalog read lock")
         .rel_type_name(edge.type_id)
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("TYPE_{}", edge.type_id));
-    let raw_props = read_property_chain_engine(engine, edge.first_property, fs)
-        .unwrap_or_default();
+    let raw_props = read_property_chain_engine(engine, edge.first_property, fs).unwrap_or_default();
     let mut properties = HashMap::new();
     for (k, prop) in raw_props {
         properties.insert(k, crate::cypher::value::Value::from_property(prop));
@@ -1833,6 +1967,24 @@ fn edge_record_id_to_value(edge_id: u64, type_id: u32, source_id: u64, target_id
         target_id,
         properties: HashMap::new(),
     })
+}
+
+/// Convert a row entity's runtime property map into the storage [`Property`]
+/// map used by the durable property-chain writer.
+///
+/// Values that have no storable scalar representation (`List`, `Map`, `Node`,
+/// etc.) are dropped — they are not yet supported by the on-disk property
+/// codec, matching the CREATE path's behaviour.
+fn node_properties_to_storage(
+    props: &HashMap<String, Value>,
+) -> HashMap<String, crate::graph::property::Property> {
+    let mut out = HashMap::with_capacity(props.len());
+    for (k, v) in props {
+        if let Some(p) = value_to_property(v) {
+            out.insert(k.clone(), p);
+        }
+    }
+    out
 }
 
 /// Convert a runtime `Value` to a storage `Property`.
@@ -1954,28 +2106,26 @@ fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
             let input_op = input.as_ref().map(|i| build_physical_operator(i));
             Box::new(CreateOp::new(pattern.clone(), input_op))
         }
-        LogicalOperator::Eager { input } => {
-            Box::new(EagerOp::new(build_physical_operator(input)))
-        }
-        LogicalOperator::Delete { input, expressions, detach } => Box::new(DeleteOp::new(
+        LogicalOperator::Eager { input } => Box::new(EagerOp::new(build_physical_operator(input))),
+        LogicalOperator::Delete {
+            input,
+            expressions,
+            detach,
+        } => Box::new(DeleteOp::new(
             expressions.clone(),
             *detach,
             build_physical_operator(input),
         )),
-        LogicalOperator::Set { input, items } => Box::new(SetOp::new(
-            items.clone(),
-            build_physical_operator(input),
-        )),
-        LogicalOperator::Remove { input, items } => Box::new(RemoveOp::new(
-            items.clone(),
-            build_physical_operator(input),
-        )),
-        LogicalOperator::Apply { left, right } => {
-            Box::new(ApplyOp::new(
-                build_physical_operator(left),
-                build_physical_operator(right),
-            ))
+        LogicalOperator::Set { input, items } => {
+            Box::new(SetOp::new(items.clone(), build_physical_operator(input)))
         }
+        LogicalOperator::Remove { input, items } => {
+            Box::new(RemoveOp::new(items.clone(), build_physical_operator(input)))
+        }
+        LogicalOperator::Apply { left, right } => Box::new(ApplyOp::new(
+            build_physical_operator(left),
+            build_physical_operator(right),
+        )),
         LogicalOperator::Aggregate {
             input,
             grouping_keys,
@@ -1985,21 +2135,26 @@ fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
             aggregations.clone(),
             build_physical_operator(input),
         )),
-        LogicalOperator::HashJoin { left, right, join_keys } => {
-            Box::new(HashJoinOp::new(
-                build_physical_operator(left),
-                build_physical_operator(right),
-                join_keys.clone(),
-            ))
-        }
-        LogicalOperator::Merge { input, pattern, on_create, on_match } => {
-            Box::new(MergeOp::new(
-                pattern.clone(),
-                on_create.clone(),
-                on_match.clone(),
-                build_physical_operator(input),
-            ))
-        }
+        LogicalOperator::HashJoin {
+            left,
+            right,
+            join_keys,
+        } => Box::new(HashJoinOp::new(
+            build_physical_operator(left),
+            build_physical_operator(right),
+            join_keys.clone(),
+        )),
+        LogicalOperator::Merge {
+            input,
+            pattern,
+            on_create,
+            on_match,
+        } => Box::new(MergeOp::new(
+            pattern.clone(),
+            on_create.clone(),
+            on_match.clone(),
+            build_physical_operator(input),
+        )),
     }
 }
 
@@ -2012,10 +2167,7 @@ fn build_physical_operator(op: &LogicalOperator) -> Box<dyn PhysicalOperator> {
 ///
 /// Column order follows the RETURN projection order as declared in the query.
 /// The `plan` must have been built with [`crate::cypher::planner::plan`].
-pub fn execute_plan(
-    plan: &LogicalPlan,
-    ctx: &ExecutionContext,
-) -> Result<QueryResult, ExecError> {
+pub fn execute_plan(plan: &LogicalPlan, ctx: &ExecutionContext) -> Result<QueryResult, ExecError> {
     // Derive the expected column order from the root Project operator if present.
     let projection_columns = extract_projection_columns(&plan.root);
 
@@ -2033,9 +2185,10 @@ pub fn execute_plan(
             columns = first_row.keys().cloned().collect();
             columns.sort();
         }
-        let values: Vec<Value> = columns.iter().map(|c| {
-            first_row.get(c).cloned().unwrap_or(Value::Null)
-        }).collect();
+        let values: Vec<Value> = columns
+            .iter()
+            .map(|c| first_row.get(c).cloned().unwrap_or(Value::Null))
+            .collect();
         rows.push(values);
     } else if !projection_columns.is_empty() {
         // Empty result — still expose the columns from the RETURN clause.
@@ -2044,9 +2197,10 @@ pub fn execute_plan(
 
     // Pull remaining rows.
     while let Some(row) = physical.next_row(ctx)? {
-        let values: Vec<Value> = columns.iter().map(|c| {
-            row.get(c).cloned().unwrap_or(Value::Null)
-        }).collect();
+        let values: Vec<Value> = columns
+            .iter()
+            .map(|c| row.get(c).cloned().unwrap_or(Value::Null))
+            .collect();
         rows.push(values);
     }
 
@@ -2056,13 +2210,16 @@ pub fn execute_plan(
 /// Walk the logical plan tree to find the projection column names in RETURN order.
 fn extract_projection_columns(op: &LogicalOperator) -> Vec<String> {
     match op {
-        LogicalOperator::Project { projections, .. } => {
-            projections.iter().map(|p| {
-                p.alias.clone().unwrap_or_else(|| p.expression.to_string())
-            }).collect()
-        }
+        LogicalOperator::Project { projections, .. } => projections
+            .iter()
+            .map(|p| p.alias.clone().unwrap_or_else(|| p.expression.to_string()))
+            .collect(),
         // Descend through transparent wrappers.
-        LogicalOperator::Aggregate { grouping_keys, aggregations, .. } => {
+        LogicalOperator::Aggregate {
+            grouping_keys,
+            aggregations,
+            ..
+        } => {
             let mut cols: Vec<String> = grouping_keys.iter().map(|e| e.to_string()).collect();
             cols.extend(aggregations.iter().map(|a| a.alias.clone()));
             cols
@@ -2080,16 +2237,20 @@ fn extract_projection_columns(op: &LogicalOperator) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::cypher::ast::{Expression, Literal, Projection};
-    
 
     #[test]
     fn filter_op_keeps_true_rows() {
         let input = Box::new(MockOp::new(vec![
-            vec![("x".to_string(), Value::Integer(5))].into_iter().collect(),
-            vec![("x".to_string(), Value::Integer(15))].into_iter().collect(),
+            vec![("x".to_string(), Value::Integer(5))]
+                .into_iter()
+                .collect(),
+            vec![("x".to_string(), Value::Integer(15))]
+                .into_iter()
+                .collect(),
         ]));
         let mut filter = FilterOp::new(
-            Expression::Comparison { span: None,
+            Expression::Comparison {
+                span: None,
                 op: crate::cypher::ast::ComparisonOperator::Gt,
                 left: Box::new(Expression::Variable("x".to_string())),
                 right: Box::new(Expression::Literal(Literal::Integer(10))),
@@ -2107,11 +2268,14 @@ mod tests {
     #[test]
     fn project_op_renames_columns() {
         let input = Box::new(MockOp::new(vec![
-            vec![("a".to_string(), Value::Integer(1))].into_iter().collect(),
+            vec![("a".to_string(), Value::Integer(1))]
+                .into_iter()
+                .collect(),
         ]));
         let mut proj = ProjectOp::new(
-            vec![Projection { span: None,
-                    expression: Expression::Variable("a".to_string()),
+            vec![Projection {
+                span: None,
+                expression: Expression::Variable("a".to_string()),
                 alias: Some("b".to_string()),
             }],
             input,
@@ -2124,14 +2288,17 @@ mod tests {
     #[test]
     fn limit_op_stops_after_n() {
         let input = Box::new(MockOp::new(vec![
-            vec![("i".to_string(), Value::Integer(1))].into_iter().collect(),
-            vec![("i".to_string(), Value::Integer(2))].into_iter().collect(),
-            vec![("i".to_string(), Value::Integer(3))].into_iter().collect(),
+            vec![("i".to_string(), Value::Integer(1))]
+                .into_iter()
+                .collect(),
+            vec![("i".to_string(), Value::Integer(2))]
+                .into_iter()
+                .collect(),
+            vec![("i".to_string(), Value::Integer(3))]
+                .into_iter()
+                .collect(),
         ]));
-        let mut limit = LimitOp::new(
-            Expression::Literal(Literal::Integer(2)),
-            input,
-        );
+        let mut limit = LimitOp::new(Expression::Literal(Literal::Integer(2)), input);
         let ctx = mock_ctx();
         assert!(limit.next_row(&ctx).unwrap().is_some());
         assert!(limit.next_row(&ctx).unwrap().is_some());
@@ -2141,14 +2308,17 @@ mod tests {
     #[test]
     fn skip_op_drops_first_n() {
         let input = Box::new(MockOp::new(vec![
-            vec![("i".to_string(), Value::Integer(1))].into_iter().collect(),
-            vec![("i".to_string(), Value::Integer(2))].into_iter().collect(),
-            vec![("i".to_string(), Value::Integer(3))].into_iter().collect(),
+            vec![("i".to_string(), Value::Integer(1))]
+                .into_iter()
+                .collect(),
+            vec![("i".to_string(), Value::Integer(2))]
+                .into_iter()
+                .collect(),
+            vec![("i".to_string(), Value::Integer(3))]
+                .into_iter()
+                .collect(),
         ]));
-        let mut skip = SkipOp::new(
-            Expression::Literal(Literal::Integer(1)),
-            input,
-        );
+        let mut skip = SkipOp::new(Expression::Literal(Literal::Integer(1)), input);
         let ctx = mock_ctx();
         let row = skip.next_row(&ctx).unwrap().unwrap();
         assert_eq!(row.get("i"), Some(&Value::Integer(2)));
@@ -2159,9 +2329,24 @@ mod tests {
     #[test]
     fn aggregate_op_count_grouped() {
         let input = Box::new(MockOp::new(vec![
-            vec![("dept".to_string(), Value::String("a".to_string())), ("salary".to_string(), Value::Integer(100))].into_iter().collect(),
-            vec![("dept".to_string(), Value::String("a".to_string())), ("salary".to_string(), Value::Integer(200))].into_iter().collect(),
-            vec![("dept".to_string(), Value::String("b".to_string())), ("salary".to_string(), Value::Integer(300))].into_iter().collect(),
+            vec![
+                ("dept".to_string(), Value::String("a".to_string())),
+                ("salary".to_string(), Value::Integer(100)),
+            ]
+            .into_iter()
+            .collect(),
+            vec![
+                ("dept".to_string(), Value::String("a".to_string())),
+                ("salary".to_string(), Value::Integer(200)),
+            ]
+            .into_iter()
+            .collect(),
+            vec![
+                ("dept".to_string(), Value::String("b".to_string())),
+                ("salary".to_string(), Value::Integer(300)),
+            ]
+            .into_iter()
+            .collect(),
         ]));
         let mut agg = AggregateOp::new(
             vec![Expression::Variable("dept".to_string())],
@@ -2180,9 +2365,15 @@ mod tests {
         }
         assert_eq!(results.len(), 2);
         // Find group 'a'
-        let group_a = results.iter().find(|r| r.get("dept") == Some(&Value::String("a".to_string()))).unwrap();
+        let group_a = results
+            .iter()
+            .find(|r| r.get("dept") == Some(&Value::String("a".to_string())))
+            .unwrap();
         assert_eq!(group_a.get("c"), Some(&Value::Integer(2)));
-        let group_b = results.iter().find(|r| r.get("dept") == Some(&Value::String("b".to_string()))).unwrap();
+        let group_b = results
+            .iter()
+            .find(|r| r.get("dept") == Some(&Value::String("b".to_string())))
+            .unwrap();
         assert_eq!(group_b.get("c"), Some(&Value::Integer(1)));
     }
 
@@ -2219,10 +2410,7 @@ mod tests {
             polls: Rc<Cell<usize>>,
         }
         impl PhysicalOperator for CountingOp {
-            fn next_row(
-                &mut self,
-                _ctx: &ExecutionContext,
-            ) -> Result<Option<Row>, ExecError> {
+            fn next_row(&mut self, _ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
                 self.polls.set(self.polls.get() + 1);
                 if self.idx >= self.n {
                     return Ok(None);
@@ -2337,10 +2525,7 @@ mod tests {
     }
 
     impl PhysicalOperator for MockOp {
-        fn next_row(
-            &mut self,
-            _ctx: &ExecutionContext,
-        ) -> Result<Option<Row>, ExecError> {
+        fn next_row(&mut self, _ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
             if self.idx >= self.rows.len() {
                 return Ok(None);
             }

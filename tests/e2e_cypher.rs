@@ -276,6 +276,77 @@ fn delete_removes_node_from_subsequent_match() {
 }
 
 // ------------------------------------------------------------------
+// Task 191: SET write-back is durable across statements and across a restart.
+// A new property and an overwritten property are both flushed to the record;
+// unmodified properties survive; the value persists after reopen.
+// ------------------------------------------------------------------
+
+#[test]
+fn set_property_write_back_persists_across_statements_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rgraph.db");
+    let fs = PosixFileSystem::new(false);
+    init_db(&db_path, &fs);
+
+    run_write(&db_path, "CREATE (a:Person {name: 'Alice', age: 30})", &fs);
+
+    // Overwrite an existing property (age) and add a new one (city).
+    let mutated = run_write(
+        &db_path,
+        "MATCH (n) WHERE n.name = 'Alice' SET n.age = 99, n.city = 'NYC' RETURN n.age AS age, n.city AS city",
+        &fs,
+    );
+    assert_eq!(
+        integer_column(&mutated, "age"),
+        vec![99],
+        "mutating statement sees new age"
+    );
+    assert_eq!(string_column(&mutated, "city"), vec!["NYC".to_string()]);
+
+    // A fresh, separate statement must read the persisted values (not pre-SET).
+    let readback = run_write(
+        &db_path,
+        "MATCH (n) WHERE n.name = 'Alice' RETURN n.age AS age, n.city AS city, n.name AS name",
+        &fs,
+    );
+    assert_eq!(
+        integer_column(&readback, "age"),
+        vec![99],
+        "overwritten property persists to the record"
+    );
+    assert_eq!(
+        string_column(&readback, "city"),
+        vec!["NYC".to_string()],
+        "new property persists to the record"
+    );
+    assert_eq!(
+        string_column(&readback, "name"),
+        vec!["Alice".to_string()],
+        "an unmodified property is preserved by the rewrite"
+    );
+
+    // Across a full reopen, the durable values are still there.
+    {
+        let mut engine = GraphStorageEngine::open(db_path.clone(), &fs).expect("reopen");
+        engine.sync(&fs).expect("sync");
+    }
+    let after_restart = run_write(
+        &db_path,
+        "MATCH (n) WHERE n.name = 'Alice' RETURN n.age AS age, n.city AS city",
+        &fs,
+    );
+    assert_eq!(
+        integer_column(&after_restart, "age"),
+        vec![99],
+        "SET value survives a restart"
+    );
+    assert_eq!(
+        string_column(&after_restart, "city"),
+        vec!["NYC".to_string()]
+    );
+}
+
+// ------------------------------------------------------------------
 // MERGE is NOT asserted here.
 //
 // Verified during Task 185: against the real engine pipeline `MERGE (e:Person
