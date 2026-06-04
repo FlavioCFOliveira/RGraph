@@ -318,19 +318,33 @@ fn main() {
                 cpu_pool_threads: cpu_threads,
             };
 
-            let runtime = ServerRuntime::new(config.clone()).expect("create runtime");
+            // Server startup is fallible; on failure log, report, and exit with
+            // the matching code rather than panicking.
+            let fail_startup = |e: rgraph::error::RGraphError| -> ! {
+                tracing::error!("server startup failed: {}", e);
+                eprintln!("Error: {}", e);
+                std::process::exit(exit_code_for(&e));
+            };
+
+            let runtime = match ServerRuntime::new(config.clone()) {
+                Ok(rt) => rt,
+                Err(e) => fail_startup(e),
+            };
 
             let data_path = path.join("rgraph.db");
-            let engine: Arc<dyn AsyncGraphEngine> =
-                if data_path.exists() {
-                    Arc::new(GraphEngineAdapter::init(data_path).expect("open graph engine"))
-                } else {
-                    info!("database file not found; initialising new graph engine");
-                    Arc::new(GraphEngineAdapter::init(data_path).expect("init graph engine"))
-                };
+            if !data_path.exists() {
+                info!("database file not found; initialising new graph engine");
+            }
+            let engine: Arc<dyn AsyncGraphEngine> = match GraphEngineAdapter::init(data_path) {
+                Ok(adapter) => Arc::new(adapter),
+                Err(e) => fail_startup(e),
+            };
 
             let metrics = MetricsCollector::new();
-            let _dispatcher = RequestDispatcher::new(cpu_threads).expect("create dispatcher");
+            let _dispatcher = match RequestDispatcher::new(cpu_threads) {
+                Ok(d) => d,
+                Err(e) => fail_startup(e),
+            };
 
             info!(
                 "starting RGraph server on {}:{} (workers={}, cpu_threads={}, max_conns={})",

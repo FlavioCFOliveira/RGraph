@@ -142,15 +142,31 @@ impl ServerRuntime {
     }
 
     /// Register a Tokio signal handler that resolves on SIGTERM or SIGINT.
+    ///
+    /// If the SIGTERM/SIGINT handlers cannot be installed (resource exhaustion
+    /// at process start), this falls back to Ctrl-C only and logs a warning,
+    /// rather than panicking on the serving path.
     async fn wait_for_signal() {
-        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
-            .expect("install SIGINT handler");
+        let sigterm = signal::unix::signal(signal::unix::SignalKind::terminate());
+        let sigint = signal::unix::signal(signal::unix::SignalKind::interrupt());
 
-        tokio::select! {
-            _ = sigterm.recv() => {},
-            _ = sigint.recv() => {},
+        match (sigterm, sigint) {
+            (Ok(mut sigterm), Ok(mut sigint)) => {
+                tokio::select! {
+                    _ = sigterm.recv() => {},
+                    _ = sigint.recv() => {},
+                }
+            }
+            (term, int) => {
+                if let Err(e) = &term {
+                    warn!("could not install SIGTERM handler: {e}");
+                }
+                if let Err(e) = &int {
+                    warn!("could not install SIGINT handler: {e}");
+                }
+                // Fall back to Ctrl-C so shutdown is still observable.
+                let _ = signal::ctrl_c().await;
+            }
         }
     }
 }

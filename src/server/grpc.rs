@@ -721,6 +721,43 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Panic-free request arithmetic tests (Task 177)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn integer_overflow_returns_typed_error_not_panic() {
+        let (_dir, svc) = cypher_service();
+        // i64::MAX + 1 would panic in debug / wrap in release without the
+        // checked arithmetic added in Task 177.
+        let resp = run_query(&svc, "RETURN 9223372036854775807 + 1 AS overflow");
+        match resp.result {
+            Some(proto::query_response::Result::Error(err)) => {
+                // A clean typed error, not a panic.
+                assert!(!err.message.is_empty());
+            }
+            Some(proto::query_response::Result::ResultSet(rs)) => {
+                panic!("overflow should not produce a result row: {rs:?}");
+            }
+            None => panic!("expected a response payload"),
+        }
+    }
+
+    #[test]
+    fn integer_division_by_zero_returns_null_not_panic() {
+        let (_dir, svc) = cypher_service();
+        let resp = run_query(&svc, "RETURN 1 / 0 AS q");
+        match resp.result {
+            Some(proto::query_response::Result::ResultSet(rs)) => {
+                assert_eq!(
+                    rs.rows[0].values[0].kind,
+                    Some(proto::value::Kind::Null(proto::Null {}))
+                );
+            }
+            other => panic!("expected NULL result, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Observability metric tests (Task 178)
     // ------------------------------------------------------------------
 

@@ -40,20 +40,23 @@ pub struct IoHandle {
 
 impl IoHandle {
     /// Send a command and block until the response arrives.
+    ///
+    /// Each request-bearing command is dispatched through the corresponding
+    /// typed helper, which owns a fresh response channel — so this method never
+    /// reaches an `unreachable!()` and never panics on a request.  If the bridge
+    /// worker has exited, an [`IoResponse::Err`] is returned rather than
+    /// panicking.
     pub fn call_sync(&self, cmd: IoCommand) -> IoResponse {
         match cmd {
-            IoCommand::ReadPage { .. }
-            | IoCommand::WritePage { .. }
-            | IoCommand::SyncWal { .. }
-            | IoCommand::FlushPage { .. } => {
-                // The command already carries its respond channel.
-                self.tx.send(cmd).expect("bridge worker alive");
-                // We need to extract the receiver from the command.
-                // This is a bit awkward because the command is moved.
-                unreachable!()
-            }
+            // The respond channel embedded in the caller-supplied command cannot
+            // be recovered once the command is moved, so we discard it and
+            // delegate to the typed helper, which manages its own channel.
+            IoCommand::ReadPage { page_id, .. } => self.read_page_sync(page_id),
+            IoCommand::WritePage { page_id, buf, .. } => self.write_page_sync(page_id, buf),
+            IoCommand::SyncWal { .. } => self.sync_wal_sync(),
+            IoCommand::FlushPage { page_id, .. } => self.flush_page_sync(page_id),
             IoCommand::Shutdown => {
-                self.tx.send(cmd).ok();
+                self.tx.send(IoCommand::Shutdown).ok();
                 IoResponse::Ok(vec![])
             }
         }
@@ -62,47 +65,66 @@ impl IoHandle {
     /// Convenience: read a page synchronously.
     pub fn read_page_sync(&self, page_id: PageId) -> IoResponse {
         let (tx, rx) = bounded(1);
-        self.tx
+        if self
+            .tx
             .send(IoCommand::ReadPage {
                 page_id,
                 respond: tx,
             })
-            .expect("bridge worker alive");
-        rx.recv().expect("bridge worker responded")
+            .is_err()
+        {
+            return IoResponse::Err("bridge worker unavailable".into());
+        }
+        Self::recv_response(rx)
     }
 
     /// Convenience: write a page synchronously.
     pub fn write_page_sync(&self, page_id: PageId, buf: AlignedBuffer) -> IoResponse {
         let (tx, rx) = bounded(1);
-        self.tx
+        if self
+            .tx
             .send(IoCommand::WritePage {
                 page_id,
                 buf,
                 respond: tx,
             })
-            .expect("bridge worker alive");
-        rx.recv().expect("bridge worker responded")
+            .is_err()
+        {
+            return IoResponse::Err("bridge worker unavailable".into());
+        }
+        Self::recv_response(rx)
     }
 
     /// Convenience: sync WAL synchronously.
     pub fn sync_wal_sync(&self) -> IoResponse {
         let (tx, rx) = bounded(1);
-        self.tx
-            .send(IoCommand::SyncWal { respond: tx })
-            .expect("bridge worker alive");
-        rx.recv().expect("bridge worker responded")
+        if self.tx.send(IoCommand::SyncWal { respond: tx }).is_err() {
+            return IoResponse::Err("bridge worker unavailable".into());
+        }
+        Self::recv_response(rx)
     }
 
     /// Convenience: flush a specific page synchronously.
     pub fn flush_page_sync(&self, page_id: PageId) -> IoResponse {
         let (tx, rx) = bounded(1);
-        self.tx
+        if self
+            .tx
             .send(IoCommand::FlushPage {
                 page_id,
                 respond: tx,
             })
-            .expect("bridge worker alive");
-        rx.recv().expect("bridge worker responded")
+            .is_err()
+        {
+            return IoResponse::Err("bridge worker unavailable".into());
+        }
+        Self::recv_response(rx)
+    }
+
+    /// Receive a response, mapping a disconnected channel to a typed error
+    /// instead of panicking.
+    fn recv_response(rx: Receiver<IoResponse>) -> IoResponse {
+        rx.recv()
+            .unwrap_or_else(|_| IoResponse::Err("bridge worker terminated before responding".into()))
     }
 }
 
@@ -327,5 +349,61 @@ mod tests {
         let res = bridge.handle.sync_wal_sync();
         assert!(matches!(res, IoResponse::Ok(_)), "sync failed");
         bridge.stop();
+    }
+
+    #[test]
+    fn call_sync_dispatches_all_request_variants_without_unreachable() {
+        // Regression for Task 177: call_sync must delegate each request-bearing
+        // command to its typed helper instead of hitting `unreachable!()`.
+        let (_dir, bridge, _pool, _wal) = setup_bridge(4);
+
+        // WritePage then ReadPage round-trip via the generic call_sync entry.
+        let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        buf[0] = 0x42;
+        let (resp_tx, _resp_rx) = bounded(1);
+        let write = bridge.handle.call_sync(IoCommand::WritePage {
+            page_id: 3,
+            buf,
+            respond: resp_tx,
+        });
+        assert!(matches!(write, IoResponse::Ok(_)), "write via call_sync");
+
+        let (resp_tx, _resp_rx) = bounded(1);
+        let read = bridge.handle.call_sync(IoCommand::ReadPage {
+            page_id: 3,
+            respond: resp_tx,
+        });
+        match read {
+            IoResponse::Ok(data) => assert_eq!(data[0], 0x42),
+            IoResponse::Err(e) => panic!("read via call_sync failed: {e}"),
+        }
+
+        let (resp_tx, _resp_rx) = bounded(1);
+        let sync = bridge
+            .handle
+            .call_sync(IoCommand::SyncWal { respond: resp_tx });
+        assert!(matches!(sync, IoResponse::Ok(_)), "sync wal via call_sync");
+
+        let shutdown = bridge.handle.call_sync(IoCommand::Shutdown);
+        assert!(matches!(shutdown, IoResponse::Ok(_)));
+
+        bridge.stop();
+    }
+
+    #[test]
+    fn call_sync_on_dead_bridge_returns_error_not_panic() {
+        // After the bridge workers stop, call_sync must surface a typed error
+        // rather than panicking on the closed channel.
+        let (_dir, bridge, _pool, _wal) = setup_bridge(4);
+        let handle_tx = bridge.handle.tx.clone();
+        bridge.stop();
+
+        let dead = IoHandle { tx: handle_tx };
+        let (resp_tx, _resp_rx) = bounded(1);
+        let res = dead.call_sync(IoCommand::ReadPage {
+            page_id: 1,
+            respond: resp_tx,
+        });
+        assert!(matches!(res, IoResponse::Err(_)));
     }
 }

@@ -168,7 +168,10 @@ impl Value {
             return Some(Value::Null);
         }
         match (self, rhs) {
-            (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a + b)),
+            // Use checked arithmetic so an overflowing request (e.g.
+            // `RETURN <i64::MAX> + 1`) yields a typed evaluation error upstream
+            // instead of panicking in debug or silently wrapping in release.
+            (Value::Integer(a), Value::Integer(b)) => a.checked_add(*b).map(Value::Integer),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(OrderedF64(*a as f64 + b.0))),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(OrderedF64(a.0 + *b as f64))),
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(OrderedF64(a.0 + b.0))),
@@ -185,7 +188,7 @@ impl Value {
     pub fn sub(&self, rhs: &Value) -> Option<Value> {
         if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
-            (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a - b)),
+            (Value::Integer(a), Value::Integer(b)) => a.checked_sub(*b).map(Value::Integer),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(OrderedF64(*a as f64 - b.0))),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(OrderedF64(a.0 - *b as f64))),
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(OrderedF64(a.0 - b.0))),
@@ -196,7 +199,7 @@ impl Value {
     pub fn mul(&self, rhs: &Value) -> Option<Value> {
         if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
-            (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a * b)),
+            (Value::Integer(a), Value::Integer(b)) => a.checked_mul(*b).map(Value::Integer),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(OrderedF64(*a as f64 * b.0))),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(OrderedF64(a.0 * *b as f64))),
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(OrderedF64(a.0 * b.0))),
@@ -209,7 +212,11 @@ impl Value {
         if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
             (Value::Integer(_), Value::Integer(b)) if *b == 0 => Some(Value::Null),
-            (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a / b)),
+            // `checked_div` also guards the `i64::MIN / -1` overflow case; on
+            // overflow we fall back to Null rather than panicking.
+            (Value::Integer(a), Value::Integer(b)) => {
+                Some(a.checked_div(*b).map_or(Value::Null, Value::Integer))
+            }
             (Value::Integer(a), Value::Float(b)) if b.0 == 0.0 => Some(Value::Null),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(OrderedF64(*a as f64 / b.0))),
             (Value::Float(a), Value::Integer(b)) if *b == 0 => Some(Value::Null),
@@ -224,7 +231,10 @@ impl Value {
         if self.is_null() || rhs.is_null() { return Some(Value::Null); }
         match (self, rhs) {
             (Value::Integer(_), Value::Integer(b)) if *b == 0 => Some(Value::Null),
-            (Value::Integer(a), Value::Integer(b)) => Some(Value::Integer(a % b)),
+            // `checked_rem` guards the `i64::MIN % -1` overflow case.
+            (Value::Integer(a), Value::Integer(b)) => {
+                Some(a.checked_rem(*b).map_or(Value::Null, Value::Integer))
+            }
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(OrderedF64(a.0 % b.0))),
             (Value::Integer(a), Value::Float(b)) => Some(Value::Float(OrderedF64(*a as f64 % b.0))),
             (Value::Float(a), Value::Integer(b)) => Some(Value::Float(OrderedF64(a.0 % *b as f64))),
@@ -260,7 +270,9 @@ impl Value {
     pub fn negate(&self) -> Option<Value> {
         match self {
             Value::Null => Some(Value::Null),
-            Value::Integer(v) => Some(Value::Integer(-v)),
+            // `checked_neg` guards against negating `i64::MIN`, which would
+            // overflow and panic.
+            Value::Integer(v) => v.checked_neg().map(Value::Integer),
             Value::Float(f) => Some(Value::Float(OrderedF64(-f.0))),
             _ => None,
         }
@@ -495,6 +507,29 @@ mod tests {
         let a = Value::Integer(10);
         let b = Value::Integer(0);
         assert_eq!(a.div(&b).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn integer_overflow_is_none_not_panic() {
+        // Checked arithmetic returns None (→ typed eval error upstream) rather
+        // than panicking on overflow.
+        assert_eq!(Value::Integer(i64::MAX).add(&Value::Integer(1)), None);
+        assert_eq!(Value::Integer(i64::MIN).sub(&Value::Integer(1)), None);
+        assert_eq!(Value::Integer(i64::MAX).mul(&Value::Integer(2)), None);
+        assert_eq!(Value::Integer(i64::MIN).negate(), None);
+    }
+
+    #[test]
+    fn min_div_neg_one_returns_null_not_panic() {
+        // i64::MIN / -1 overflows; we yield Null instead of panicking.
+        assert_eq!(
+            Value::Integer(i64::MIN).div(&Value::Integer(-1)).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            Value::Integer(i64::MIN).modulo(&Value::Integer(-1)).unwrap(),
+            Value::Null
+        );
     }
 
     #[test]
