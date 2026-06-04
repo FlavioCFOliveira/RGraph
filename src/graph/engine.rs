@@ -587,6 +587,44 @@ impl GraphStorageEngine {
         slot_ref(page_id, slot)
     }
 
+    /// Reserve a slot for `record` and return the resulting page image WITHOUT
+    /// writing it to disk.
+    ///
+    /// This is the no-steal/no-force counterpart of [`Self::insert_record`]: the
+    /// caller logs a physical page-redo record and makes the commit durable
+    /// *before* the returned image is written, so an uncommitted mutation never
+    /// reaches the data file (no steal) and a committed one is reconstructable by
+    /// REDO if its eager write is lost (no force).  See reliability-audit
+    /// findings C1/C3 (2026-06-04).
+    fn prepare_record(
+        page_manager: &mut PageManager,
+        record: &[u8],
+        page_list: &mut Vec<PageId>,
+        page_type: PageType,
+        fs: &dyn FileSystem,
+    ) -> Result<(SlotRef, PageId, AlignedBuffer), StorageError> {
+        // Try existing pages (most recent first).
+        for &page_id in page_list.iter().rev() {
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            page_manager.read_page(fs, page_id, &mut buf)?;
+            let mut page = SlottedPage::new(buf);
+            if let Some(slot) = page.insert(record) {
+                page.update_checksum();
+                let sref = slot_ref(page_id, slot)?;
+                return Ok((sref, page_id, page.buf));
+            }
+        }
+
+        // Allocate a new page.
+        let page_id = page_manager.allocate_page();
+        let mut page = SlottedPage::init(page_id, page_type);
+        let slot = page.insert(record).ok_or(StorageError::PageFull)?;
+        page.update_checksum();
+        page_list.push(page_id);
+        let sref = slot_ref(page_id, slot)?;
+        Ok((sref, page_id, page.buf))
+    }
+
     /// Read a raw record from a [`SlotRef`].
     fn read_record(
         page_manager: &PageManager,
@@ -1589,62 +1627,67 @@ impl StorageEngine for GraphStorageEngine {
         let txid = autocommit_tx.txid;
         let mut buf = [0u8; NodeRecord::SIZE];
         node.encode(&mut buf);
-        let slot = match Self::insert_record(
+        // No-steal: build the page image but DO NOT write it to disk yet.
+        let (slot, page_id, mut image) = match Self::prepare_record(
             &mut self.page_manager,
             &buf,
             &mut self.node_pages,
             PageType::SlottedData,
             fs,
         ) {
-            Ok(s) => s,
+            Ok(v) => v,
             Err(e) => {
                 let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
                 return Err(e);
             }
         };
 
-        // Index: node_id -> SlotRef (4 bytes).
+        // RAM secondary indexes (rebuilt from the heap on open).
         let value = slot.raw.to_be_bytes().to_vec();
         if let Err(e) = self.node_index.insert(&key, &value) {
             let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
             return Err(StorageError::from(e));
         }
-
-        // Secondary label index.
         let label_key = label_index_key(node.label_id as u64, node.node_id as u128);
         if let Err(e) = self.label_index.insert(&label_key, &value) {
             let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
             return Err(StorageError::from(e));
         }
 
-        // WAL: NodeInsert with MVCC xmin = this transaction's TxId.
-        let mut payload = Vec::with_capacity(8 + 4 + NodeRecord::SIZE);
-        payload.extend_from_slice(&node.node_id.to_be_bytes());
-        payload.extend_from_slice(&slot.raw.to_be_bytes());
-        // Embed a TupleHeader (xmin = txid, xmax = 0) before the record bytes
-        // so recovery can reconstruct MVCC visibility.
-        let tuple_hdr = TupleHeader::new_insert(txid, 0);
-        let mut hdr_bytes = [0u8; TupleHeader::SIZE];
-        tuple_hdr.encode(&mut hdr_bytes);
-        payload.extend_from_slice(&hdr_bytes);
-        payload.extend_from_slice(&buf);
-        if let Err(e) = Self::log(
+        // WAL-before-data (Option A, no-force REDO): log the PHYSICAL page
+        // after-image so a committed insert is reconstructable by REDO, then
+        // commit (flush WAL) BEFORE the page is written.  A loser never writes
+        // its page (no steal) and REDO replays committed records only, so no UNDO
+        // of the heap is ever needed.  See findings C1/C3 (2026-06-04).
+        let mut payload = Vec::with_capacity(8 + PAGE_SIZE);
+        payload.extend_from_slice(&page_id.to_be_bytes());
+        payload.extend_from_slice(image.as_ref());
+        let lsn = match Self::log(
             &mut self.page_manager,
             &mut self.wal_writer,
             fs,
-            RecordType::NodeInsert,
+            RecordType::PageInsert,
             txid,
             payload,
         ) {
-            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
-            return Err(e);
-        }
+            Ok(l) => l,
+            Err(e) => {
+                let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+                return Err(e);
+            }
+        };
 
-        // Commit the autocommit transaction (flush WAL, release locks).
+        // Commit the autocommit transaction (append Commit, flush WAL).
         let wal_fs = Arc::clone(&self.wal_fs);
         txn_mgr
             .commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
             .map_err(StorageError::from)?;
+
+        // Commit is durable.  Eagerly write the data page, stamping page_lsn =
+        // the redo record's LSN so a re-REDO is idempotent.  If this write is
+        // lost to a crash, REDO reconstructs the page from the committed record.
+        image.as_mut()[0..8].copy_from_slice(&lsn.to_be_bytes());
+        self.page_manager.write_page(fs, page_id, &mut image)?;
 
         Ok(slot)
     }
@@ -2336,35 +2379,42 @@ mod tests {
         engine.put_node(&node, &fs).unwrap();
         engine.sync(&fs).unwrap();
 
-        // Read the WAL segment back and verify a NodeInsert record exists.
+        // Under the no-steal/no-force write path (findings C1/C3) put_node logs a
+        // physical PageInsert (page after-image) as the REDO source, then commits
+        // BEFORE the page is written.  Verify the PageInsert and a Commit exist
+        // and that the PageInsert precedes the Commit (WAL-before-data ordering).
         let seg = dir.path().join("wal").join("wal-000000000");
         let handle = fs.open(&seg, false).unwrap();
         let len = handle.len().unwrap() as usize;
         let mut buf = vec![0u8; len];
         handle.read_at(&mut buf, 0).unwrap();
 
-        let mut found = false;
+        let mut page_insert_lsn: Option<u64> = None;
+        let mut commit_lsn: Option<u64> = None;
         let mut offset = 0;
         while offset < buf.len() {
             if let Some((rec, size)) = WalRecord::decode(&buf, offset) {
-                if rec.record_type == RecordType::NodeInsert {
-                    found = true;
-                    // WAL payload: node_id (8) + slot_ref (4) +
-                    //              TupleHeader (16, xmin/xmax for MVCC) +
-                    //              NodeRecord (32).
-                    use crate::txn::mvcc::TupleHeader as TH;
-                    assert_eq!(
-                        rec.payload.len(),
-                        8 + 4 + TH::SIZE + NodeRecord::SIZE,
-                        "NodeInsert WAL payload must include TupleHeader"
-                    );
+                match rec.record_type {
+                    RecordType::PageInsert if page_insert_lsn.is_none() => {
+                        // Payload: page_id (8) + full page image (PAGE_SIZE).
+                        assert_eq!(
+                            rec.payload.len(),
+                            8 + crate::storage::page::PAGE_SIZE,
+                            "PageInsert WAL payload must carry the full page image"
+                        );
+                        page_insert_lsn = Some(rec.lsn);
+                    }
+                    RecordType::Commit if commit_lsn.is_none() => commit_lsn = Some(rec.lsn),
+                    _ => {}
                 }
                 offset += size;
             } else {
                 break;
             }
         }
-        assert!(found, "NodeInsert WAL record not found");
+        let pi = page_insert_lsn.expect("PageInsert WAL record not found");
+        let ci = commit_lsn.expect("Commit WAL record not found");
+        assert!(pi < ci, "PageInsert must be logged before Commit (WAL-before-data)");
     }
 
     #[test]

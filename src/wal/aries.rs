@@ -287,7 +287,7 @@ impl<'a> AriesRecovery<'a> {
         );
 
         let redo_count = if let Some(fs) = self.fs {
-            self.redo(records, &dpt, fs)?
+            self.redo(records, &att, &dpt, fs)?
         } else {
             // Test mode: REDO phase requires real I/O — skip silently.
             0
@@ -463,6 +463,7 @@ impl<'a> AriesRecovery<'a> {
     fn redo(
         &self,
         records: &[WalRecord],
+        att: &HashMap<u64, AttEntry>,
         dpt: &HashMap<u64, DptEntry>,
         fs: &dyn FileSystem,
     ) -> io::Result<usize> {
@@ -508,6 +509,19 @@ impl<'a> AriesRecovery<'a> {
                     | RecordType::Clr
             );
             if !is_physical_page_record {
+                continue;
+            }
+
+            // Option A (no-steal / no-force): only replay records of COMMITTED
+            // transactions. A loser never wrote its data page — data writes
+            // happen only after the commit record is durable — so replaying its
+            // records would resurrect uncommitted data. CLRs are always replayed
+            // (they are completed undo work). This is sound while ANALYSIS scans
+            // from LSN 0 so every committed txn is in the ATT; a future fuzzy
+            // checkpoint (H7) must flush dirty pages to preserve the invariant.
+            if rec.record_type != RecordType::Clr
+                && att.get(&rec.txid).map(|e| e.status) != Some(TxStatus::Committed)
+            {
                 continue;
             }
 
@@ -1118,7 +1132,17 @@ mod tests {
 
         let recovery = AriesRecovery::new(&fs, &wal_dir, &data_path, 0);
         let records = recovery.load_all_segments(&fs, &wal_dir).unwrap();
-        let count = recovery.redo(&records, &dpt, &fs).unwrap();
+        // REDO replays committed records only (Option A): mark txid 1 committed.
+        let mut att = HashMap::new();
+        att.insert(
+            1u64,
+            AttEntry {
+                txid: 1,
+                status: TxStatus::Committed,
+                last_lsn: 999,
+            },
+        );
+        let count = recovery.redo(&records, &att, &dpt, &fs).unwrap();
         assert_eq!(count, 1);
     }
 
@@ -1164,8 +1188,81 @@ mod tests {
 
         let recovery = AriesRecovery::new(&fs, &wal_dir, &data_path, 0);
         let records = recovery.load_all_segments(&fs, &wal_dir).unwrap();
-        let count = recovery.redo(&records, &dpt, &fs).unwrap();
+        // Committed txn so the record reaches the idempotency check (not skipped
+        // by the commit-filter); it must still be a no-op because the page is newer.
+        let mut att = HashMap::new();
+        att.insert(
+            1u64,
+            AttEntry {
+                txid: 1,
+                status: TxStatus::Committed,
+                last_lsn: 500,
+            },
+        );
+        let count = recovery.redo(&records, &att, &dpt, &fs).unwrap();
         assert_eq!(count, 0, "page is already up-to-date; REDO must be a no-op");
+    }
+
+    #[test]
+    fn redo_reconstructs_committed_page_and_skips_loser() {
+        // Regression gate for findings C1/C3 (Option A no-steal/no-force,
+        // 2026-06-04): a committed PageInsert whose data-page write was lost is
+        // reconstructed by REDO, while an uncommitted (loser) PageInsert is
+        // skipped — never resurrected.
+        use crate::io::posix::PosixFileSystem;
+        use crate::storage::page::{PageType, SlottedPage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let data_path = dir.path().join("data.db");
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Committed page 8 (txid 10 + Commit); loser page 7 (txid 11, no commit).
+        // Neither page is on disk — both eager writes were lost by the crash.
+        let mut committed = SlottedPage::init(8, PageType::SlottedData);
+        committed.insert(b"committed").unwrap();
+        committed.update_checksum();
+        let mut loser = SlottedPage::init(7, PageType::SlottedData);
+        loser.insert(b"loser").unwrap();
+        loser.update_checksum();
+
+        {
+            let mut wal = WalWriter::open(wal_dir.clone(), &fs).unwrap();
+            let mut p8 = 8u64.to_be_bytes().to_vec();
+            p8.extend_from_slice(&committed.buf);
+            wal.append(&fs, WalRecord::new(RecordType::PageInsert, 10, 0, 0, p8))
+                .unwrap();
+            wal.append(&fs, WalRecord::new(RecordType::Commit, 10, 0, 0, vec![]))
+                .unwrap();
+            let mut p7 = 7u64.to_be_bytes().to_vec();
+            p7.extend_from_slice(&loser.buf);
+            wal.append(&fs, WalRecord::new(RecordType::PageInsert, 11, 0, 0, p7))
+                .unwrap();
+            wal.sync(&fs).unwrap();
+        }
+
+        let mut rwal = WalWriter::open(wal_dir.clone(), &fs).unwrap();
+        let recovery = AriesRecovery::new(&fs, &wal_dir, &data_path, 0);
+        let result = recovery.recover(&mut rwal).unwrap();
+        assert_eq!(result.redo_count, 1, "only the committed page must be redone");
+
+        let handle = fs.open(&data_path, false).unwrap();
+        // Page 8 (committed) reconstructed and checksum-valid.
+        let mut buf8 = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut buf8, 8 * PAGE_SIZE as u64).unwrap();
+        assert!(
+            SlottedPage::verify_checksum_bytes(buf8.as_ref()),
+            "committed page must be valid after REDO"
+        );
+        assert_eq!(SlottedPage::new(buf8).read(0), Some(&b"committed"[..]));
+        // Page 7 (loser) was never written: zero-filled by the file extension.
+        let mut buf7 = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut buf7, 7 * PAGE_SIZE as u64).unwrap();
+        assert!(
+            buf7.iter().all(|&b| b == 0),
+            "loser page must not be resurrected by REDO"
+        );
     }
 
     // ── UNDO with before-images (Task 149) ────────────────────────────────────

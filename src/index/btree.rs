@@ -2054,6 +2054,21 @@ mod tests {
             .collect();
         tree.insert_batch_logged(&entries, &mut wal, fs.as_ref(), 1)
             .unwrap();
+        // Commit the logged index batch so REDO replays it: under the
+        // no-steal/no-force policy (findings C1/C3) REDO replays committed
+        // transactions only.
+        wal.append(
+            fs.as_ref(),
+            crate::wal::record::WalRecord::new(
+                crate::wal::record::RecordType::Commit,
+                1,
+                0,
+                0,
+                vec![],
+            ),
+        )
+        .unwrap();
+        wal.sync(fs.as_ref()).unwrap();
         // Flush the dirty index pages to disk, then capture them.
         pool.flush_all(fs.as_ref()).unwrap();
 
