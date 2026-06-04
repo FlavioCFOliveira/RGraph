@@ -1,7 +1,7 @@
 //! Composite key encoding for all index types.
 //!
 //! Keys are encoded as byte strings that preserve lexicographic ordering.
-//! This enables efficient range scans and prefix compression.
+//! This enables efficient range scans.
 //!
 //! # Key Layouts
 //!

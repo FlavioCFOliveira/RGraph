@@ -3,6 +3,22 @@ name = "rgraph"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Off by default: experimental, not yet wired into the B+ tree hot path.
+#
+# `epoch` — gates the `EpochPageTable` lock-free page-snapshot prototype.
+#   It is NOT used by the tree today and acquires a mutex on every read, so
+#   it provides no lock-free benefit.  Kept behind a flag until a genuine
+#   lock-free integration lands (see TODO in `src/index/btree.rs`).
+#
+# `prefix_compression` — gates per-page key prefix compression.  The B+ tree
+#   comparison/search paths read raw record bytes (not prefix-reconstructed
+#   keys), so enabling compression would corrupt ordering and lookups.  Kept
+#   behind a flag until every comparator is made prefix-aware.
+default = []
+epoch = ["dep:crossbeam-epoch"]
+prefix_compression = []
+
 [dependencies]
 crc32c = "0.6"
 twox-hash = "1.6"
@@ -11,7 +27,7 @@ anyhow = "1.0"
 libc = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
-crossbeam-epoch = "0.9"
+crossbeam-epoch = { version = "0.9", optional = true }
 io-uring = "0.7"
 parking_lot = "0.12"
 

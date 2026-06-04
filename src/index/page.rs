@@ -3,7 +3,10 @@
 //! Extends the slotted page format with B+ tree specific headers.
 
 use crate::io::AlignedBuffer;
-use crate::storage::page::{PageHeader, PageId, PageType, SlottedPage, PAGE_SIZE};
+use crate::storage::page::{PageHeader, PageId, PageType, SlottedPage};
+#[cfg(feature = "prefix_compression")]
+use crate::storage::page::PAGE_SIZE;
+#[cfg(feature = "prefix_compression")]
 use crate::index::prefix::{common_prefix, compress_record, decompress_record, extract_key};
 
 /// Size of the B+ tree specific header extension (after the 64-byte page header).
@@ -35,6 +38,10 @@ pub struct BTreeHeader {
     /// Number of keys currently stored in this page.
     pub key_count: u16,
     /// Length of the common prefix shared by all keys in this page.
+    ///
+    /// Reserved field, part of the on-disk layout.  It is only populated when
+    /// the off-by-default `prefix_compression` feature is enabled; otherwise it
+    /// stays `0` and every record stores its full, uncompressed key.
     pub common_prefix_len: u16,
     /// Tree level (0 = leaf, 1 = first branch, etc.).
     pub level: u8,
@@ -219,6 +226,7 @@ impl BTreePage {
     ///
     /// The prefix is located immediately after the B+ tree header at offset 96
     /// and is stored as `[len: u16 BE][bytes…]`.
+    #[cfg(feature = "prefix_compression")]
     pub fn common_prefix(&self) -> Vec<u8> {
         let bh = self.btree_header();
         let len = bh.common_prefix_len as usize;
@@ -236,6 +244,7 @@ impl BTreePage {
     ///
     /// Existing slot data is **not** rewritten; callers must call
     /// [`recompute_prefix`] when they want to compress existing records.
+    #[cfg(feature = "prefix_compression")]
     pub fn set_common_prefix(&mut self,
         prefix: &[u8],
     ) {
@@ -277,6 +286,7 @@ impl BTreePage {
     ///
     /// This is typically called immediately after a page split, when the
     /// remaining keys are highly homogeneous.
+    #[cfg(feature = "prefix_compression")]
     pub fn recompute_prefix(&mut self,
     ) {
         // Gather full keys (ignoring values) from every live slot.
@@ -335,6 +345,7 @@ impl BTreePage {
     }
 
     /// Read the full key at slot `idx`, reconstructing the prefix if present.
+    #[cfg(feature = "prefix_compression")]
     pub fn key_full(&self, idx: u16) -> Option<Vec<u8>> {
         let data = self.inner.read(idx)?;
         let prefix = self.common_prefix();
@@ -345,6 +356,7 @@ impl BTreePage {
     }
 
     /// Read the full separator key at slot `idx` (branch nodes).
+    #[cfg(feature = "prefix_compression")]
     pub fn separator_key_full(&self, idx: u16) -> Option<Vec<u8>> {
         let data = self.inner.read(idx)?;
         let key_len = data.len().saturating_sub(8);

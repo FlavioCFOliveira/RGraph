@@ -3,6 +3,18 @@
 //! The tree is built over slotted pages and uses latch crabbing for
 //! concurrency.  Structural changes are logged to WAL as physical
 //! redo/undo records.
+//!
+//! # Deferred work
+//!
+//! * **Epoch-based reclamation.** The [`crate::index::epoch::EpochPageTable`]
+//!   prototype is gated behind the off-by-default `epoch` feature and is not
+//!   integrated here.  It currently takes a mutex on every read, so it is not
+//!   lock-free; a genuine lock-free page table is future work.
+//! * **Prefix compression.** Gated behind the off-by-default
+//!   `prefix_compression` feature.  The comparison paths in this module
+//!   (`branch_child`, `leaf_lower_bound`) read raw record bytes, so prefix
+//!   compression must not be enabled until every comparator reconstructs the
+//!   full key first.
 
 use crate::buffer::pool::BufferPool;
 use crate::index::key::CompositeKey;
@@ -891,6 +903,7 @@ mod tests {
         assert!(tree.optimistic_search(&node_id_key(2)).is_none());
     }
 
+    #[cfg(feature = "prefix_compression")]
     #[test]
     fn prefix_compression_reduces_leaf_size() {
         use crate::index::page::BTreePage;
