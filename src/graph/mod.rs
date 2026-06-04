@@ -9,6 +9,7 @@ pub mod property;
 pub mod builder;
 pub mod graph;
 pub mod adjacency;
+pub mod csr;
 pub mod engine;
 
 pub use record::{EdgeRecord, NodeRecord, PropertyRecord, PropertyHeader, SlotRef, ValueType, OverflowHandle, node_flags, edge_flags};
@@ -16,4 +17,5 @@ pub use property::{Property, OrderedF64};
 pub use builder::{NodeBuilder, RelationshipBuilder, BuilderError};
 pub use graph::{Graph, Node, Relationship};
 pub use adjacency::{AdjacencyError, EdgeRecordView, link_source_head, link_target_head, unlink_source, unlink_target, collect_outgoing, collect_incoming};
+pub use csr::{CsrAdjacency, CsrBuilder, CsrEdge, CsrHolder};
 pub use engine::{GraphStorageEngine, StorageEngine, StorageError};

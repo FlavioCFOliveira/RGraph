@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 // ------------------------------------------------------------------
 // Low-level KV storage traits (Task 11 acceptance criteria)
@@ -347,8 +347,16 @@ impl AsyncTransaction for InMemoryTransaction {
 ///
 /// CPU-bound and blocking operations are offloaded to `tokio::task::spawn_blocking`
 /// so the async runtime remains responsive.
+///
+/// # Concurrency
+///
+/// The inner [`Graph`] is guarded by a [`tokio::sync::RwLock`] (Task 174).
+/// Read operations (`get_node`, `get_relationship`, `scan_by_label`,
+/// `scan_by_type`, `scan_nodes_by_property`) take a shared read-lock and can
+/// run concurrently; write operations take an exclusive write-lock.  This
+/// removes the previous global mutex that serialised reads behind writes.
 pub struct GraphEngineAdapter {
-    inner: Arc<Mutex<Graph>>,
+    inner: Arc<RwLock<Graph>>,
     #[allow(dead_code)]
     fs: PosixFileSystem,
 }
@@ -357,7 +365,7 @@ impl GraphEngineAdapter {
     /// Wrap an existing [`Graph`] instance.
     pub fn new(graph: Graph) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(graph)),
+            inner: Arc::new(RwLock::new(graph)),
             fs: PosixFileSystem::new(false),
         }
     }
@@ -381,7 +389,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let inner = self.inner.clone();
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.create_node(builder, &fs)
                 .map(|(slot, _id)| slot)
                 .map_err(into_rgraph_err)
@@ -397,7 +405,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let inner = self.inner.clone();
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
+            let guard = inner.blocking_read();
             guard.get_node(node_id, &fs).map_err(into_rgraph_err)
         })
         .await
@@ -411,7 +419,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let inner = self.inner.clone();
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.delete_node(node_id, &fs).map_err(into_rgraph_err)
         })
         .await
@@ -425,7 +433,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let inner = self.inner.clone();
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.create_relationship(builder, &fs)
                 .map(|(slot, _id)| slot)
                 .map_err(into_rgraph_err)
@@ -441,7 +449,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let inner = self.inner.clone();
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
+            let guard = inner.blocking_read();
             guard.get_relationship(edge_id, &fs).map_err(into_rgraph_err)
         })
         .await
@@ -455,7 +463,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let inner = self.inner.clone();
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.delete_relationship(edge_id, &fs).map_err(into_rgraph_err)
         })
         .await
@@ -469,7 +477,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let inner = self.inner.clone();
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
+            let guard = inner.blocking_read();
             guard.scan_by_label(label_id, &fs).map_err(into_rgraph_err)
         })
         .await
@@ -483,7 +491,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let inner = self.inner.clone();
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
+            let guard = inner.blocking_read();
             guard.scan_by_type(type_id, &fs).map_err(into_rgraph_err)
         })
         .await
@@ -500,7 +508,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
     ) -> Result<(), RGraphError> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard
                 .insert_property_index(entity_id, property_id, value_type, &payload, slot)
                 .map_err(into_rgraph_err)
@@ -518,7 +526,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let inner = self.inner.clone();
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
-            let guard = inner.blocking_lock();
+            let guard = inner.blocking_read();
             guard
                 .scan_nodes_by_property(property_id, value_type, &payload, &fs)
                 .map_err(into_rgraph_err)
@@ -531,7 +539,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         let inner = self.inner.clone();
         let fs = PosixFileSystem::new(false);
         tokio::task::spawn_blocking(move || {
-            let mut guard = inner.blocking_lock();
+            let mut guard = inner.blocking_write();
             guard.sync(&fs).map_err(into_rgraph_err)
         })
         .await

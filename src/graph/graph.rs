@@ -385,6 +385,43 @@ impl Graph {
         self.engine.insert_property_index(entity_id as u128, property_id, value_type, payload, slot)
     }
 
+    /// Build and publish a frozen CSR adjacency snapshot (Task 58).
+    ///
+    /// After this call, [`Graph::scan_adjacency`] uses the cache-friendly CSR
+    /// path.  Returns the published [`CsrAdjacency`] snapshot.
+    pub fn freeze_adjacency(
+        &self,
+        fs: &dyn FileSystem,
+    ) -> std::sync::Arc<crate::graph::csr::CsrAdjacency> {
+        self.engine.freeze_adjacency(fs)
+    }
+
+    /// Release the frozen CSR snapshot, reverting [`Graph::scan_adjacency`] to
+    /// the doubly-linked walk until the next [`Graph::freeze_adjacency`].
+    pub fn thaw_adjacency(&self) {
+        self.engine.thaw_adjacency();
+    }
+
+    /// Scan the outgoing edges of `node_id`, returning
+    /// `(target_id, edge_id, type_id)` triples.
+    ///
+    /// Prefers the frozen CSR snapshot when available; otherwise walks the
+    /// doubly-linked adjacency list.
+    pub fn scan_adjacency(
+        &self,
+        node_id: u64,
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<(u64, u64, u32)>, StorageError> {
+        self.engine.scan_adjacency(node_id, fs)
+    }
+
+    /// Compact tombstoned node/edge slots and reclaim space (Task 174).
+    ///
+    /// Returns the number of tombstone slots reclaimed.
+    pub fn compact(&mut self, fs: &dyn FileSystem) -> Result<usize, StorageError> {
+        self.engine.compact(fs)
+    }
+
     /// Scan nodes that have a property with the given `property_id` and value.
     pub fn scan_nodes_by_property(
         &self,

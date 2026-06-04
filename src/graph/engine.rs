@@ -3,6 +3,7 @@
 //! The [`GraphStorageEngine`] provides CRUD operations for nodes, edges,
 //! and properties on top of the page manager, B+ tree indexes, and WAL.
 
+use crate::graph::csr::{CsrAdjacency, CsrBuilder, CsrHolder};
 use crate::graph::record::{
     EdgeRecord, NodeRecord, PropertyRecord, SlotRef, ValueType, edge_flags, node_flags,
 };
@@ -26,7 +27,7 @@ use crate::wal::writer::WalWriter;
 use crate::catalog::Catalog;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Monotonically-increasing graph-entity id allocator.
@@ -233,6 +234,14 @@ pub trait StorageEngine {
 /// ids for nodes and edges.  On engine open the allocator is seeded from
 /// the highest id observed during `rebuild_indexes`.
 ///
+/// # Free-space map and compaction
+///
+/// `node_free_list` and `edge_free_list` track [`SlotRef`]s vacated by
+/// `delete_node` / `delete_edge`.  [`GraphStorageEngine::compact`] scans the
+/// record pages, drops tombstone-only pages, prunes stale free-list entries,
+/// and brackets the operation with `CompactionBegin` / `CompactionEnd` WAL
+/// records.
+///
 /// # Transaction API
 ///
 /// * [`GraphStorageEngine::begin_transaction`] — start a transaction.
@@ -264,6 +273,16 @@ pub struct GraphStorageEngine {
     wal_fs: Arc<crate::io::posix::PosixFileSystem>,
     /// Schema catalog — maps label/type/property-key names to compact u32 ids.
     pub catalog: Arc<RwLock<Catalog>>,
+    /// Slots previously occupied by deleted node records (free-space map).
+    ///
+    /// `delete_node` pushes the freed [`SlotRef`] here so that
+    /// [`GraphStorageEngine::compact`] can account for reclaimable space.
+    pub node_free_list: StdMutex<Vec<SlotRef>>,
+    /// Slots previously occupied by deleted edge records (free-space map).
+    pub edge_free_list: StdMutex<Vec<SlotRef>>,
+    /// Optional frozen CSR adjacency snapshot for fast read-only traversals
+    /// (Task 58).  Published by [`GraphStorageEngine::freeze_adjacency`].
+    pub csr: CsrHolder,
 }
 
 impl GraphStorageEngine {
@@ -304,6 +323,9 @@ impl GraphStorageEngine {
             txn_manager: Arc::new(TransactionManager::new()),
             wal_fs,
             catalog: Arc::new(RwLock::new(Catalog::new())),
+            node_free_list: StdMutex::new(Vec::new()),
+            edge_free_list: StdMutex::new(Vec::new()),
+            csr: CsrHolder::new(),
         })
     }
 
@@ -388,6 +410,9 @@ impl GraphStorageEngine {
             txn_manager: Arc::new(TransactionManager::new()),
             wal_fs: wal_fs_arc,
             catalog: Arc::new(RwLock::new(Catalog::new())),
+            node_free_list: StdMutex::new(Vec::new()),
+            edge_free_list: StdMutex::new(Vec::new()),
+            csr: CsrHolder::new(),
         };
 
         // Rebuild secondary indexes from primary data pages.  This also
@@ -592,6 +617,247 @@ impl GraphStorageEngine {
         let lsn = wal_writer.append(fs, rec)?;
         page_manager.superblock.current_wal_lsn = lsn;
         Ok(lsn)
+    }
+
+    /// Compact tombstoned node and edge slots.
+    ///
+    /// Scans the tracked node and edge pages, drops pages whose records are
+    /// all tombstones (no live records remain), prunes free-list entries that
+    /// point into discarded pages, and brackets the operation with
+    /// `CompactionBegin` / `CompactionEnd` WAL records so recovery can observe
+    /// the event.
+    ///
+    /// Returns the number of tombstone slots reclaimed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates WAL or page-manager I/O failures as [`StorageError`].
+    pub fn compact(&mut self, fs: &dyn FileSystem) -> Result<usize, StorageError> {
+        let mut reclaimed = 0usize;
+
+        // Bracket the compaction in the WAL (logical marker, no page image).
+        Self::log(
+            &mut self.page_manager,
+            &mut self.wal_writer,
+            fs,
+            RecordType::CompactionBegin,
+            0,
+            vec![],
+        )?;
+
+        // --- Compact node pages: keep only pages with at least one live record.
+        let node_page_ids = std::mem::take(&mut self.node_pages);
+        for page_id in &node_page_ids {
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            if self.page_manager.read_page(fs, *page_id, &mut buf).is_err() {
+                continue;
+            }
+            let page = SlottedPage::new(buf);
+            let count = page.header().slot_count;
+            let mut has_live = false;
+            for slot_idx in 0..count {
+                let Some(bytes) = page.read(slot_idx) else {
+                    continue;
+                };
+                if bytes.len() == NodeRecord::SIZE
+                    && let Some(node) = NodeRecord::decode(bytes)
+                    && node.node_id != 0
+                {
+                    if node.flags & node_flags::DELETED == 0 {
+                        has_live = true;
+                    } else {
+                        reclaimed += 1;
+                    }
+                }
+            }
+            if has_live {
+                self.node_pages.push(*page_id);
+            }
+        }
+        {
+            let mut free = self.node_free_list.lock().expect("node free list poisoned");
+            free.retain(|s| self.node_pages.contains(&(s.page_id() as u64)));
+        }
+
+        // --- Compact edge pages.
+        let edge_page_ids = std::mem::take(&mut self.edge_pages);
+        for page_id in &edge_page_ids {
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            if self.page_manager.read_page(fs, *page_id, &mut buf).is_err() {
+                continue;
+            }
+            let page = SlottedPage::new(buf);
+            let count = page.header().slot_count;
+            let mut has_live = false;
+            for slot_idx in 0..count {
+                let Some(bytes) = page.read(slot_idx) else {
+                    continue;
+                };
+                if bytes.len() == EdgeRecord::SIZE
+                    && let Some(edge) = EdgeRecord::decode(bytes)
+                    && edge.edge_id != 0
+                {
+                    if edge.flags & edge_flags::DELETED == 0 {
+                        has_live = true;
+                    } else {
+                        reclaimed += 1;
+                    }
+                }
+            }
+            if has_live {
+                self.edge_pages.push(*page_id);
+            }
+        }
+        {
+            let mut free = self.edge_free_list.lock().expect("edge free list poisoned");
+            free.retain(|s| self.edge_pages.contains(&(s.page_id() as u64)));
+        }
+
+        // Bracket end with the count of reclaimed slots.
+        let payload = (reclaimed as u64).to_be_bytes().to_vec();
+        Self::log(
+            &mut self.page_manager,
+            &mut self.wal_writer,
+            fs,
+            RecordType::CompactionEnd,
+            0,
+            payload,
+        )?;
+
+        Ok(reclaimed)
+    }
+
+    /// Build and publish a frozen [`CsrAdjacency`] snapshot from the current
+    /// edge and node pages (Task 58).
+    ///
+    /// After this call, [`GraphStorageEngine::scan_adjacency`] uses the
+    /// cache-friendly CSR path instead of the doubly-linked walk.  The CSR is
+    /// keyed by the logical `source_id` / `target_id` carried in each
+    /// [`EdgeRecord`].
+    ///
+    /// # Performance
+    ///
+    /// Building the CSR requires a full scan of all tracked edge and node
+    /// pages.  Call this when the write rate drops or before a read-heavy
+    /// traversal workload.
+    pub fn freeze_adjacency(&self, fs: &dyn FileSystem) -> Arc<CsrAdjacency> {
+        let mut builder = CsrBuilder::new();
+
+        // Collect live edge records from every tracked edge page.
+        for &page_id in &self.edge_pages {
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            if self.page_manager.read_page(fs, page_id, &mut buf).is_err() {
+                continue;
+            }
+            let page = SlottedPage::new(buf);
+            let count = page.header().slot_count;
+            for slot_idx in 0..count {
+                let Some(bytes) = page.read(slot_idx) else {
+                    continue;
+                };
+                if bytes.len() == EdgeRecord::SIZE
+                    && let Some(edge) = EdgeRecord::decode(bytes)
+                    && edge.edge_id != 0
+                {
+                    builder.add_edge(&edge);
+                }
+            }
+        }
+
+        // Also scan node pages so isolated nodes are represented in row_ptr.
+        for &page_id in &self.node_pages {
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            if self.page_manager.read_page(fs, page_id, &mut buf).is_err() {
+                continue;
+            }
+            let page = SlottedPage::new(buf);
+            let count = page.header().slot_count;
+            for slot_idx in 0..count {
+                let Some(bytes) = page.read(slot_idx) else {
+                    continue;
+                };
+                if bytes.len() == NodeRecord::SIZE
+                    && let Some(node) = NodeRecord::decode(bytes)
+                    && node.node_id != 0
+                {
+                    builder.add_node(&node);
+                }
+            }
+        }
+
+        let csr = builder.build();
+        // Publish a clone, returning the Arc to the caller for immediate use.
+        self.csr.freeze(csr.clone());
+        Arc::new(csr)
+    }
+
+    /// Release the frozen CSR snapshot, reverting [`scan_adjacency`] to the
+    /// doubly-linked walk until the next [`freeze_adjacency`].
+    pub fn thaw_adjacency(&self) {
+        self.csr.thaw();
+    }
+
+    /// Scan the outgoing edges of `node_id`, returning
+    /// `(target_id, edge_id, type_id)` triples.
+    ///
+    /// Prefers the frozen CSR snapshot when one is available (cache-friendly);
+    /// otherwise falls back to walking the doubly-linked adjacency list from
+    /// the node's `first_outgoing_edge`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::IndexError`] if the node index is inconsistent,
+    /// or propagates page-read failures.
+    pub fn scan_adjacency(
+        &self,
+        node_id: u64,
+        fs: &dyn FileSystem,
+    ) -> Result<Vec<(u64, u64, u32)>, StorageError> {
+        // Fast path: a frozen CSR snapshot is available.
+        if let Some(snap) = self.csr.snapshot() {
+            return Ok(snap
+                .outgoing_edges(node_id)
+                .map(|e| (e.target_id, e.edge_id, e.edge_type))
+                .collect());
+        }
+
+        // Slow path: follow the doubly-linked list via the node record.
+        let key = node_id_key(node_id as u128);
+        let (page_id, slot) = match self.node_index.search(&key) {
+            Some(r) => r,
+            None => return Ok(Vec::new()),
+        };
+        let page = self
+            .node_index
+            .get_page(page_id)
+            .ok_or(StorageError::IndexError)?;
+        let kv = page.key(slot).ok_or(StorageError::IndexError)?;
+        let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
+        let value = &kv[2 + key_len..];
+        let slot_ref = decode_slot_ref(value).ok_or(StorageError::IndexError)?;
+
+        let record =
+            Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
+        let node = NodeRecord::decode(&record).ok_or(StorageError::NotFound)?;
+
+        let mut result = Vec::new();
+        let mut cursor = node.first_outgoing_edge;
+        const MAX_HOPS: usize = 65536;
+        let mut depth = 0usize;
+        while !cursor.is_null() && depth < MAX_HOPS {
+            depth += 1;
+            let Some(edge_bytes) = Self::read_record(&self.page_manager, cursor, fs)? else {
+                break;
+            };
+            let Some(edge) = EdgeRecord::decode(&edge_bytes) else {
+                break;
+            };
+            if edge.flags & edge_flags::DELETED == 0 {
+                result.push((edge.target_id, edge.edge_id, edge.type_id));
+            }
+            cursor = edge.next_source_edge;
+        }
+        Ok(result)
     }
 
     /// Sync the WAL, superblock, and bitmap to durable storage.
@@ -1295,6 +1561,12 @@ impl StorageEngine for GraphStorageEngine {
         txn_mgr.commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
             .map_err(StorageError::from)?;
 
+        // Track the freed node slot for the free-space map (Task 174).
+        self.node_free_list
+            .lock()
+            .expect("node free list poisoned")
+            .push(slot_ref);
+
         Ok(())
     }
 
@@ -1517,6 +1789,12 @@ impl StorageEngine for GraphStorageEngine {
         let wal_fs = Arc::clone(&self.wal_fs);
         txn_mgr.commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
             .map_err(StorageError::from)?;
+
+        // Track the freed edge slot for the free-space map (Task 174).
+        self.edge_free_list
+            .lock()
+            .expect("edge free list poisoned")
+            .push(slot_ref);
 
         Ok(())
     }
@@ -2107,5 +2385,181 @@ mod tests {
         // Open must succeed even with no WAL.
         let engine = GraphStorageEngine::open(path, &fs).unwrap();
         assert_eq!(engine.page_manager.superblock.total_page_count, 3);
+    }
+
+    // ------------------------------------------------------------------
+    // Task 174: free-space map and tombstone compaction
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn delete_node_adds_to_free_list() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+
+        let node = NodeRecord::new(1, 42);
+        engine.put_node(&node, &fs).unwrap();
+        assert_eq!(engine.node_free_list.lock().unwrap().len(), 0);
+
+        engine.delete_node(1, &fs).unwrap();
+        assert_eq!(
+            engine.node_free_list.lock().unwrap().len(),
+            1,
+            "free list should have 1 entry after deletion"
+        );
+    }
+
+    #[test]
+    fn delete_edge_adds_to_free_list() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+
+        // Insert endpoints first so adjacency wiring succeeds.
+        engine.put_node(&NodeRecord::new(1, 0), &fs).unwrap();
+        engine.put_node(&NodeRecord::new(2, 0), &fs).unwrap();
+        let src = engine.lookup_node_slot(1).unwrap().unwrap();
+        let tgt = engine.lookup_node_slot(2).unwrap().unwrap();
+
+        let edge = EdgeRecord::new(100, 5, 1, 2, src, tgt);
+        engine.put_edge(&edge, &fs).unwrap();
+        assert_eq!(engine.edge_free_list.lock().unwrap().len(), 0);
+
+        engine.delete_edge(100, &fs).unwrap();
+        assert_eq!(
+            engine.edge_free_list.lock().unwrap().len(),
+            1,
+            "edge free list should have 1 entry after deletion"
+        );
+    }
+
+    #[test]
+    fn compact_wal_logs_and_returns_reclaimed_count() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+
+        // Insert and delete nodes to create tombstones.
+        for i in 1u64..=5 {
+            engine.put_node(&NodeRecord::new(i, 10), &fs).unwrap();
+        }
+        for i in 1u64..=5 {
+            engine.delete_node(i, &fs).unwrap();
+        }
+
+        let reclaimed = engine.compact(&fs).unwrap();
+        assert!(
+            reclaimed >= 5,
+            "compact() should report at least the 5 deleted node slots; got {}",
+            reclaimed
+        );
+
+        // The free list must not grow beyond what compaction leaves behind.
+        let fl = engine.node_free_list.lock().unwrap().len();
+        assert!(fl <= 5, "free list should not grow past the deletions");
+    }
+
+    #[test]
+    fn compact_is_wal_logged_with_brackets() {
+        let (dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+        engine.put_node(&NodeRecord::new(1, 10), &fs).unwrap();
+        engine.delete_node(1, &fs).unwrap();
+        engine.compact(&fs).unwrap();
+        engine.sync(&fs).unwrap();
+
+        let seg = dir.path().join("wal").join("wal-000000000");
+        let handle = fs.open(&seg, false).unwrap();
+        let len = handle.len().unwrap() as usize;
+        let mut buf = vec![0u8; len];
+        handle.read_at(&mut buf, 0).unwrap();
+
+        let mut saw_begin = false;
+        let mut saw_end = false;
+        let mut offset = 0;
+        while offset < buf.len() {
+            if let Some((rec, size)) = WalRecord::decode(&buf, offset) {
+                match rec.record_type {
+                    RecordType::CompactionBegin => saw_begin = true,
+                    RecordType::CompactionEnd => saw_end = true,
+                    _ => {}
+                }
+                offset += size;
+            } else {
+                break;
+            }
+        }
+        assert!(saw_begin, "CompactionBegin WAL record must be present");
+        assert!(saw_end, "CompactionEnd WAL record must be present");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 58: freeze_adjacency / scan_adjacency
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn freeze_adjacency_returns_correct_edges() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+
+        engine.put_node(&NodeRecord::new(1, 1), &fs).unwrap();
+        engine.put_node(&NodeRecord::new(2, 1), &fs).unwrap();
+        let src = engine.lookup_node_slot(1).unwrap().unwrap();
+        let tgt = engine.lookup_node_slot(2).unwrap().unwrap();
+
+        // Edge 100: logical node 1 → node 2.
+        let edge = EdgeRecord::new(100, 5, 1, 2, src, tgt);
+        engine.put_edge(&edge, &fs).unwrap();
+
+        let snap = engine.freeze_adjacency(&fs);
+        assert!(
+            engine.csr.is_frozen(),
+            "CSR should be frozen after freeze_adjacency()"
+        );
+
+        let edges: Vec<_> = snap.outgoing_edges(1).collect();
+        assert_eq!(edges.len(), 1, "node 1 should have 1 outgoing edge");
+        assert_eq!(edges[0].target_id, 2, "edge target should be node 2");
+        assert_eq!(edges[0].edge_id, 100, "edge id should be 100");
+        assert_eq!(edges[0].edge_type, 5, "edge type should be 5");
+    }
+
+    #[test]
+    fn scan_adjacency_csr_and_linked_list_agree() {
+        let (_dir, fs, path) = temp_fs();
+        let mut engine = GraphStorageEngine::init(path, &fs).unwrap();
+
+        engine.put_node(&NodeRecord::new(1, 1), &fs).unwrap();
+        engine.put_node(&NodeRecord::new(2, 1), &fs).unwrap();
+        engine.put_node(&NodeRecord::new(3, 1), &fs).unwrap();
+        let s1 = engine.lookup_node_slot(1).unwrap().unwrap();
+        let s2 = engine.lookup_node_slot(2).unwrap().unwrap();
+        let s3 = engine.lookup_node_slot(3).unwrap().unwrap();
+
+        // Edges from node 1 → 2 and node 1 → 3 (adjacency auto-wired by put_edge).
+        engine.put_edge(&EdgeRecord::new(10, 1, 1, 2, s1, s2), &fs).unwrap();
+        engine.put_edge(&EdgeRecord::new(11, 1, 1, 3, s1, s3), &fs).unwrap();
+
+        // Linked-list path (no CSR yet) must already see both edges.
+        let mut ll = engine.scan_adjacency(1, &fs).unwrap();
+        ll.sort_by_key(|(t, _, _)| *t);
+        let ll_targets: Vec<u64> = ll.iter().map(|(t, _, _)| *t).collect();
+        assert_eq!(ll_targets, vec![2, 3], "linked-list scan should see both edges");
+
+        // Freeze and compare CSR results.
+        engine.freeze_adjacency(&fs);
+        let mut csr = engine.scan_adjacency(1, &fs).unwrap();
+        csr.sort_by_key(|(t, _, _)| *t);
+        assert_eq!(csr, ll, "CSR and linked-list scans must agree");
+    }
+
+    #[test]
+    fn thaw_removes_csr_snapshot() {
+        let (_dir, fs, path) = temp_fs();
+        let engine = GraphStorageEngine::init(path, &fs).unwrap();
+        engine.freeze_adjacency(&fs);
+        assert!(engine.csr.is_frozen());
+        engine.thaw_adjacency();
+        assert!(
+            !engine.csr.is_frozen(),
+            "CSR should not be frozen after thaw_adjacency()"
+        );
     }
 }

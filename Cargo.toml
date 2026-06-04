@@ -13,6 +13,7 @@ clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
 crossbeam-epoch = "0.9"
 io-uring = "0.7"
+parking_lot = "0.12"
 
 # --- async / server ---
 tokio = { version = "1", features = [
@@ -60,6 +61,10 @@ gherkin = "0.14"
 
 [[bench]]
 name = "btree_bench"
+harness = false
+
+[[bench]]
+name = "csr_bench"
 harness = false
 
 [build-dependencies]

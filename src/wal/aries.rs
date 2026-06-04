@@ -437,8 +437,12 @@ impl<'a> AriesRecovery<'a> {
                     seed_dpt_from_checkpoint(&rec.payload, &mut dpt);
                 }
 
-                // ── Checkpoint begin / segment descriptor: no side effects ──
-                RecordType::CheckpointBegin | RecordType::SegmentDescriptor => {}
+                // ── Checkpoint begin / segment descriptor / compaction:
+                //    purely logical markers with no page side effects ──────────
+                RecordType::CheckpointBegin
+                | RecordType::SegmentDescriptor
+                | RecordType::CompactionBegin
+                | RecordType::CompactionEnd => {}
             }
         }
 

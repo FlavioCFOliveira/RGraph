@@ -1800,6 +1800,7 @@ dependencies = [
  "libc",
  "logos",
  "num_cpus",
+ "parking_lot",
  "prometheus",
  "proptest",
  "prost",

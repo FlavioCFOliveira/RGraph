@@ -76,6 +76,17 @@ pub enum RecordType {
     /// Payload is a [`SegmentDescriptor::SIZE`]-byte block produced by
     /// [`SegmentDescriptor::encode`].
     SegmentDescriptor = 0x50,
+    /// Begin-compaction marker — tombstone-only pages are being collected.
+    ///
+    /// Logical record: carries no page image and is a no-op for REDO/UNDO.
+    /// It bounds the compaction operation in the WAL so recovery can observe
+    /// that a compaction was in progress.
+    CompactionBegin = 0x60,
+    /// End-compaction marker.
+    ///
+    /// Payload: an 8-byte big-endian count of reclaimed slots.  Logical
+    /// record: a no-op for REDO/UNDO.
+    CompactionEnd = 0x61,
 }
 
 /// A single WAL record.
@@ -230,6 +241,8 @@ impl WalRecord {
             0x37 => RecordType::PropertyUpdate,
             0x40 => RecordType::Clr,
             0x50 => RecordType::SegmentDescriptor,
+            0x60 => RecordType::CompactionBegin,
+            0x61 => RecordType::CompactionEnd,
             _ => return None,
         };
         cursor += 1;
@@ -336,6 +349,8 @@ mod tests {
             RecordType::PropertyUpdate,
             RecordType::Clr,
             RecordType::SegmentDescriptor,
+            RecordType::CompactionBegin,
+            RecordType::CompactionEnd,
         ] {
             let rec = WalRecord::new(rt, 42, 0, 0, vec![0xAB, 0xCD]);
             let bytes = rec.encode();
