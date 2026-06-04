@@ -227,9 +227,22 @@ impl WalWriter {
 
         let (intra_offset, segment_handle) = if fs.exists(&segment_path) {
             let handle = fs.open(&segment_path, false)?;
-            let len = handle.len()? as u32;
+            let len = handle.len()?;
+            // M22: remove any torn tail (a partial record left by a crash
+            // mid-append) before resuming.  Otherwise the writer would append
+            // after the torn bytes and every future recovery would stop decoding
+            // at the torn record, silently dropping everything written afterward.
+            let valid_end = Self::last_valid_offset(handle.as_ref(), len)?;
+            if valid_end < len {
+                handle.set_len(valid_end)?;
+                handle.sync_all()?;
+            }
             // Ensure a non-zero offset so LSN 0 remains the "null/initial" sentinel.
-            let offset = if segment_id == 0 { len.max(1) } else { len };
+            let offset = if segment_id == 0 {
+                (valid_end as u32).max(1)
+            } else {
+                valid_end as u32
+            };
             (offset, Some(handle))
         } else {
             let handle = fs.open(&segment_path, true)?;
@@ -284,6 +297,26 @@ impl WalWriter {
             }
         }
         max_id
+    }
+
+    /// Byte offset just past the last fully-decodable WAL record in a segment —
+    /// i.e. where a torn (partial) trailing record begins, or `len` if the
+    /// segment is intact.  Used by [`Self::open`] to truncate a partial trailing
+    /// record left by a crash mid-append (M22).
+    fn last_valid_offset(handle: &dyn crate::io::FileHandle, len: u64) -> io::Result<u64> {
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut raw = vec![0u8; len as usize];
+        handle.read_at(&mut raw, 0)?;
+        let mut offset = 0usize;
+        while offset < raw.len() {
+            match WalRecord::decode(&raw, offset) {
+                Some((_, size)) if size > 0 => offset += size,
+                _ => break,
+            }
+        }
+        Ok(offset as u64)
     }
 
     /// Return a shared handle to the durable LSN watermark.
@@ -646,6 +679,67 @@ mod tests {
     }
 
     // ── Rotation tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn open_truncates_torn_tail_so_later_records_survive() {
+        // Regression gate for finding M22 (2026-06-04): a torn (partial) record at
+        // the tail of the active segment must be truncated on open, so records
+        // appended afterward are not lost behind the torn bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let seg = dir.path().join("wal-000000000");
+
+        // Write one valid record and flush it.
+        {
+            let mut writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
+            writer
+                .append(&fs, WalRecord::new(RecordType::Begin, 1, 0, 0, vec![1, 2, 3]))
+                .unwrap();
+            writer.flush(&fs).unwrap();
+        }
+
+        // Append a partial (torn) record directly to the segment file.
+        {
+            let handle = fs.open(&seg, false).unwrap();
+            let len = handle.len().unwrap();
+            handle.write_at(&[0xAB, 0xCD, 0xEF], len).unwrap();
+            handle.sync_data().unwrap();
+        }
+        let torn_len = fs.open(&seg, false).unwrap().len().unwrap();
+
+        // Reopen: the torn tail must be truncated, and a new record appended
+        // cleanly past the (now removed) garbage.
+        {
+            let mut writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
+            assert!(
+                fs.open(&seg, false).unwrap().len().unwrap() < torn_len,
+                "torn tail must be truncated on open"
+            );
+            writer
+                .append(&fs, WalRecord::new(RecordType::Commit, 1, 0, 0, vec![]))
+                .unwrap();
+            writer.flush(&fs).unwrap();
+        }
+
+        // The segment must now decode cleanly to exactly two records and no tail.
+        let handle = fs.open(&seg, false).unwrap();
+        let len = handle.len().unwrap() as usize;
+        let mut raw = vec![0u8; len];
+        handle.read_at(&mut raw, 0).unwrap();
+        let mut offset = 0usize;
+        let mut count = 0;
+        while offset < raw.len() {
+            match WalRecord::decode(&raw, offset) {
+                Some((_, size)) if size > 0 => {
+                    offset += size;
+                    count += 1;
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(count, 2, "exactly Begin + Commit must decode");
+        assert_eq!(offset, raw.len(), "no trailing garbage after the kept records");
+    }
 
     #[test]
     fn segment_create_and_symlink_rename_fsync_the_wal_directory() {
