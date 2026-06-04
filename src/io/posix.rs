@@ -11,6 +11,7 @@ use std::path::Path;
 /// page-aligned buffers can be transferred without kernel copying.
 /// If `O_DIRECT` is not available (or the file-system rejects it) the
 /// call falls back to ordinary buffered I/O.
+#[derive(Debug)]
 pub struct PosixFileSystem {
     use_odirect: bool,
 }

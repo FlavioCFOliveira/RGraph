@@ -71,10 +71,26 @@ impl SsiTracker {
         writer_flags.in_conflict.store(true, Ordering::Relaxed);
     }
 
-    /// Has `txid` accumulated both in and out conflicts?
-    pub fn is_doomed(&self, _txid: TxId, flags: &SsiFlags) -> bool {
-        flags.in_conflict.load(Ordering::Relaxed)
-            && flags.out_conflict.load(Ordering::Relaxed)
+    /// Mark `txid` as having an `out_conflict` (it read a range that another
+    /// transaction subsequently wrote).  Used by the manager when it detects
+    /// an rw-antidependency via the lock table without having direct access to
+    /// the reader's [`SsiFlags`].
+    pub fn mark_out_conflict(&self, txid: TxId) {
+        self.out_set.lock().unwrap().insert(txid);
+    }
+
+    /// Returns `true` if `txid` is recorded in the `out_set` (has read-before-
+    /// write conflict) AND the provided `flags` also have `in_conflict` set.
+    ///
+    /// This makes `is_doomed` **authoritative** for Serializable transactions:
+    /// it consults both the global tracker and the per-transaction flags,
+    /// ensuring symmetric antidependency detection is sound.
+    pub fn is_doomed(&self, txid: TxId, flags: &SsiFlags) -> bool {
+        let has_out = flags.out_conflict.load(Ordering::Relaxed)
+            || self.out_set.lock().unwrap().contains(&txid);
+        let has_in = flags.in_conflict.load(Ordering::Relaxed)
+            || self.in_set.lock().unwrap().contains(&txid);
+        has_out && has_in
     }
 
     /// Clean up bookkeeping for a finalised transaction.

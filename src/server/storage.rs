@@ -549,6 +549,8 @@ fn into_rgraph_err(e: StorageError) -> RGraphError {
         StorageError::SlotOverflow => RGraphError::Internal("slot overflow".into()),
         StorageError::AlreadyExists => RGraphError::AlreadyExists("entity already exists".into()),
         StorageError::InvalidId => RGraphError::Argument("id 0 is reserved".into()),
+        StorageError::TxConflict => RGraphError::Internal("transaction conflict — retry".into()),
+        StorageError::TxAborted => RGraphError::Internal("transaction aborted".into()),
     }
 }
 

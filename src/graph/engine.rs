@@ -16,6 +16,9 @@ use crate::storage::manager::PageManager;
 use crate::storage::manager::num_bitmap_pages;
 use crate::storage::meta::load_superblock;
 use crate::storage::page::{PAGE_SIZE, PageId, PageType, SlottedPage};
+use crate::txn::lock_table::LockMode;
+use crate::txn::manager::{IsolationLevel, Transaction, TransactionManager, TxError};
+use crate::txn::mvcc::TupleHeader;
 use crate::wal::aries::AriesRecovery;
 use crate::wal::doublewrite::DoubleWriteBuffer;
 use crate::wal::record::{RecordType, WalRecord};
@@ -105,6 +108,12 @@ pub enum StorageError {
     AlreadyExists,
     /// Id 0 is reserved and must not be used for graph entities.
     InvalidId,
+    /// A transaction conflict was detected (wound-wait, write-write conflict,
+    /// or SSI write-skew).  The caller must roll back and retry.
+    TxConflict,
+    /// The transaction was aborted (e.g. it was wounded by an older
+    /// transaction in the wound-wait protocol).
+    TxAborted,
 }
 
 impl std::fmt::Display for StorageError {
@@ -117,6 +126,8 @@ impl std::fmt::Display for StorageError {
             StorageError::SlotOverflow => write!(f, "slot reference overflow"),
             StorageError::AlreadyExists => write!(f, "entity already exists"),
             StorageError::InvalidId => write!(f, "id 0 is reserved and may not be used"),
+            StorageError::TxConflict => write!(f, "transaction conflict — retry"),
+            StorageError::TxAborted => write!(f, "transaction aborted"),
         }
     }
 }
@@ -132,6 +143,20 @@ impl From<io::Error> for StorageError {
 impl From<BTreeError> for StorageError {
     fn from(_: BTreeError) -> Self {
         StorageError::IndexError
+    }
+}
+
+impl From<TxError> for StorageError {
+    fn from(e: TxError) -> Self {
+        match e {
+            TxError::WoundWait(_) => StorageError::TxAborted,
+            TxError::PhantomConflict(_) | TxError::WriteConflict(_, _) => {
+                StorageError::TxConflict
+            }
+            TxError::WalFlush(_) => StorageError::IoError,
+            TxError::NotActive(_, _) | TxError::AlreadyFinalised(_) => StorageError::TxAborted,
+            TxError::IndexMutation(_) => StorageError::IndexError,
+        }
     }
 }
 
@@ -198,14 +223,24 @@ pub trait StorageEngine {
 
 /// Production graph storage engine.
 ///
-/// Owns the page manager, WAL writer, and all B+ tree indexes.
-/// Pages used for graph records are tracked in `node_pages`,
-/// `edge_pages`, and `property_pages` so that insertions prefer
+/// Owns the page manager, WAL writer, all B+ tree indexes, and the
+/// MVCC transaction manager.  Pages used for graph records are tracked in
+/// `node_pages`, `edge_pages`, and `property_pages` so that insertions prefer
 /// recently-used pages before allocating new ones.
 ///
 /// `id_allocator` hands out globally unique, monotonically-increasing u64
 /// ids for nodes and edges.  On engine open the allocator is seeded from
 /// the highest id observed during `rebuild_indexes`.
+///
+/// # Transaction API
+///
+/// * [`GraphStorageEngine::begin_transaction`] — start a transaction.
+/// * [`GraphStorageEngine::commit_transaction`] — flush WAL, release locks.
+/// * [`GraphStorageEngine::rollback_transaction`] — release locks, mark aborted.
+///
+/// The engine's `put_node`/`put_edge`/`delete_node`/`delete_edge` methods
+/// accept an optional `Transaction` reference; when `None` is passed they
+/// operate in a single-statement autocommit mode.
 #[derive(Debug)]
 pub struct GraphStorageEngine {
     pub page_manager: PageManager,
@@ -220,6 +255,12 @@ pub struct GraphStorageEngine {
     pub property_pages: Vec<PageId>,
     /// Server-side id allocator.  Seeded from on-disk data during open.
     pub id_allocator: IdAllocator,
+    /// MVCC/lock-based transaction manager.  Shared (via `Arc`) so that
+    /// multiple engine handles can participate in the same transaction space.
+    pub txn_manager: Arc<TransactionManager>,
+    /// Tracks the WAL filesystem for use in transaction commit/rollback.
+    /// Cached here so callers do not need to pass it separately.
+    wal_fs: Arc<crate::io::posix::PosixFileSystem>,
 }
 
 impl GraphStorageEngine {
@@ -244,6 +285,7 @@ impl GraphStorageEngine {
         let wal_writer = WalWriter::open(wal_dir, &wal_fs)?;
 
         let config = BPlusTreeConfig::default();
+        let wal_fs = Arc::new(crate::io::posix::PosixFileSystem::new(false));
         Ok(Self {
             page_manager: pm,
             wal_writer,
@@ -256,6 +298,8 @@ impl GraphStorageEngine {
             edge_pages: Vec::new(),
             property_pages: Vec::new(),
             id_allocator: IdAllocator::new(1),
+            txn_manager: Arc::new(TransactionManager::new()),
+            wal_fs,
         })
     }
 
@@ -324,6 +368,7 @@ impl GraphStorageEngine {
         }
 
         let config = BPlusTreeConfig::default();
+        let wal_fs_arc = Arc::new(crate::io::posix::PosixFileSystem::new(false));
         let mut engine = Self {
             page_manager: pm,
             wal_writer,
@@ -336,6 +381,8 @@ impl GraphStorageEngine {
             edge_pages: Vec::new(),
             property_pages: Vec::new(),
             id_allocator: IdAllocator::new(1),
+            txn_manager: Arc::new(TransactionManager::new()),
+            wal_fs: wal_fs_arc,
         };
 
         // Rebuild secondary indexes from primary data pages.  This also
@@ -577,6 +624,74 @@ impl GraphStorageEngine {
         self.page_manager.sync_superblock(fs)?;
         self.page_manager.sync_bitmap(fs)?;
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Transaction API (Task 154)
+    // ------------------------------------------------------------------
+
+    /// Begin a new transaction at the default isolation level
+    /// (`RepeatableRead`).
+    ///
+    /// The caller is responsible for calling [`commit_transaction`] or
+    /// [`rollback_transaction`] when done.
+    pub fn begin_transaction(&self) -> Transaction {
+        self.txn_manager.begin()
+    }
+
+    /// Begin a new transaction with an explicit isolation level.
+    pub fn begin_transaction_with_isolation(&self, level: IsolationLevel) -> Transaction {
+        self.txn_manager.begin_with_isolation(level)
+    }
+
+    /// Commit a transaction: flush the WAL to durable storage, release locks,
+    /// and update the global transaction state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::IoError` if the WAL flush fails.
+    /// Returns `StorageError::TxAborted` if the transaction is not active.
+    /// Returns `StorageError::TxConflict` if an SSI write-skew is detected.
+    pub fn commit_transaction(
+        &mut self,
+        tx: &mut Transaction,
+    ) -> Result<(), StorageError> {
+        let fs = Arc::clone(&self.wal_fs);
+        self.txn_manager
+            .commit(tx, &mut self.wal_writer, fs.as_ref())
+            .map_err(StorageError::from)
+    }
+
+    /// Roll back a transaction: release all locks and mark it as aborted.
+    ///
+    /// An `Abort` WAL record is written best-effort (not flushed).
+    pub fn rollback_transaction(
+        &mut self,
+        tx: &mut Transaction,
+    ) -> Result<(), StorageError> {
+        let fs = Arc::clone(&self.wal_fs);
+        self.txn_manager
+            .rollback(tx, &mut self.wal_writer, fs.as_ref())
+            .map_err(StorageError::from)
+    }
+
+    /// Acquire an exclusive lock on a node resource within a transaction.
+    ///
+    /// Used internally by `put_node` / `delete_node`; exposed publicly for
+    /// callers that need to lock a node before reading-then-writing it.
+    pub fn lock_node(&self, tx: &mut Transaction, node_id: u64) -> Result<(), StorageError> {
+        let resource_id = node_resource_id(node_id);
+        self.txn_manager
+            .acquire_lock(tx, resource_id, LockMode::Exclusive)
+            .map_err(StorageError::from)
+    }
+
+    /// Acquire an exclusive lock on an edge resource within a transaction.
+    pub fn lock_edge(&self, tx: &mut Transaction, edge_id: u64) -> Result<(), StorageError> {
+        let resource_id = edge_resource_id(edge_id);
+        self.txn_manager
+            .acquire_lock(tx, resource_id, LockMode::Exclusive)
+            .map_err(StorageError::from)
     }
 
     pub fn scan_nodes_by_label(
@@ -860,6 +975,20 @@ impl GraphStorageEngine {
     }
 }
 
+/// Derive a lock-table resource ID for a node from its logical `node_id`.
+///
+/// The low 32 bits are the node_id; bit 32 is 0 to distinguish nodes from edges.
+pub(crate) fn node_resource_id(node_id: u64) -> u64 {
+    node_id & 0x0000_FFFF_FFFF_FFFF
+}
+
+/// Derive a lock-table resource ID for an edge from its logical `edge_id`.
+///
+/// Bit 48 is set to keep edge IDs in a separate namespace from node IDs.
+pub(crate) fn edge_resource_id(edge_id: u64) -> u64 {
+    (edge_id & 0x0000_FFFF_FFFF_FFFF) | (1u64 << 48)
+}
+
 /// Convert a `(PageId, slot)` to a [`SlotRef`], checking bounds.
 fn slot_ref(page_id: PageId, slot: u16) -> Result<SlotRef, StorageError> {
     if page_id > SlotRef::MAX_PAGE_ID as u64 || slot > SlotRef::MAX_SLOT_INDEX as u16 {
@@ -891,37 +1020,73 @@ impl StorageEngine for GraphStorageEngine {
             return Err(StorageError::AlreadyExists);
         }
 
+        // Acquire an exclusive lock on this node resource.
+        let resource_id = node_resource_id(node.node_id);
+        let txn_mgr = Arc::clone(&self.txn_manager);
+        let mut autocommit_tx = txn_mgr.begin();
+        if let Err(e) = txn_mgr.acquire_lock(&mut autocommit_tx, resource_id, LockMode::Exclusive) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
+
+        let txid = autocommit_tx.txid;
         let mut buf = [0u8; NodeRecord::SIZE];
         node.encode(&mut buf);
-        let slot = Self::insert_record(
+        let slot = match Self::insert_record(
             &mut self.page_manager,
             &buf,
             &mut self.node_pages,
             PageType::SlottedData,
             fs,
-        )?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+                return Err(e);
+            }
+        };
 
         // Index: node_id -> SlotRef (4 bytes).
         let value = slot.raw.to_be_bytes().to_vec();
-        self.node_index.insert(&key, &value)?;
+        if let Err(e) = self.node_index.insert(&key, &value) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
 
         // Secondary label index.
         let label_key = label_index_key(node.label_id as u64, node.node_id as u128);
-        self.label_index.insert(&label_key, &value)?;
+        if let Err(e) = self.label_index.insert(&label_key, &value) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
 
-        // WAL: NodeInsert.
+        // WAL: NodeInsert with MVCC xmin = this transaction's TxId.
         let mut payload = Vec::with_capacity(8 + 4 + NodeRecord::SIZE);
         payload.extend_from_slice(&node.node_id.to_be_bytes());
         payload.extend_from_slice(&slot.raw.to_be_bytes());
+        // Embed a TupleHeader (xmin = txid, xmax = 0) before the record bytes
+        // so recovery can reconstruct MVCC visibility.
+        let tuple_hdr = TupleHeader::new_insert(txid, 0);
+        let mut hdr_bytes = [0u8; TupleHeader::SIZE];
+        tuple_hdr.encode(&mut hdr_bytes);
+        payload.extend_from_slice(&hdr_bytes);
         payload.extend_from_slice(&buf);
-        Self::log(
+        if let Err(e) = Self::log(
             &mut self.page_manager,
             &mut self.wal_writer,
             fs,
             RecordType::NodeInsert,
-            1,
+            txid,
             payload,
-        )?;
+        ) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
+        }
+
+        // Commit the autocommit transaction (flush WAL, release locks).
+        let wal_fs = Arc::clone(&self.wal_fs);
+        txn_mgr.commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
+            .map_err(StorageError::from)?;
 
         Ok(slot)
     }
@@ -946,6 +1111,11 @@ impl StorageEngine for GraphStorageEngine {
         let slot_ref = decode_slot_ref(value).ok_or(StorageError::IndexError)?;
 
         let record = Self::read_record(&self.page_manager, slot_ref, fs)?;
+        // Note: The on-disk record is a raw NodeRecord (no TupleHeader on the
+        // data page).  The TupleHeader is written into WAL payloads for recovery
+        // and future MVCC chain support, but the slotted page stores the record
+        // in its compact fixed-size format.  MVCC visibility in the autocommit
+        // path relies on the logical DELETED flag in the NodeRecord.
         match record {
             Some(bytes) => Ok(NodeRecord::decode(&bytes)),
             None => Ok(None),
@@ -964,6 +1134,16 @@ impl StorageEngine for GraphStorageEngine {
         let value = &kv[2 + key_len..];
         let slot_ref = decode_slot_ref(value).ok_or(StorageError::IndexError)?;
 
+        // Acquire exclusive lock on the node.
+        let resource_id = node_resource_id(node_id);
+        let txn_mgr = Arc::clone(&self.txn_manager);
+        let mut autocommit_tx = txn_mgr.begin();
+        if let Err(e) = txn_mgr.acquire_lock(&mut autocommit_tx, resource_id, LockMode::Exclusive) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
+        let txid = autocommit_tx.txid;
+
         let record =
             Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
         let mut node = NodeRecord::decode(&record).ok_or(StorageError::NotFound)?;
@@ -972,24 +1152,43 @@ impl StorageEngine for GraphStorageEngine {
 
         let mut buf = [0u8; NodeRecord::SIZE];
         node.encode(&mut buf);
-        Self::overwrite_record(&mut self.page_manager, slot_ref, &buf, fs)?;
+        if let Err(e) = Self::overwrite_record(&mut self.page_manager, slot_ref, &buf, fs) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
+        }
 
         // Remove from label index (tombstone approach: keep in primary index).
         let label_key = label_index_key(node.label_id as u64, node_id as u128);
-        self.label_index.delete(&label_key)?;
+        if let Err(e) = self.label_index.delete(&label_key) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
 
-        // WAL: NodeDelete.
+        // WAL: NodeDelete with MVCC xmax = this transaction's TxId.
         let mut payload = node_id.to_be_bytes().to_vec();
         payload.extend_from_slice(&slot_ref.raw.to_be_bytes());
+        // TupleHeader: xmin from original insert (0 = unknown here), xmax = txid.
+        let mut tuple_hdr = TupleHeader::new_insert(0, 0);
+        tuple_hdr.mark_deleted(txid);
+        let mut hdr_bytes = [0u8; TupleHeader::SIZE];
+        tuple_hdr.encode(&mut hdr_bytes);
+        payload.extend_from_slice(&hdr_bytes);
         payload.extend_from_slice(&buf);
-        Self::log(
+        if let Err(e) = Self::log(
             &mut self.page_manager,
             &mut self.wal_writer,
             fs,
             RecordType::NodeDelete,
-            1,
+            txid,
             payload,
-        )?;
+        ) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
+        }
+
+        let wal_fs = Arc::clone(&self.wal_fs);
+        txn_mgr.commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
+            .map_err(StorageError::from)?;
 
         Ok(())
     }
@@ -1007,48 +1206,96 @@ impl StorageEngine for GraphStorageEngine {
             return Err(StorageError::AlreadyExists);
         }
 
+        // Acquire exclusive lock on the edge resource.
+        let resource_id = edge_resource_id(edge.edge_id);
+        let txn_mgr = Arc::clone(&self.txn_manager);
+        let mut autocommit_tx = txn_mgr.begin();
+        if let Err(e) = txn_mgr.acquire_lock(&mut autocommit_tx, resource_id, LockMode::Exclusive) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
+        let txid = autocommit_tx.txid;
+
         let mut buf = [0u8; EdgeRecord::SIZE];
         edge.encode(&mut buf);
-        let edge_slot = Self::insert_record(
+        let edge_slot = match Self::insert_record(
             &mut self.page_manager,
             &buf,
             &mut self.edge_pages,
             PageType::SlottedData,
             fs,
-        )?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+                return Err(e);
+            }
+        };
 
         let value = edge_slot.raw.to_be_bytes().to_vec();
-        self.edge_index.insert(&key, &value)?;
+        if let Err(e) = self.edge_index.insert(&key, &value) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
 
         // Secondary type index.
         let type_key = type_index_key(edge.type_id as u64, edge.edge_id as u128);
-        self.type_index.insert(&type_key, &value)?;
+        if let Err(e) = self.type_index.insert(&type_key, &value) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
 
         // Adjacency list maintenance for source node (outgoing).
-        if !edge.source_node.is_null() {
-            Self::wire_source_adjacency(&mut self.page_manager, edge_slot, edge.source_node, fs)?;
+        if !edge.source_node.is_null()
+            && let Err(e) = Self::wire_source_adjacency(&mut self.page_manager, edge_slot, edge.source_node, fs)
+        {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
         }
 
         // Adjacency list maintenance for target node (incoming).
-        if !edge.target_node.is_null() {
-            Self::wire_target_adjacency(&mut self.page_manager, edge_slot, edge.target_node, fs)?;
+        if !edge.target_node.is_null()
+            && let Err(e) = Self::wire_target_adjacency(&mut self.page_manager, edge_slot, edge.target_node, fs)
+        {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
         }
 
-        // WAL: EdgeInsert — re-encode to capture any pointer updates.
-        let final_record =
-            Self::read_record(&self.page_manager, edge_slot, fs)?.ok_or(StorageError::NotFound)?;
-        let mut payload = Vec::with_capacity(8 + 4 + EdgeRecord::SIZE);
+        // WAL: EdgeInsert with MVCC xmin — re-read to capture pointer updates.
+        let final_record = match Self::read_record(&self.page_manager, edge_slot, fs) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+                return Err(StorageError::NotFound);
+            }
+            Err(e) => {
+                let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+                return Err(e);
+            }
+        };
+        let mut payload = Vec::with_capacity(8 + 4 + TupleHeader::SIZE + EdgeRecord::SIZE);
         payload.extend_from_slice(&edge.edge_id.to_be_bytes());
         payload.extend_from_slice(&edge_slot.raw.to_be_bytes());
+        let tuple_hdr = TupleHeader::new_insert(txid, 0);
+        let mut hdr_bytes = [0u8; TupleHeader::SIZE];
+        tuple_hdr.encode(&mut hdr_bytes);
+        payload.extend_from_slice(&hdr_bytes);
         payload.extend_from_slice(&final_record);
-        Self::log(
+        if let Err(e) = Self::log(
             &mut self.page_manager,
             &mut self.wal_writer,
             fs,
             RecordType::EdgeInsert,
-            1,
+            txid,
             payload,
-        )?;
+        ) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
+        }
+
+        let wal_fs = Arc::clone(&self.wal_fs);
+        txn_mgr.commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
+            .map_err(StorageError::from)?;
 
         Ok(edge_slot)
     }
@@ -1073,6 +1320,8 @@ impl StorageEngine for GraphStorageEngine {
         let slot_ref = decode_slot_ref(value).ok_or(StorageError::IndexError)?;
 
         let record = Self::read_record(&self.page_manager, slot_ref, fs)?;
+        // Same as get_node: on-disk record is raw EdgeRecord; MVCC header is
+        // only in the WAL payload for recovery.
         match record {
             Some(bytes) => Ok(EdgeRecord::decode(&bytes)),
             None => Ok(None),
@@ -1091,16 +1340,32 @@ impl StorageEngine for GraphStorageEngine {
         let value = &kv[2 + key_len..];
         let slot_ref = decode_slot_ref(value).ok_or(StorageError::IndexError)?;
 
+        // Acquire exclusive lock on the edge.
+        let resource_id = edge_resource_id(edge_id);
+        let txn_mgr = Arc::clone(&self.txn_manager);
+        let mut autocommit_tx = txn_mgr.begin();
+        if let Err(e) = txn_mgr.acquire_lock(&mut autocommit_tx, resource_id, LockMode::Exclusive) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
+        let txid = autocommit_tx.txid;
+
         let record =
             Self::read_record(&self.page_manager, slot_ref, fs)?.ok_or(StorageError::NotFound)?;
         let mut edge = EdgeRecord::decode(&record).ok_or(StorageError::NotFound)?;
 
         // Unlink from adjacency lists before marking as deleted.
-        if !edge.source_node.is_null() {
-            Self::unwire_source_adjacency(&mut self.page_manager, slot_ref, edge.source_node, fs)?;
+        if !edge.source_node.is_null()
+            && let Err(e) = Self::unwire_source_adjacency(&mut self.page_manager, slot_ref, edge.source_node, fs)
+        {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
         }
-        if !edge.target_node.is_null() {
-            Self::unwire_target_adjacency(&mut self.page_manager, slot_ref, edge.target_node, fs)?;
+        if !edge.target_node.is_null()
+            && let Err(e) = Self::unwire_target_adjacency(&mut self.page_manager, slot_ref, edge.target_node, fs)
+        {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
         }
 
         // Re-read the record after pointer patching.
@@ -1112,24 +1377,41 @@ impl StorageEngine for GraphStorageEngine {
 
         let mut buf = [0u8; EdgeRecord::SIZE];
         edge.encode(&mut buf);
-        Self::overwrite_record(&mut self.page_manager, slot_ref, &buf, fs)?;
+        if let Err(e) = Self::overwrite_record(&mut self.page_manager, slot_ref, &buf, fs) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
+        }
 
         // Remove from type index.
-        let type_key = type_index_key(edge.type_id as u64, edge_id as u128);
-        self.type_index.delete(&type_key)?;
+        if let Err(e) = self.type_index.delete(&type_index_key(edge.type_id as u64, edge_id as u128)) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(StorageError::from(e));
+        }
 
-        // WAL: EdgeDelete.
+        // WAL: EdgeDelete with MVCC xmax = txid.
         let mut payload = edge_id.to_be_bytes().to_vec();
         payload.extend_from_slice(&slot_ref.raw.to_be_bytes());
+        let mut tuple_hdr = TupleHeader::new_insert(0, 0);
+        tuple_hdr.mark_deleted(txid);
+        let mut hdr_bytes = [0u8; TupleHeader::SIZE];
+        tuple_hdr.encode(&mut hdr_bytes);
+        payload.extend_from_slice(&hdr_bytes);
         payload.extend_from_slice(&buf);
-        Self::log(
+        if let Err(e) = Self::log(
             &mut self.page_manager,
             &mut self.wal_writer,
             fs,
             RecordType::EdgeDelete,
-            1,
+            txid,
             payload,
-        )?;
+        ) {
+            let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
+            return Err(e);
+        }
+
+        let wal_fs = Arc::clone(&self.wal_fs);
+        txn_mgr.commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
+            .map_err(StorageError::from)?;
 
         Ok(())
     }
@@ -1479,7 +1761,15 @@ mod tests {
             if let Some((rec, size)) = WalRecord::decode(&buf, offset) {
                 if rec.record_type == RecordType::NodeInsert {
                     found = true;
-                    assert_eq!(rec.payload.len(), 8 + 4 + NodeRecord::SIZE);
+                    // WAL payload: node_id (8) + slot_ref (4) +
+                    //              TupleHeader (16, xmin/xmax for MVCC) +
+                    //              NodeRecord (32).
+                    use crate::txn::mvcc::TupleHeader as TH;
+                    assert_eq!(
+                        rec.payload.len(),
+                        8 + 4 + TH::SIZE + NodeRecord::SIZE,
+                        "NodeInsert WAL payload must include TupleHeader"
+                    );
                 }
                 offset += size;
             } else {

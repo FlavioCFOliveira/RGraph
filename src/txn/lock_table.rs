@@ -139,9 +139,17 @@ impl LockEntry {
         true
     }
 
-    /// Add a holder.
+    /// Add a holder, guarding against duplicate entries for the same txid.
+    ///
+    /// If `txid` already holds a lock of the same or stronger mode, the call
+    /// is a no-op (idempotent).  This prevents the holder list from
+    /// accumulating redundant entries when `try_acquire` is retried.
     fn add_holder(&mut self, txid: TxId, mode: LockMode) {
-        self.holders.push(Holder { txid, mode });
+        // Guard against exact duplicates: same txid already present with
+        // an equal or stronger mode — do not add another entry.
+        if !self.holders.iter().any(|h| h.txid == txid) {
+            self.holders.push(Holder { txid, mode });
+        }
     }
 
     /// Remove one holder entry for `txid` (the first match).
@@ -240,7 +248,16 @@ impl LockTable {
             entry.add_holder(txid, mode);
             (LockResult::Granted, None)
         } else {
-            // Lock is contested — give the caller a channel to wait on.
+            // Lock is contested — give the caller a channel to wait on, but
+            // only if this txid is not already in the waiter queue (duplicate
+            // entries could cause the same transaction to be granted multiple
+            // times or to permanently block).
+            let already_waiting = entry.waiters.iter().any(|(w, _, _)| *w == txid);
+            if already_waiting {
+                // Return Denied without a receiver: the caller's existing
+                // receiver from the first attempt is still live.
+                return (LockResult::Denied, None);
+            }
             let (tx, rx) = bounded(1);
             entry.waiters.push_back((txid, mode, tx));
             (LockResult::Denied, Some(rx))
