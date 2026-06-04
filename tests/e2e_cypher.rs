@@ -12,27 +12,28 @@
 //!
 //! # Scope
 //!
-//! Every assertion below covers behaviour that is verified to work end-to-end
-//! today.  Three known gaps are deliberately **not** asserted as passing, each
-//! tracked by its own rmp task so this suite stays honest:
+//! Every assertion below covers behaviour that is verified to work end-to-end.
+//! The four openCypher correctness gaps that Sprint F surfaced were resolved in
+//! Sprint G and are now asserted here as passing behaviour:
 //!
-//! * **Labelled MATCH after restart** (`MATCH (n:Person)`): the in-memory schema
-//!   catalog (label/type/property-key name -> id map) is rebuilt empty on
-//!   reopen, so a labelled scan finds nothing after a restart even though the
-//!   node persists and an unlabelled `MATCH (n)` still finds it.  Tracked by
-//!   **rmp Task 189** ("Persist the schema catalog to disk and restore it on
-//!   open").  The restart test below therefore asserts node identity and
-//!   properties via an *unlabelled* match, not labels.
+//! * **Labelled MATCH after restart** (`MATCH (n:Person)`): the schema catalog
+//!   (label/type/property-key name -> id map) is now persisted to a sidecar file
+//!   and restored on reopen, so a labelled scan resolves correctly after a
+//!   restart (**rmp Task 189**).
 //!
-//! * **End-to-end aggregation** (`RETURN count(n)`, `sum`/`avg`/`min`/`max`):
-//!   the aggregation operator does not see MATCH-bound pattern variables against
-//!   the real engine pipeline.  Tracked by **rmp Task 190**.  No aggregation
-//!   result is asserted here.
+//! * **`SET` write-back across statements**: `SET n.prop = v` is flushed durably
+//!   to the node's property chain, so a subsequent separate MATCH reads the new
+//!   value, including after a restart (**rmp Task 191**).
 //!
-//! * **`SET` write-back across statements**: a `SET n.prop = v` is reflected in
-//!   the mutating statement's own RETURN projection but is not flushed to the
-//!   node's record, so a subsequent separate MATCH reads the pre-SET value.
-//!   Surfaced for its own task; this suite does not assert `SET` read-back.
+//! * **MERGE with an inline property map**: `MERGE (e:Person {name: 'Dave'})`
+//!   matches only a node equal on *all* inline properties and otherwise creates
+//!   one, persisting its properties; a repeated identical MERGE is idempotent
+//!   (**rmp Task 192**).
+//!
+//! * **End-to-end aggregation** (`RETURN count(n)`, `sum`/`avg`/`min`/`max`/
+//!   `collect`, grouped aggregation): aggregate arguments now see the
+//!   MATCH-bound pattern variables against the real engine pipeline
+//!   (**rmp Task 190**).
 
 use rgraph::cypher::executor::QueryResult;
 use rgraph::cypher::parser::parse;
@@ -291,12 +292,10 @@ fn delete_removes_node_from_subsequent_match() {
 // ------------------------------------------------------------------
 // Persistence across a restart: CREATE -> sync -> drop -> reopen -> MATCH (n).
 //
-// This proves node identity and properties survive a full close/reopen cycle
-// end-to-end.  The match is deliberately *unlabelled* (`MATCH (n)`): the schema
-// catalog is not yet persisted, so labels are lost on reopen and a labelled
-// `MATCH (n:Person)` would return zero rows after restart — that gap is tracked
-// by rmp Task 189 and is asserted only as a documented expectation here, never
-// as passing behaviour.
+// This proves node identity, properties, AND labels survive a full close/reopen
+// cycle end-to-end.  Since rmp Task 189 (catalog sidecar persistence) the schema
+// catalog is restored on reopen, so both an unlabelled `MATCH (n)` and a
+// labelled `MATCH (n:Person)` resolve the node after a restart.
 // ------------------------------------------------------------------
 
 #[test]
@@ -345,28 +344,77 @@ fn nodes_persist_across_restart_via_unlabelled_match() {
                 Some(&Value::Integer(30)),
                 "integer property persists across restart"
             );
-            // NOTE (rmp Task 189): labels are NOT persisted yet — the schema
-            // catalog is rebuilt empty on reopen, so `node.labels` is empty here
-            // and a labelled `MATCH (n:Person)` returns zero rows after restart.
-            // We assert the *current* documented behaviour (no labels) rather
-            // than the desired one, so this test is honest about the gap.
-            assert!(
-                node.labels.is_empty(),
-                "labels are currently lost on reopen (rmp Task 189); got {:?}",
+            // rmp Task 189: labels are now persisted via the catalog sidecar,
+            // so they are restored on reopen.
+            assert_eq!(
+                node.labels,
+                vec!["Person".to_string()],
+                "label persists across restart (rmp Task 189); got {:?}",
                 node.labels
             );
         }
         other => panic!("expected a Node, got {other:?}"),
     }
 
-    // Confirm the Task 189 gap explicitly: a labelled match after restart finds
-    // nothing.  Documented here (not asserted as a feature) so a future fix that
-    // makes this return the node will flip this assertion and flag the test for
-    // update alongside Task 189.
+    // rmp Task 189 (fixed): a labelled match after restart resolves the node.
     let labelled = run_write(&db_path, "MATCH (n:Person) RETURN n", &fs);
     assert_eq!(
         labelled.rows.len(),
+        1,
+        "labelled MATCH after restart returns the node (rmp Task 189)"
+    );
+    match &labelled.rows[0][0] {
+        Value::Node(node) => {
+            assert_eq!(node.labels, vec!["Person".to_string()]);
+            assert_eq!(
+                node.properties.get("name"),
+                Some(&Value::String("Alice".into()))
+            );
+        }
+        other => panic!("expected a Node, got {other:?}"),
+    }
+}
+
+// ------------------------------------------------------------------
+// Task 189: the schema catalog (label names) survives a restart and a labelled
+// scan returns the node, projecting a stored property by name.
+// ------------------------------------------------------------------
+
+#[test]
+fn labelled_match_after_restart_resolves_via_persisted_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rgraph.db");
+    let fs = PosixFileSystem::new(false);
+    init_db(&db_path, &fs);
+
+    // First lifecycle: create a labelled node and sync (run_write drops engine).
+    run_write(&db_path, "CREATE (a:Person {name: 'Alice', age: 30})", &fs);
+
+    // The catalog sidecar must exist next to the data file after sync.
+    let catalog_sidecar = db_path.with_extension("catalog");
+    assert!(
+        catalog_sidecar.exists(),
+        "catalog sidecar must be written on sync"
+    );
+
+    // Second lifecycle: a labelled scan resolves the label name through the
+    // restored catalog and returns Alice.
+    let result = run_write(
+        &db_path,
+        "MATCH (n:Person) RETURN n.name AS name ORDER BY n.name",
+        &fs,
+    );
+    assert_eq!(
+        string_column(&result, "name"),
+        vec!["Alice".to_string()],
+        "labelled MATCH resolves the persisted label after restart"
+    );
+
+    // A label that was never registered resolves to nothing (no false matches).
+    let absent = run_write(&db_path, "MATCH (n:Company) RETURN n", &fs);
+    assert_eq!(
+        absent.rows.len(),
         0,
-        "labelled MATCH after restart currently returns 0 rows (rmp Task 189)"
+        "an unknown label must not match any node"
     );
 }

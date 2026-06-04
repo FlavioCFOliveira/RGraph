@@ -8,10 +8,23 @@
 //!
 //! # Persistence
 //!
-//! The catalog is currently an in-memory data structure seeded from a snapshot
-//! that can be encoded to and decoded from bytes.  The snapshot is intended to
-//! be stored in the engine's superblock region; full WAL-logged persistence is
-//! deferred to Sprint D.
+//! The catalog is persisted to a dedicated sidecar file that lives next to the
+//! database data file (`<data>.catalog`), mirroring the double-write sidecar
+//! (`<data>.dw`).  On [`GraphStorageEngine::sync`] the in-memory snapshot is
+//! serialised and written crash-safely (write to a temporary file, `fsync`,
+//! then atomic `rename` over the final path).  On
+//! [`GraphStorageEngine::open`] the sidecar is read back and the name → id
+//! maps are restored, so labelled scans (`MATCH (n:Person)`) resolve correctly
+//! after a restart.
+//!
+//! The sidecar payload is framed with a magic number, a CRC32C checksum, and a
+//! length prefix.  A torn or corrupt sidecar fails the integrity check and is
+//! ignored (the catalog falls back to empty, exactly as before this file
+//! existed), so a partial write can never corrupt schema resolution — it only
+//! costs the (recoverable) name → id mapping for that session.
+//!
+//! [`GraphStorageEngine::sync`]: crate::graph::engine::GraphStorageEngine::sync
+//! [`GraphStorageEngine::open`]: crate::graph::engine::GraphStorageEngine::open
 //!
 //! # Thread safety
 //!
@@ -19,7 +32,16 @@
 //! access should wrap it in an `Arc<RwLock<Catalog>>` (the pattern used in
 //! `GraphStorageEngine`).
 
+use crate::io::FileSystem;
 use std::collections::HashMap;
+use std::io;
+use std::path::Path;
+
+/// Magic signature for the catalog sidecar payload (`"RGCATLG\0"`).
+const CATALOG_MAGIC: u64 = 0x5247_4341_544C_4700;
+
+/// On-disk sidecar header: magic (8) + crc32c (4) + body length (4) = 16 bytes.
+const CATALOG_HEADER_LEN: usize = 16;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Catalog
@@ -187,7 +209,8 @@ impl Catalog {
         let mut pos = 0;
         let (labels, labels_rev, next_label_id) = decode_section(bytes, &mut pos)?;
         let (rel_types, rel_types_rev, next_rel_type_id) = decode_section(bytes, &mut pos)?;
-        let (property_keys, property_keys_rev, next_property_key_id) = decode_section(bytes, &mut pos)?;
+        let (property_keys, property_keys_rev, next_property_key_id) =
+            decode_section(bytes, &mut pos)?;
         Some(Self {
             labels,
             labels_rev,
@@ -199,6 +222,94 @@ impl Catalog {
             property_keys_rev,
             next_property_key_id,
         })
+    }
+
+    // ── Sidecar persistence ───────────────────────────────────────────────
+
+    /// Frame the catalog snapshot with a magic number, CRC32C checksum, and a
+    /// length prefix, ready to be written to the sidecar file.
+    ///
+    /// Layout: `magic (u64 LE) | crc32c(body) (u32 LE) | body_len (u32 LE) | body`.
+    fn frame(&self) -> Vec<u8> {
+        let body = self.encode();
+        let crc = crc32c::crc32c(&body);
+        let mut framed = Vec::with_capacity(CATALOG_HEADER_LEN + body.len());
+        framed.extend_from_slice(&CATALOG_MAGIC.to_le_bytes());
+        framed.extend_from_slice(&crc.to_le_bytes());
+        framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&body);
+        framed
+    }
+
+    /// Parse a framed sidecar payload, verifying the magic, length, and CRC.
+    ///
+    /// Returns `None` if the frame is truncated, has the wrong magic, fails its
+    /// checksum, or its body cannot be decoded — in every such case the caller
+    /// falls back to an empty catalog rather than trusting corrupt data.
+    fn unframe(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < CATALOG_HEADER_LEN {
+            return None;
+        }
+        let magic = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+        if magic != CATALOG_MAGIC {
+            return None;
+        }
+        let crc = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+        let body_len = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+        let body = bytes.get(CATALOG_HEADER_LEN..CATALOG_HEADER_LEN + body_len)?;
+        if crc32c::crc32c(body) != crc {
+            return None;
+        }
+        Self::decode(body)
+    }
+
+    /// Persist the catalog crash-safely to the sidecar at `path`.
+    ///
+    /// Writes the framed snapshot to a sibling temporary file, flushes it, and
+    /// atomically renames it over `path`.  A crash before the rename leaves the
+    /// previous (or absent) sidecar intact; a crash after the rename leaves the
+    /// new sidecar fully present — there is no torn intermediate state visible
+    /// at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any I/O failure from the underlying file system.
+    pub fn persist(&self, path: &Path, fs: &dyn FileSystem) -> io::Result<()> {
+        let framed = self.frame();
+        let tmp_path = path.with_extension("catalog.tmp");
+        {
+            let handle = fs.open(&tmp_path, true)?;
+            handle.set_len(0)?;
+            handle.write_at(&framed, 0)?;
+            handle.sync_all()?;
+        }
+        fs.rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    /// Load a catalog from the sidecar at `path`, if it exists and is valid.
+    ///
+    /// Returns:
+    /// * `Ok(Some(catalog))` when a valid sidecar is present.
+    /// * `Ok(None)` when the sidecar is absent, empty, truncated, or fails its
+    ///   integrity check — the caller should start from an empty catalog.
+    ///
+    /// # Errors
+    ///
+    /// Propagates I/O failures other than "file not found" from opening or
+    /// reading the sidecar.
+    pub fn load(path: &Path, fs: &dyn FileSystem) -> io::Result<Option<Self>> {
+        if !fs.exists(path) {
+            return Ok(None);
+        }
+        let handle = fs.open(path, false)?;
+        let len = handle.len()? as usize;
+        if len == 0 {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; len];
+        handle.read_at(&mut buf, 0)?;
+        Ok(Self::unframe(&buf))
     }
 }
 
@@ -227,7 +338,9 @@ fn decode_section(bytes: &[u8], pos: &mut usize) -> Option<DecodedSection> {
         if *pos + name_len > bytes.len() {
             return None;
         }
-        let name = std::str::from_utf8(&bytes[*pos..*pos + name_len]).ok()?.to_string();
+        let name = std::str::from_utf8(&bytes[*pos..*pos + name_len])
+            .ok()?
+            .to_string();
         *pos += name_len;
         if id > max_id {
             max_id = id;
@@ -242,7 +355,12 @@ fn read_u32_le(bytes: &[u8], pos: &mut usize) -> Option<u32> {
     if *pos + 4 > bytes.len() {
         return None;
     }
-    let val = u32::from_le_bytes([bytes[*pos], bytes[*pos + 1], bytes[*pos + 2], bytes[*pos + 3]]);
+    let val = u32::from_le_bytes([
+        bytes[*pos],
+        bytes[*pos + 1],
+        bytes[*pos + 2],
+        bytes[*pos + 3],
+    ]);
     *pos += 4;
     Some(val)
 }
@@ -337,7 +455,115 @@ mod tests {
         let mut decoded = Catalog::decode(&encoded).unwrap();
 
         let new_id = decoded.get_or_create_label("B");
-        assert!(new_id > decoded.label_id("A").unwrap(),
-            "new id must be greater than any existing id");
+        assert!(
+            new_id > decoded.label_id("A").unwrap(),
+            "new id must be greater than any existing id"
+        );
+    }
+
+    // ── Sidecar persistence (Task 189) ────────────────────────────────────
+
+    #[test]
+    fn frame_unframe_roundtrip() {
+        let mut c = Catalog::new();
+        c.get_or_create_label("Person");
+        c.get_or_create_rel_type("KNOWS");
+        c.get_or_create_property_key("name");
+
+        let framed = c.frame();
+        let back = Catalog::unframe(&framed).expect("valid frame must unframe");
+        assert_eq!(back.label_id("Person"), c.label_id("Person"));
+        assert_eq!(back.rel_type_id("KNOWS"), c.rel_type_id("KNOWS"));
+        assert_eq!(back.property_key_id("name"), c.property_key_id("name"));
+    }
+
+    #[test]
+    fn unframe_rejects_corrupt_payload() {
+        let mut c = Catalog::new();
+        c.get_or_create_label("Person");
+        let mut framed = c.frame();
+        // Flip a byte in the body — the CRC must reject it.
+        let last = framed.len() - 1;
+        framed[last] ^= 0xFF;
+        assert!(
+            Catalog::unframe(&framed).is_none(),
+            "a corrupt body must fail the checksum and be ignored"
+        );
+    }
+
+    #[test]
+    fn unframe_rejects_wrong_magic() {
+        let c = Catalog::new();
+        let mut framed = c.frame();
+        framed[0] ^= 0xFF; // corrupt the magic
+        assert!(Catalog::unframe(&framed).is_none());
+    }
+
+    #[test]
+    fn unframe_rejects_truncated() {
+        let mut c = Catalog::new();
+        c.get_or_create_label("Person");
+        let framed = c.frame();
+        // Drop the last few body bytes.
+        assert!(Catalog::unframe(&framed[..framed.len() - 3]).is_none());
+    }
+
+    #[test]
+    fn persist_then_load_roundtrip() {
+        use crate::io::posix::PosixFileSystem;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rgraph.db.catalog");
+        let fs = PosixFileSystem::new(false);
+
+        let mut c = Catalog::new();
+        let person = c.get_or_create_label("Person");
+        let movie = c.get_or_create_label("Movie");
+        let knows = c.get_or_create_rel_type("KNOWS");
+        let name = c.get_or_create_property_key("name");
+
+        c.persist(&path, &fs).expect("persist must succeed");
+
+        let loaded = Catalog::load(&path, &fs)
+            .expect("load io must succeed")
+            .expect("a valid sidecar must be present");
+
+        assert_eq!(loaded.label_id("Person"), Some(person));
+        assert_eq!(loaded.label_id("Movie"), Some(movie));
+        assert_eq!(loaded.rel_type_id("KNOWS"), Some(knows));
+        assert_eq!(loaded.property_key_id("name"), Some(name));
+        assert_eq!(loaded.label_name(person), Some("Person"));
+    }
+
+    #[test]
+    fn load_absent_sidecar_returns_none() {
+        use crate::io::posix::PosixFileSystem;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.catalog");
+        let fs = PosixFileSystem::new(false);
+        assert!(Catalog::load(&path, &fs).unwrap().is_none());
+    }
+
+    #[test]
+    fn persist_overwrites_previous_sidecar() {
+        use crate::io::posix::PosixFileSystem;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rgraph.db.catalog");
+        let fs = PosixFileSystem::new(false);
+
+        let mut c1 = Catalog::new();
+        c1.get_or_create_label("Person");
+        c1.persist(&path, &fs).unwrap();
+
+        let mut c2 = Catalog::new();
+        c2.get_or_create_label("Person");
+        let movie = c2.get_or_create_label("Movie");
+        c2.persist(&path, &fs).unwrap();
+
+        let loaded = Catalog::load(&path, &fs).unwrap().unwrap();
+        assert_eq!(
+            loaded.label_id("Movie"),
+            Some(movie),
+            "the newest snapshot must win after re-persist"
+        );
     }
 }

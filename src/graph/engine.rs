@@ -3,6 +3,7 @@
 //! The [`GraphStorageEngine`] provides CRUD operations for nodes, edges,
 //! and properties on top of the page manager, B+ tree indexes, and WAL.
 
+use crate::catalog::Catalog;
 use crate::graph::csr::{CsrAdjacency, CsrBuilder, CsrHolder};
 use crate::graph::record::{
     EdgeRecord, NodeRecord, PropertyRecord, SlotRef, ValueType, edge_flags, node_flags,
@@ -24,11 +25,10 @@ use crate::wal::aries::AriesRecovery;
 use crate::wal::doublewrite::DoubleWriteBuffer;
 use crate::wal::record::{RecordType, WalRecord};
 use crate::wal::writer::WalWriter;
-use crate::catalog::Catalog;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 /// Monotonically-increasing graph-entity id allocator.
 ///
@@ -152,9 +152,7 @@ impl From<TxError> for StorageError {
     fn from(e: TxError) -> Self {
         match e {
             TxError::WoundWait(_) => StorageError::TxAborted,
-            TxError::PhantomConflict(_) | TxError::WriteConflict(_, _) => {
-                StorageError::TxConflict
-            }
+            TxError::PhantomConflict(_) | TxError::WriteConflict(_, _) => StorageError::TxConflict,
             TxError::WalFlush(_) => StorageError::IoError,
             TxError::NotActive(_, _) | TxError::AlreadyFinalised(_) => StorageError::TxAborted,
             TxError::IndexMutation(_) => StorageError::IndexError,
@@ -381,7 +379,10 @@ impl GraphStorageEngine {
         if torn > 0 {
             // Non-fatal: ARIES will REDO any operations that updated these pages
             // after they were last written to the DW buffer.
-            eprintln!("DoubleWriteBuffer: restored {} torn page(s) before ARIES recovery", torn);
+            eprintln!(
+                "DoubleWriteBuffer: restored {} torn page(s) before ARIES recovery",
+                torn
+            );
         }
 
         // Run full ARIES recovery (ANALYSIS → REDO → UNDO) using a buffered
@@ -423,6 +424,15 @@ impl GraphStorageEngine {
             csr: CsrHolder::new(),
             rdf_store: crate::rdf::RdfTripleStore::new(),
         };
+
+        // Restore the persisted schema catalog from its sidecar file so that
+        // label/relationship-type/property-key names resolve to their stored
+        // numeric ids after a restart (Task 189).  A missing or corrupt sidecar
+        // leaves the catalog empty, exactly as before this file existed.
+        let catalog_path = engine.catalog_path();
+        if let Ok(Some(restored)) = Catalog::load(&catalog_path, fs) {
+            *engine.catalog.write().expect("catalog write lock poisoned") = restored;
+        }
 
         // Rebuild secondary indexes from primary data pages.  This also
         // seeds the id_allocator with the highest id seen on disk.
@@ -911,6 +921,18 @@ impl GraphStorageEngine {
         // bitmap page (page 2).
         self.page_manager.sync_superblock(fs)?;
         self.page_manager.sync_bitmap(fs)?;
+
+        // Persist the schema catalog to its sidecar so label/type/property-key
+        // names survive a restart (Task 189).  Written crash-safely (temp file
+        // + atomic rename); a failure here is surfaced as an I/O error because
+        // losing the catalog would make labelled scans return no rows after the
+        // next reopen.
+        let catalog_path = self.catalog_path();
+        let snapshot = {
+            let guard = self.catalog.read().expect("catalog read lock poisoned");
+            guard.clone()
+        };
+        snapshot.persist(&catalog_path, fs)?;
         Ok(())
     }
 
@@ -940,10 +962,7 @@ impl GraphStorageEngine {
     /// Returns `StorageError::IoError` if the WAL flush fails.
     /// Returns `StorageError::TxAborted` if the transaction is not active.
     /// Returns `StorageError::TxConflict` if an SSI write-skew is detected.
-    pub fn commit_transaction(
-        &mut self,
-        tx: &mut Transaction,
-    ) -> Result<(), StorageError> {
+    pub fn commit_transaction(&mut self, tx: &mut Transaction) -> Result<(), StorageError> {
         let fs = Arc::clone(&self.wal_fs);
         self.txn_manager
             .commit(tx, &mut self.wal_writer, fs.as_ref())
@@ -953,10 +972,7 @@ impl GraphStorageEngine {
     /// Roll back a transaction: release all locks and mark it as aborted.
     ///
     /// An `Abort` WAL record is written best-effort (not flushed).
-    pub fn rollback_transaction(
-        &mut self,
-        tx: &mut Transaction,
-    ) -> Result<(), StorageError> {
+    pub fn rollback_transaction(&mut self, tx: &mut Transaction) -> Result<(), StorageError> {
         let fs = Arc::clone(&self.wal_fs);
         self.txn_manager
             .rollback(tx, &mut self.wal_writer, fs.as_ref())
@@ -985,6 +1001,14 @@ impl GraphStorageEngine {
     /// Return a shared reference to the schema catalog.
     pub fn catalog(&self) -> Arc<RwLock<Catalog>> {
         Arc::clone(&self.catalog)
+    }
+
+    /// Path of the schema-catalog sidecar file (`<data>.catalog`).
+    ///
+    /// Lives next to the data file, alongside the double-write sidecar
+    /// (`<data>.dw`), so it survives across restarts.
+    pub fn catalog_path(&self) -> PathBuf {
+        self.page_manager.data_path.with_extension("catalog")
     }
 
     // ------------------------------------------------------------------
@@ -1074,14 +1098,19 @@ impl GraphStorageEngine {
     /// This is a write operation on the catalog — use when registering new
     /// labels (typically during `CREATE` execution).
     pub fn catalog_label_id(&self, label: &str) -> u32 {
-        self.catalog.write().expect("catalog write lock poisoned").get_or_create_label(label)
+        self.catalog
+            .write()
+            .expect("catalog write lock poisoned")
+            .get_or_create_label(label)
     }
 
     /// Look up the u64 label id used in storage from a string label name.
     ///
     /// Returns `None` if the label is not yet registered in the catalog.
     pub fn storage_label_id_for(&self, label: &str) -> Option<u64> {
-        self.catalog.read().expect("catalog read lock poisoned")
+        self.catalog
+            .read()
+            .expect("catalog read lock poisoned")
             .label_id(label)
             .map(|id| id as u64)
     }
@@ -1156,8 +1185,7 @@ impl GraphStorageEngine {
                 None => break,
             };
             if edge.flags & edge_flags::DELETED == 0 {
-                let type_matches = type_ids.is_empty()
-                    || type_ids.contains(&(edge.type_id as u64));
+                let type_matches = type_ids.is_empty() || type_ids.contains(&(edge.type_id as u64));
                 if type_matches {
                     results.push((edge, edge.target_id));
                 }
@@ -1195,8 +1223,7 @@ impl GraphStorageEngine {
                 None => break,
             };
             if edge.flags & edge_flags::DELETED == 0 {
-                let type_matches = type_ids.is_empty()
-                    || type_ids.contains(&(edge.type_id as u64));
+                let type_matches = type_ids.is_empty() || type_ids.contains(&(edge.type_id as u64));
                 if type_matches {
                     results.push((edge, edge.source_id));
                 }
@@ -1459,10 +1486,7 @@ impl GraphStorageEngine {
     ///
     /// Returns [`StorageError::IndexError`] if an index value cannot be decoded,
     /// or propagates page-read failures.
-    pub fn scan_all_nodes(
-        &self,
-        fs: &dyn FileSystem,
-    ) -> Result<Vec<NodeRecord>, StorageError> {
+    pub fn scan_all_nodes(&self, fs: &dyn FileSystem) -> Result<Vec<NodeRecord>, StorageError> {
         let start = node_id_key(0);
         let end = node_id_key(u128::MAX);
         let entries = self.node_index.range_search(&start, &end);
@@ -1489,10 +1513,7 @@ impl GraphStorageEngine {
     ///
     /// Returns [`StorageError::IndexError`] if an index value cannot be decoded,
     /// or propagates page-read failures.
-    pub fn scan_all_edges(
-        &self,
-        fs: &dyn FileSystem,
-    ) -> Result<Vec<EdgeRecord>, StorageError> {
+    pub fn scan_all_edges(&self, fs: &dyn FileSystem) -> Result<Vec<EdgeRecord>, StorageError> {
         let start = edge_id_key(0);
         let end = edge_id_key(u128::MAX);
         let entries = self.edge_index.range_search(&start, &end);
@@ -1621,7 +1642,8 @@ impl StorageEngine for GraphStorageEngine {
 
         // Commit the autocommit transaction (flush WAL, release locks).
         let wal_fs = Arc::clone(&self.wal_fs);
-        txn_mgr.commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
+        txn_mgr
+            .commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
             .map_err(StorageError::from)?;
 
         Ok(slot)
@@ -1723,7 +1745,8 @@ impl StorageEngine for GraphStorageEngine {
         }
 
         let wal_fs = Arc::clone(&self.wal_fs);
-        txn_mgr.commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
+        txn_mgr
+            .commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
             .map_err(StorageError::from)?;
 
         // Track the freed node slot for the free-space map (Task 174).
@@ -1789,7 +1812,8 @@ impl StorageEngine for GraphStorageEngine {
 
         // Adjacency list maintenance for source node (outgoing).
         if !edge.source_node.is_null()
-            && let Err(e) = Self::wire_source_adjacency(&mut self.page_manager, edge_slot, edge.source_node, fs)
+            && let Err(e) =
+                Self::wire_source_adjacency(&mut self.page_manager, edge_slot, edge.source_node, fs)
         {
             let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
             return Err(e);
@@ -1797,7 +1821,8 @@ impl StorageEngine for GraphStorageEngine {
 
         // Adjacency list maintenance for target node (incoming).
         if !edge.target_node.is_null()
-            && let Err(e) = Self::wire_target_adjacency(&mut self.page_manager, edge_slot, edge.target_node, fs)
+            && let Err(e) =
+                Self::wire_target_adjacency(&mut self.page_manager, edge_slot, edge.target_node, fs)
         {
             let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
             return Err(e);
@@ -1836,7 +1861,8 @@ impl StorageEngine for GraphStorageEngine {
         }
 
         let wal_fs = Arc::clone(&self.wal_fs);
-        txn_mgr.commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
+        txn_mgr
+            .commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
             .map_err(StorageError::from)?;
 
         Ok(edge_slot)
@@ -1898,13 +1924,23 @@ impl StorageEngine for GraphStorageEngine {
 
         // Unlink from adjacency lists before marking as deleted.
         if !edge.source_node.is_null()
-            && let Err(e) = Self::unwire_source_adjacency(&mut self.page_manager, slot_ref, edge.source_node, fs)
+            && let Err(e) = Self::unwire_source_adjacency(
+                &mut self.page_manager,
+                slot_ref,
+                edge.source_node,
+                fs,
+            )
         {
             let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
             return Err(e);
         }
         if !edge.target_node.is_null()
-            && let Err(e) = Self::unwire_target_adjacency(&mut self.page_manager, slot_ref, edge.target_node, fs)
+            && let Err(e) = Self::unwire_target_adjacency(
+                &mut self.page_manager,
+                slot_ref,
+                edge.target_node,
+                fs,
+            )
         {
             let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
             return Err(e);
@@ -1925,7 +1961,10 @@ impl StorageEngine for GraphStorageEngine {
         }
 
         // Remove from type index.
-        if let Err(e) = self.type_index.delete(&type_index_key(edge.type_id as u64, edge_id as u128)) {
+        if let Err(e) = self
+            .type_index
+            .delete(&type_index_key(edge.type_id as u64, edge_id as u128))
+        {
             let _ = txn_mgr.rollback(&mut autocommit_tx, &mut self.wal_writer, &*self.wal_fs);
             return Err(StorageError::from(e));
         }
@@ -1952,7 +1991,8 @@ impl StorageEngine for GraphStorageEngine {
         }
 
         let wal_fs = Arc::clone(&self.wal_fs);
-        txn_mgr.commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
+        txn_mgr
+            .commit(&mut autocommit_tx, &mut self.wal_writer, wal_fs.as_ref())
             .map_err(StorageError::from)?;
 
         // Track the freed edge slot for the free-space map (Task 174).
@@ -2699,14 +2739,22 @@ mod tests {
         let s3 = engine.lookup_node_slot(3).unwrap().unwrap();
 
         // Edges from node 1 → 2 and node 1 → 3 (adjacency auto-wired by put_edge).
-        engine.put_edge(&EdgeRecord::new(10, 1, 1, 2, s1, s2), &fs).unwrap();
-        engine.put_edge(&EdgeRecord::new(11, 1, 1, 3, s1, s3), &fs).unwrap();
+        engine
+            .put_edge(&EdgeRecord::new(10, 1, 1, 2, s1, s2), &fs)
+            .unwrap();
+        engine
+            .put_edge(&EdgeRecord::new(11, 1, 1, 3, s1, s3), &fs)
+            .unwrap();
 
         // Linked-list path (no CSR yet) must already see both edges.
         let mut ll = engine.scan_adjacency(1, &fs).unwrap();
         ll.sort_by_key(|(t, _, _)| *t);
         let ll_targets: Vec<u64> = ll.iter().map(|(t, _, _)| *t).collect();
-        assert_eq!(ll_targets, vec![2, 3], "linked-list scan should see both edges");
+        assert_eq!(
+            ll_targets,
+            vec![2, 3],
+            "linked-list scan should see both edges"
+        );
 
         // Freeze and compare CSR results.
         engine.freeze_adjacency(&fs);

@@ -2,10 +2,15 @@
 //!
 //! The exporter enumerates every live node and relationship through the
 //! [`Graph`] public API and serialises them.  Textual labels / types are
-//! recovered from the reserved [`LABEL_KEY`] / [`TYPE_KEY`] properties written
-//! by the importer, so a round-trip survives an engine restart.
+//! resolved from the persisted schema [`Catalog`] (the durable, hack-free
+//! path since rmp Task 189), falling back to the reserved [`LABEL_KEY`] /
+//! [`TYPE_KEY`] properties for graphs imported before the catalog was
+//! persisted, and finally to `L{id}` / `T{id}` when neither is available.
+//!
+//! [`Catalog`]: crate::catalog::Catalog
 
 use super::{CliError, Format, KEY_KEY, LABEL_KEY, TYPE_KEY};
+use crate::catalog::Catalog;
 use crate::graph::graph::{Graph, Node, Relationship};
 use crate::graph::property::{OrderedF64, Property};
 use crate::io::FileSystem;
@@ -28,10 +33,19 @@ pub fn export<W: Write>(
     let nodes = graph.scan_all_nodes(fs)?;
     let edges = graph.scan_all_relationships(fs)?;
 
+    // Snapshot the schema catalog so label/type ids resolve to their textual
+    // names without round-tripping through reserved properties (rmp Task 189).
+    let catalog = graph
+        .engine()
+        .catalog()
+        .read()
+        .expect("catalog read lock poisoned")
+        .clone();
+
     match format {
-        Format::Cypher => write_cypher(&nodes, &edges, out)?,
-        Format::Jsonl => write_jsonl(&nodes, &edges, out)?,
-        Format::Turtle => write_turtle(&nodes, &edges, out)?,
+        Format::Cypher => write_cypher(&nodes, &edges, &catalog, out)?,
+        Format::Jsonl => write_jsonl(&nodes, &edges, &catalog, out)?,
+        Format::Turtle => write_turtle(&nodes, &edges, &catalog, out)?,
         Format::Csv => {
             return Err(CliError::UnknownFormat(
                 "csv export is not supported; use cypher, jsonl, or turtle".into(),
@@ -41,18 +55,29 @@ pub fn export<W: Write>(
     Ok((nodes.len(), edges.len()))
 }
 
-/// Recover a node's textual label from its [`LABEL_KEY`] property, falling back
-/// to `L{label_id}` when the property is absent.
-fn node_label(node: &Node) -> String {
+/// Resolve a node's textual label.
+///
+/// Prefers the persisted schema [`Catalog`] (`label_id` → name), then the
+/// reserved [`LABEL_KEY`] property (graphs imported before catalog
+/// persistence), and finally `L{label_id}` when neither is available.
+fn node_label(node: &Node, catalog: &Catalog) -> String {
+    if let Some(name) = catalog.label_name(node.label_id) {
+        return name.to_owned();
+    }
     match node.properties.get(LABEL_KEY) {
         Some(Property::String(s)) => s.clone(),
         _ => format!("L{}", node.label_id),
     }
 }
 
-/// Recover an edge's textual type from its [`TYPE_KEY`] property, falling back
-/// to `T{type_id}`.
-fn edge_type(edge: &Relationship) -> String {
+/// Resolve an edge's textual type.
+///
+/// Prefers the persisted schema [`Catalog`] (`type_id` → name), then the
+/// reserved [`TYPE_KEY`] property, and finally `T{type_id}`.
+fn edge_type(edge: &Relationship, catalog: &Catalog) -> String {
+    if let Some(name) = catalog.rel_type_name(edge.type_id) {
+        return name.to_owned();
+    }
     match edge.properties.get(TYPE_KEY) {
         Some(Property::String(s)) => s.clone(),
         _ => format!("T{}", edge.type_id),
@@ -82,10 +107,11 @@ fn user_properties(
 fn write_cypher<W: Write>(
     nodes: &[Node],
     edges: &[Relationship],
+    catalog: &Catalog,
     out: &mut W,
 ) -> Result<(), CliError> {
     for node in nodes {
-        let label = node_label(node);
+        let label = node_label(node, catalog);
         let props = cypher_property_map(&user_properties(&node.properties));
         // `id` is encoded as a deterministic Cypher variable so relationships
         // can MATCH the endpoints; we also pin the logical id as a property.
@@ -103,7 +129,7 @@ fn write_cypher<W: Write>(
         )?;
     }
     for edge in edges {
-        let rel = edge_type(edge);
+        let rel = edge_type(edge, catalog);
         let props = cypher_property_map(&user_properties(&edge.properties));
         let prop_clause = if props.is_empty() {
             String::new()
@@ -147,7 +173,9 @@ fn cypher_value(p: &Property) -> String {
 /// is not a bare identifier.
 fn escape_key(k: &str) -> String {
     if !k.is_empty()
-        && k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && k.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         k.to_owned()
@@ -177,14 +205,21 @@ fn format_float(f: f64) -> String {
 fn write_jsonl<W: Write>(
     nodes: &[Node],
     edges: &[Relationship],
+    catalog: &Catalog,
     out: &mut W,
 ) -> Result<(), CliError> {
     for node in nodes {
         let mut map = serde_json::Map::new();
         map.insert("type".into(), serde_json::Value::String("node".into()));
         map.insert("id".into(), serde_json::Value::from(node.node_id));
-        map.insert("label".into(), serde_json::Value::String(node_label(node)));
-        map.insert("props".into(), property_json(&user_properties(&node.properties)));
+        map.insert(
+            "label".into(),
+            serde_json::Value::String(node_label(node, catalog)),
+        );
+        map.insert(
+            "props".into(),
+            property_json(&user_properties(&node.properties)),
+        );
         writeln!(out, "{}", serde_json::Value::Object(map))?;
     }
     for edge in edges {
@@ -193,8 +228,14 @@ fn write_jsonl<W: Write>(
         map.insert("id".into(), serde_json::Value::from(edge.edge_id));
         map.insert("src".into(), serde_json::Value::from(edge.source_id));
         map.insert("dst".into(), serde_json::Value::from(edge.target_id));
-        map.insert("relType".into(), serde_json::Value::String(edge_type(edge)));
-        map.insert("props".into(), property_json(&user_properties(&edge.properties)));
+        map.insert(
+            "relType".into(),
+            serde_json::Value::String(edge_type(edge, catalog)),
+        );
+        map.insert(
+            "props".into(),
+            property_json(&user_properties(&edge.properties)),
+        );
         writeln!(out, "{}", serde_json::Value::Object(map))?;
     }
     Ok(())
@@ -215,7 +256,9 @@ fn property_to_json(p: &Property) -> Option<serde_json::Value> {
         Property::Null => Some(serde_json::Value::Null),
         Property::Boolean(b) => Some(serde_json::Value::Bool(*b)),
         Property::Integer(i) => Some(serde_json::Value::from(*i)),
-        Property::Float(OrderedF64(f)) => serde_json::Number::from_f64(*f).map(serde_json::Value::Number),
+        Property::Float(OrderedF64(f)) => {
+            serde_json::Number::from_f64(*f).map(serde_json::Value::Number)
+        }
         Property::String(s) => Some(serde_json::Value::String(s.clone())),
         Property::Date(i) | Property::Duration(i) => Some(serde_json::Value::from(*i)),
         _ => None,
@@ -229,13 +272,19 @@ fn property_to_json(p: &Property) -> Option<serde_json::Value> {
 fn write_turtle<W: Write>(
     nodes: &[Node],
     edges: &[Relationship],
+    catalog: &Catalog,
     out: &mut W,
 ) -> Result<(), CliError> {
     // Each node id becomes an IRI term `<n{id}>`.  Literal properties become
     // `<n{id}> <key> "value" .` statements; edges become IRI-object triples.
     for node in nodes {
         let subj = format!("<n{}>", node.node_id);
-        writeln!(out, "{} <_label> \"{}\" .", subj, turtle_escape(&node_label(node)))?;
+        writeln!(
+            out,
+            "{} <_label> \"{}\" .",
+            subj,
+            turtle_escape(&node_label(node, catalog))
+        )?;
         for (k, v) in user_properties(&node.properties) {
             writeln!(out, "{} <{}> {} .", subj, k, turtle_value(v))?;
         }
@@ -245,7 +294,7 @@ fn write_turtle<W: Write>(
             out,
             "<n{}> <{}> <n{}> .",
             edge.source_id,
-            edge_type(edge),
+            edge_type(edge, catalog),
             edge.target_id
         )?;
     }
@@ -294,12 +343,30 @@ mod tests {
         }
     }
 
+    /// Empty catalog — forces the legacy `_label`/`_type` reserved-property
+    /// fallback path so backward compatibility stays covered.
+    fn empty_catalog() -> Catalog {
+        Catalog::new()
+    }
+
+    /// Catalog with `label_id 1 = "Person"` and `type_id 1 = "KNOWS"`, matching
+    /// the `label_id`/`type_id` the test fixtures use — exercises the durable
+    /// (hack-free) resolution path.
+    fn populated_catalog() -> Catalog {
+        let mut c = Catalog::new();
+        let lid = c.get_or_create_label("Person");
+        let tid = c.get_or_create_rel_type("KNOWS");
+        assert_eq!(lid, 1);
+        assert_eq!(tid, 1);
+        c
+    }
+
     #[test]
     fn cypher_output_contains_create_and_match() {
         let nodes = vec![node(1, "Person", "Alice"), node(2, "Person", "Bob")];
         let edges = vec![edge(1, 1, 2, "KNOWS")];
         let mut buf = Vec::new();
-        write_cypher(&nodes, &edges, &mut buf).unwrap();
+        write_cypher(&nodes, &edges, &empty_catalog(), &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("CREATE (n1:Person"), "got: {s}");
         assert!(s.contains("name: 'Alice'"), "got: {s}");
@@ -308,11 +375,31 @@ mod tests {
     }
 
     #[test]
+    fn cypher_label_resolves_from_catalog_without_reserved_property() {
+        // A node carrying NO reserved `_label` property still exports with the
+        // real label name, resolved purely from the persisted catalog.
+        let mut props = HashMap::new();
+        props.insert("name".to_owned(), Property::String("Alice".to_owned()));
+        let nodes = vec![Node {
+            node_id: 1,
+            label_id: 1,
+            properties: props,
+        }];
+        let mut buf = Vec::new();
+        write_cypher(&nodes, &[], &populated_catalog(), &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("CREATE (n1:Person"),
+            "label must resolve from the catalog; got: {s}"
+        );
+    }
+
+    #[test]
     fn jsonl_output_roundtrips_via_serde() {
         let nodes = vec![node(1, "Person", "Alice")];
         let edges = vec![];
         let mut buf = Vec::new();
-        write_jsonl(&nodes, &edges, &mut buf).unwrap();
+        write_jsonl(&nodes, &edges, &empty_catalog(), &mut buf).unwrap();
         let line = String::from_utf8(buf).unwrap();
         let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(v["type"], "node");
@@ -325,7 +412,7 @@ mod tests {
         let nodes = vec![node(1, "Person", "Alice")];
         let edges = vec![edge(1, 1, 2, "KNOWS")];
         let mut buf = Vec::new();
-        write_turtle(&nodes, &edges, &mut buf).unwrap();
+        write_turtle(&nodes, &edges, &empty_catalog(), &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("<n1> <_label> \"Person\" ."), "got: {s}");
         assert!(s.contains("<n1> <KNOWS> <n2> ."), "got: {s}");
