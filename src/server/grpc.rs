@@ -317,7 +317,7 @@ impl proto::transaction_manager_server::TransactionManager for TransactionServic
                     result: Some(proto::commit_response::Result::Ok(true)),
                 }))
             }
-            Err(RGraphError::NotFound(msg)) => Err(Status::not_found(msg)),
+            Err(RGraphError::NotFound(msg)) => Err(Status::not_found(msg.text())),
             Err(e) => {
                 warn!("commit transaction failed: {}", e);
                 self.metrics.observe_transaction_aborted();
@@ -343,7 +343,7 @@ impl proto::transaction_manager_server::TransactionManager for TransactionServic
                     result: Some(proto::rollback_response::Result::Ok(true)),
                 }))
             }
-            Err(RGraphError::NotFound(msg)) => Err(Status::not_found(msg)),
+            Err(RGraphError::NotFound(msg)) => Err(Status::not_found(msg.text())),
             Err(e) => {
                 warn!("rollback transaction failed: {}", e);
                 Ok(Response::new(RollbackResponse {
@@ -531,7 +531,7 @@ impl GraphGrpcServer {
         router
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await
-            .map_err(|e| RGraphError::Io(format!("grpc serve failed: {e}")))
+            .map_err(|e| RGraphError::Io(format!("grpc serve failed: {e}").into()))
     }
 }
 

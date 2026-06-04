@@ -450,7 +450,7 @@ impl GraphEngineAdapter {
     pub fn init(path: PathBuf) -> Result<Self, RGraphError> {
         let fs = PosixFileSystem::new(false);
         let engine = GraphStorageEngine::init(path, &fs)
-            .map_err(|e| RGraphError::Storage(e.to_string()))?;
+            .map_err(|e| RGraphError::Storage(e.to_string().into()))?;
         let graph = Graph::new(engine);
         Ok(Self::new(graph))
     }
@@ -471,7 +471,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
                 .map_err(into_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn get_node(
@@ -485,7 +485,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
             guard.get_node(node_id, &fs).map_err(into_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn delete_node(
@@ -499,7 +499,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
             guard.delete_node(node_id, &fs).map_err(into_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn create_relationship(
@@ -515,7 +515,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
                 .map_err(into_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn get_relationship(
@@ -529,7 +529,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
             guard.get_relationship(edge_id, &fs).map_err(into_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn delete_relationship(
@@ -543,7 +543,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
             guard.delete_relationship(edge_id, &fs).map_err(into_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn scan_nodes_by_label(
@@ -557,7 +557,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
             guard.scan_by_label(label_id, &fs).map_err(into_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn scan_relationships_by_type(
@@ -571,7 +571,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
             guard.scan_by_type(type_id, &fs).map_err(into_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn insert_property_index(
@@ -590,7 +590,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
                 .map_err(into_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn scan_nodes_by_property(
@@ -608,7 +608,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
                 .map_err(into_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn execute_cypher(
@@ -626,7 +626,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
         tokio::task::spawn_blocking(move || {
             // Parse → semantic analyse → plan are CPU-only; do them first so we
             // surface syntax/semantic errors before acquiring the write lock.
-            let stmt = parse(&query).map_err(|e| RGraphError::Syntax(e.to_string()))?;
+            let stmt = parse(&query).map_err(|e| RGraphError::Syntax(e.to_string().into()))?;
             analyse(&stmt).map_err(RGraphError::from)?;
             let logical_plan = plan(&stmt).map_err(RGraphError::from)?;
 
@@ -644,7 +644,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
             })
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn begin_txn(&self, read_only: bool) -> Result<u64, RGraphError> {
@@ -672,7 +672,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
             Ok(txid)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn commit_txn(&self, tx_id: u64) -> Result<(), RGraphError> {
@@ -686,7 +686,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
                 .lock()
                 .map_err(|_| RGraphError::Internal("transaction registry poisoned".into()))?
                 .remove(&tx_id)
-                .ok_or_else(|| RGraphError::NotFound(format!("transaction {tx_id} not found")))?;
+                .ok_or_else(|| RGraphError::NotFound(format!("transaction {tx_id} not found").into()))?;
 
             let mut guard = inner.blocking_write();
             let engine = guard.engine_mut();
@@ -698,7 +698,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
                 .map_err(into_tx_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn rollback_txn(&self, tx_id: u64) -> Result<(), RGraphError> {
@@ -710,7 +710,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
                 .lock()
                 .map_err(|_| RGraphError::Internal("transaction registry poisoned".into()))?
                 .remove(&tx_id)
-                .ok_or_else(|| RGraphError::NotFound(format!("transaction {tx_id} not found")))?;
+                .ok_or_else(|| RGraphError::NotFound(format!("transaction {tx_id} not found").into()))?;
 
             let mut guard = inner.blocking_write();
             let engine = guard.engine_mut();
@@ -720,7 +720,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
                 .map_err(into_tx_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 
     async fn cache_stats(&self) -> Option<(u64, u64)> {
@@ -747,7 +747,7 @@ impl AsyncGraphEngine for GraphEngineAdapter {
             guard.sync(&fs).map_err(into_rgraph_err)
         })
         .await
-        .map_err(|e| RGraphError::Internal(e.to_string()))?
+        .map_err(|e| RGraphError::Internal(e.to_string().into()))?
     }
 }
 
@@ -755,23 +755,23 @@ impl AsyncGraphEngine for GraphEngineAdapter {
 fn into_tx_rgraph_err(e: crate::txn::manager::TxError) -> RGraphError {
     use crate::txn::manager::TxError;
     match e {
-        TxError::WalFlush(io) => RGraphError::Io(format!("WAL flush failed: {io}")),
+        TxError::WalFlush(io) => RGraphError::Io(format!("WAL flush failed: {io}").into()),
         TxError::WoundWait(id) => {
-            RGraphError::Transaction(format!("transaction {id} wounded — retry"))
+            RGraphError::Transaction(format!("transaction {id} wounded — retry").into())
         }
         TxError::NotActive(id, status) => {
-            RGraphError::Transaction(format!("transaction {id} not active (status {status:?})"))
+            RGraphError::Transaction(format!("transaction {id} not active (status {status:?})").into())
         }
         TxError::AlreadyFinalised(id) => {
-            RGraphError::Transaction(format!("transaction {id} already finalised"))
+            RGraphError::Transaction(format!("transaction {id} already finalised").into())
         }
-        TxError::IndexMutation(msg) => RGraphError::Index(msg),
+        TxError::IndexMutation(msg) => RGraphError::Index(msg.into()),
         TxError::PhantomConflict(id) => {
-            RGraphError::Transaction(format!("transaction {id} aborted — phantom/rw-conflict"))
+            RGraphError::Transaction(format!("transaction {id} aborted — phantom/rw-conflict").into())
         }
         TxError::WriteConflict(id, res) => RGraphError::Transaction(format!(
             "transaction {id} aborted — write-write conflict on resource {res}"
-        )),
+        ).into()),
     }
 }
 

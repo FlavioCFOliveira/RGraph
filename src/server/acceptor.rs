@@ -62,7 +62,7 @@ impl ProtocolMultiplexer {
                 Ok(Protocol::Unknown)
             }
             Ok(_) => Ok(Protocol::Unknown),
-            Err(e) => Err(RGraphError::Io(format!("peek failed: {e}"))),
+            Err(e) => Err(RGraphError::Io(format!("peek failed: {e}").into())),
         }
     }
 }
@@ -246,10 +246,10 @@ impl ConnectionAcceptor {
     ) -> Result<Self, RGraphError> {
         let listener = TcpListener::bind(addr)
             .await
-            .map_err(|e| RGraphError::Io(format!("bind failed: {e}")))?;
+            .map_err(|e| RGraphError::Io(format!("bind failed: {e}").into()))?;
         let local_port = listener
             .local_addr()
-            .map_err(|e| RGraphError::Io(format!("local_addr failed: {e}")))?
+            .map_err(|e| RGraphError::Io(format!("local_addr failed: {e}").into()))?
             .port();
 
         let tls_acceptor = match (tls_cert_path, tls_key_path) {
@@ -382,18 +382,18 @@ impl ConnectionAcceptor {
         key_path: &PathBuf,
     ) -> Result<RustlsServerConfig, RGraphError> {
         let cert_file = std::fs::read(cert_path)
-            .map_err(|e| RGraphError::Io(format!("cannot read cert: {e}")))?;
+            .map_err(|e| RGraphError::Io(format!("cannot read cert: {e}").into()))?;
         let key_file = std::fs::read(key_path)
-            .map_err(|e| RGraphError::Io(format!("cannot read key: {e}")))?;
+            .map_err(|e| RGraphError::Io(format!("cannot read key: {e}").into()))?;
 
         let certs: Vec<CertificateDer<'static>> =
             rustls_pemfile::certs(&mut cert_file.as_slice())
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| RGraphError::Io(format!("invalid cert PEM: {e}")))?;
+                .map_err(|e| RGraphError::Io(format!("invalid cert PEM: {e}").into()))?;
 
         let keys: Vec<PrivateKeyDer<'static>> =
             rustls_pemfile::private_key(&mut key_file.as_slice())
-                .map_err(|e| RGraphError::Io(format!("invalid key PEM: {e}")))?
+                .map_err(|e| RGraphError::Io(format!("invalid key PEM: {e}").into()))?
                 .into_iter()
                 .collect();
 
@@ -408,7 +408,7 @@ impl ConnectionAcceptor {
         let mut config = RustlsServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(|e| RGraphError::Io(format!("TLS config error: {e}")))?;
+            .map_err(|e| RGraphError::Io(format!("TLS config error: {e}").into()))?;
 
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(config)

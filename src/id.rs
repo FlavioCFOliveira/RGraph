@@ -34,7 +34,7 @@ impl Id {
     pub fn from_bytes(bytes: [u8; 16]) -> Result<Self> {
         uuid::Uuid::from_slice(&bytes)
             .map(Self)
-            .map_err(|e| RGraphError::Argument(format!("invalid id bytes: {}", e)))
+            .map_err(|e| RGraphError::Argument(format!("invalid id bytes: {}", e).into()))
     }
 
     /// Return the raw 16-byte representation.
@@ -54,13 +54,13 @@ impl Id {
     /// The wire format is a fixed 16-byte little-endian `u128`.
     pub fn encode(&self) -> Result<Vec<u8>> {
         bincode::serialize(&self.to_u128())
-            .map_err(|e| RGraphError::Argument(format!("id encode failed: {}", e)))
+            .map_err(|e| RGraphError::Argument(format!("id encode failed: {}", e).into()))
     }
 
     /// Decode an identifier from a compact byte buffer.
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let val: u128 = bincode::deserialize(buf)
-            .map_err(|e| RGraphError::Argument(format!("id decode failed: {}", e)))?;
+            .map_err(|e| RGraphError::Argument(format!("id decode failed: {}", e).into()))?;
         Self::from_bytes(val.to_be_bytes())
     }
 }

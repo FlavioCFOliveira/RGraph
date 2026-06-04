@@ -25,7 +25,7 @@ impl CpuPool {
                 .num_threads(threads)
                 .thread_name(|i| format!("rgraph-cpu-{i}"))
                 .build()
-                .map_err(|e| RGraphError::Internal(format!("rayon pool build failed: {e}")))?,
+                .map_err(|e| RGraphError::Internal(format!("rayon pool build failed: {e}").into()))?,
         );
         Ok(Self { pool })
     }
@@ -71,7 +71,7 @@ impl CpuPool {
             Err(_) => Err(RGraphError::ResourceExhausted(format!(
                 "request timed out after {:?}",
                 timeout
-            ))),
+            ).into())),
         }
     }
 }
@@ -107,7 +107,7 @@ impl RequestDispatcher {
         self.cpu_pool
             .spawn(f)
             .await
-            .map_err(|e| RGraphError::Internal(format!("cpu pool task panicked: {e}")))
+            .map_err(|e| RGraphError::Internal(format!("cpu pool task panicked: {e}").into()))
     }
 }
 

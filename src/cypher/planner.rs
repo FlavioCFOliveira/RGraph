@@ -29,7 +29,8 @@ impl std::error::Error for PlanError {}
 
 impl From<PlanError> for RGraphError {
     fn from(e: PlanError) -> Self {
-        RGraphError::Semantic(e.message)
+        let msg = crate::error::Msg::new(e.message.clone()).with_source(e);
+        RGraphError::Semantic(msg)
     }
 }
 

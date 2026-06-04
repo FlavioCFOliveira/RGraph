@@ -24,7 +24,8 @@ impl std::error::Error for SemanticError {}
 
 impl From<SemanticError> for RGraphError {
     fn from(e: SemanticError) -> Self {
-        RGraphError::Semantic(e.message)
+        let msg = crate::error::Msg::new(e.message.clone()).with_source(e);
+        RGraphError::Semantic(msg)
     }
 }
 

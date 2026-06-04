@@ -74,7 +74,7 @@ impl ServerRuntime {
             .thread_name("rgraph-server")
             .enable_all()
             .build()
-            .map_err(|e| RGraphError::Internal(format!("tokio runtime build failed: {e}")))?;
+            .map_err(|e| RGraphError::Internal(format!("tokio runtime build failed: {e}").into()))?;
 
         let (shutdown_tx, _rx) = broadcast::channel(1);
         let shutting_down = Arc::new(AtomicBool::new(false));

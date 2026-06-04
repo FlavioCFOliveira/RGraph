@@ -315,23 +315,23 @@ impl StressHarness {
 
         // Create some data.
         let engine = GraphStorageEngine::init(path.clone(), fs)
-            .map_err(|e| RGraphError::Storage(e.to_string()))?;
+            .map_err(|e| RGraphError::Storage(e.to_string().into()))?;
         let mut graph = Graph::new(engine);
         let (_, node_id) = graph
             .create_node(NodeBuilder::new().label(1), fs)
-            .map_err(|e| RGraphError::Storage(e.to_string()))?;
-        graph.sync(fs).map_err(|e| RGraphError::Storage(e.to_string()))?;
+            .map_err(|e| RGraphError::Storage(e.to_string().into()))?;
+        graph.sync(fs).map_err(|e| RGraphError::Storage(e.to_string().into()))?;
 
         // Simulate crash by dropping without clean shutdown.
         drop(graph);
 
         // Re-open and verify.
         let engine2 = GraphStorageEngine::open(path, fs)
-            .map_err(|e| RGraphError::Storage(e.to_string()))?;
+            .map_err(|e| RGraphError::Storage(e.to_string().into()))?;
         let graph2 = Graph::new(engine2);
         let recovered = graph2
             .get_node(node_id, fs)
-            .map_err(|e| RGraphError::Storage(e.to_string()))?;
+            .map_err(|e| RGraphError::Storage(e.to_string().into()))?;
         assert!(recovered.is_some(), "created node must survive crash");
         Ok(())
     }

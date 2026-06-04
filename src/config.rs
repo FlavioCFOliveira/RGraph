@@ -35,7 +35,7 @@ impl std::str::FromStr for GraphMode {
             _ => Err(RGraphError::Argument(format!(
                 "invalid graph mode '{}' (expected LPG or RDF)",
                 s
-            ))),
+            ).into())),
         }
     }
 }
@@ -101,7 +101,7 @@ impl Config {
     /// Missing fields fall back to [`Config::default`].
     pub fn from_toml(path: impl AsRef<Path>) -> Result<Self> {
         let text = std::fs::read_to_string(path.as_ref())
-            .map_err(|e| RGraphError::Io(format!("failed to read config file: {}", e)))?;
+            .map_err(|e| RGraphError::Io(format!("failed to read config file: {}", e).into()))?;
         Self::from_toml_str(&text)
     }
 
@@ -119,7 +119,7 @@ impl Config {
             }
             let (key, value) = line
                 .split_once('=')
-                .ok_or_else(|| RGraphError::Argument(format!("invalid config line: {}", line)))?;
+                .ok_or_else(|| RGraphError::Argument(format!("invalid config line: {}", line).into()))?;
             let key = key.trim();
             let value = value.trim();
             match key {
@@ -160,7 +160,7 @@ impl Config {
                     return Err(RGraphError::Argument(format!(
                         "unknown config key: {}",
                         key
-                    )));
+                    ).into()));
                 }
             }
         }
@@ -238,14 +238,14 @@ fn parse_string(value: &str) -> Result<String> {
         Err(RGraphError::Argument(format!(
             "expected quoted string, got {}",
             value
-        )))
+        ).into()))
     }
 }
 
 fn parse_usize(value: &str) -> Result<usize> {
     value
         .parse()
-        .map_err(|e| RGraphError::Argument(format!("expected positive integer: {} ({:?})", value, e)))
+        .map_err(|e| RGraphError::Argument(format!("expected positive integer: {} ({:?})", value, e).into()))
 }
 
 fn parse_bool(value: &str) -> Result<bool> {
@@ -255,7 +255,7 @@ fn parse_bool(value: &str) -> Result<bool> {
         _ => Err(RGraphError::Argument(format!(
             "expected boolean, got {}",
             value
-        ))),
+        ).into())),
     }
 }
 
@@ -426,10 +426,10 @@ impl GraphBuilder {
         let mode = cfg.graph_mode;
         if cfg.database_path.exists() {
             crate::db::database::Database::open(&cfg.database_path, &fs, mode)
-                .map_err(|e| RGraphError::Io(format!("failed to open database: {}", e)))
+                .map_err(|e| RGraphError::Io(format!("failed to open database: {}", e).into()))
         } else {
             crate::db::database::Database::init(&cfg.database_path, &fs, mode)
-                .map_err(|e| RGraphError::Io(format!("failed to init database: {}", e)))
+                .map_err(|e| RGraphError::Io(format!("failed to init database: {}", e).into()))
         }
     }
 

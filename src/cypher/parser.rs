@@ -35,7 +35,9 @@ impl std::error::Error for ParseError {}
 
 impl From<ParseError> for RGraphError {
     fn from(e: ParseError) -> Self {
-        RGraphError::Syntax(format!("{} at {}:{}", e.message, e.line, e.column))
+        let text = format!("{} at {}:{}", e.message, e.line, e.column);
+        let msg = crate::error::Msg::new(text).with_source(e);
+        RGraphError::Syntax(msg)
     }
 }
 
