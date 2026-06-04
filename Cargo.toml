@@ -21,6 +21,7 @@ prefix_compression = []
 
 [dependencies]
 crc32c = "0.6"
+smallvec = { version = "1.13", features = ["union", "const_generics"] }
 twox-hash = "1.6"
 thiserror = "2.0"
 anyhow = "1.0"

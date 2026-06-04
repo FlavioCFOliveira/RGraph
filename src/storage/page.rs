@@ -214,6 +214,19 @@ impl SlottedPage {
         buf[28..32].copy_from_slice(&cksum.to_ne_bytes());
     }
 
+    /// Does a raw page buffer carry the [`PAGE_MAGIC`] signature?
+    ///
+    /// The magic field sits at byte offset 24 (after `page_lsn`, `page_id`, and
+    /// `overflow_page_id`).  Used by recovery to decide whether a recovered
+    /// after-image is a real page whose checksum should be recomputed.
+    pub fn has_valid_magic_bytes(buf: &[u8]) -> bool {
+        if buf.len() < 28 {
+            return false;
+        }
+        let magic = u32::from_ne_bytes([buf[24], buf[25], buf[26], buf[27]]);
+        magic == PAGE_MAGIC
+    }
+
     /// Slice of the current slot directory (tail of the page).
     ///
     /// Slot 0 is the *last* slot in the buffer (closest to PAGE_SIZE),

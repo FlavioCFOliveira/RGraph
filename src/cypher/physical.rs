@@ -188,7 +188,7 @@ impl PhysicalOperator for AllNodesScanOp {
             let (key, _value_bytes) = &self.cursor[self.idx];
             self.idx += 1;
             let node_id = u128::from_be_bytes(
-                key.bytes[..16].try_into().unwrap_or([0u8; 16])
+                key.as_slice()[..16].try_into().unwrap_or([0u8; 16])
             ) as u64;
             match load_node_value(ctx.engine, node_id, ctx.fs)? {
                 Some(node_val) => {

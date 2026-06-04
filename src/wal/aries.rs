@@ -386,7 +386,10 @@ impl<'a> AriesRecovery<'a> {
                 RecordType::PageInsert
                 | RecordType::PageUpdate
                 | RecordType::PageFree
-                | RecordType::BitmapUpdate => {
+                | RecordType::BitmapUpdate
+                | RecordType::IndexPageInsert
+                | RecordType::IndexPageUpdate
+                | RecordType::IndexPageFree => {
                     // Payload: [8-byte page_id][page image bytes...].
                     if rec.payload.len() >= 8 {
                         let page_id = page_id_from_payload(&rec.payload);
@@ -497,6 +500,9 @@ impl<'a> AriesRecovery<'a> {
                     | RecordType::PageUpdate
                     | RecordType::PageFree
                     | RecordType::BitmapUpdate
+                    | RecordType::IndexPageInsert
+                    | RecordType::IndexPageUpdate
+                    | RecordType::IndexPageFree
                     | RecordType::Clr
             );
             if !is_physical_page_record {
@@ -585,6 +591,9 @@ impl<'a> AriesRecovery<'a> {
                         | RecordType::PropertyUpdate
                         | RecordType::BitmapUpdate
                         | RecordType::PageFree
+                        | RecordType::IndexPageInsert
+                        | RecordType::IndexPageUpdate
+                        | RecordType::IndexPageFree
                 );
 
                 if undoable && let Some((page_id, after_image)) = extract_page_and_image(rec) {
@@ -701,6 +710,17 @@ fn apply_after_image(
     // Stamp page_lsn so idempotency holds.
     page_buf[0..8].copy_from_slice(&record_lsn.to_be_bytes());
 
+    // Recompute the page checksum so the recovered page is self-consistent:
+    // stamping page_lsn above invalidated the checksum that was computed when
+    // the after-image was captured.  Only do this for full-page after-images
+    // that already carry a valid page magic, so partial/synthetic images used
+    // by lower-level tests are left untouched.
+    if copy_len == PAGE_SIZE
+        && crate::storage::page::SlottedPage::has_valid_magic_bytes(&page_buf)
+    {
+        crate::storage::page::SlottedPage::update_checksum_bytes(&mut page_buf);
+    }
+
     handle.write_at(&page_buf, offset)?;
     Ok(())
 }
@@ -747,6 +767,7 @@ fn apply_inverse(
             | RecordType::EdgeInsert
             | RecordType::PropertyInsert
             | RecordType::PageInsert
+            | RecordType::IndexPageInsert
     );
 
     if is_insert {

@@ -171,6 +171,161 @@ impl<'a> BTreeRangeScan<'a> {
     }
 }
 
+/// A tree-backed forward range cursor that follows sibling leaves.
+///
+/// Unlike [`BTreeCursor`], which is confined to a single page, this cursor
+/// holds a reference to the [`BPlusTree`] and reloads the next sibling leaf when
+/// the current one is exhausted, so a range scan correctly spans many leaves.
+///
+/// Construct it with [`BPlusTree::cursor_from`] / [`BPlusTree::into_range`].
+pub struct BTreeRangeCursor<'a> {
+    tree: &'a crate::index::btree::BPlusTree,
+    current_leaf_id: PageId,
+    current_leaf: BTreePage,
+    current_slot: u16,
+    /// Exclusive upper bound; `None` means scan to the end.
+    end_key: Option<CompositeKey>,
+}
+
+impl<'a> BTreeRangeCursor<'a> {
+    /// Internal constructor: position at the first key `>= from` in `leaf`.
+    pub(crate) fn new(
+        tree: &'a crate::index::btree::BPlusTree,
+        leaf_id: PageId,
+        leaf: BTreePage,
+        from: &CompositeKey,
+        end_key: Option<CompositeKey>,
+    ) -> Self {
+        let slot = BTreeCursor::lower_bound(&leaf, from);
+        Self {
+            tree,
+            current_leaf_id: leaf_id,
+            current_leaf: leaf,
+            current_slot: slot,
+            end_key,
+        }
+    }
+
+    /// Reposition the cursor at the first key `>= key`, following sibling
+    /// leaves if necessary.  Returns `true` if a key at or after `key` exists
+    /// within the scan bound.
+    pub fn advance_to(&mut self, key: &CompositeKey) -> bool {
+        // If `key` is beyond the current leaf, hop forward leaf by leaf.
+        loop {
+            let count = self.current_leaf.key_count();
+            if count > 0
+                && let Some(last) = leaf_key_at(&self.current_leaf, count - 1)
+                && last.as_slice() < key.as_slice()
+            {
+                // Every key on this leaf is < target; move to the next sibling.
+                let next = self.current_leaf.btree_header().sibling_next;
+                if next == 0 {
+                    self.current_slot = count; // exhaust
+                    return false;
+                }
+                match self.tree.get_page(next) {
+                    Some(p) => {
+                        self.current_leaf_id = next;
+                        self.current_leaf = p;
+                        self.current_slot = 0;
+                        continue;
+                    }
+                    None => return false,
+                }
+            }
+            break;
+        }
+        self.current_slot = BTreeCursor::lower_bound(&self.current_leaf, key);
+        self.current_within_bound()
+    }
+
+    /// Return the current key/value as owned bytes, or `None` if the cursor is
+    /// past the end or the upper bound.
+    pub fn current(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if !self.current_within_bound() {
+            return None;
+        }
+        let kv = self.current_leaf.key(self.current_slot)?;
+        let (k, v) = decode_kv(kv)?;
+        Some((k.to_vec(), v.to_vec()))
+    }
+
+    /// Advance to the next entry, crossing sibling leaves as needed.
+    /// Returns `false` once the scan is exhausted (end of tree or bound).
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> bool {
+        let count = self.current_leaf.key_count();
+        if (self.current_slot as usize) + 1 < count as usize {
+            self.current_slot += 1;
+            return self.current_within_bound();
+        }
+        // Move to the next sibling leaf.
+        let next = self.current_leaf.btree_header().sibling_next;
+        if next == 0 {
+            self.current_slot = count;
+            return false;
+        }
+        match self.tree.get_page(next) {
+            Some(p) => {
+                self.current_leaf_id = next;
+                self.current_leaf = p;
+                self.current_slot = 0;
+                self.current_within_bound()
+            }
+            None => false,
+        }
+    }
+
+    /// Collect the entire remaining range into a vector of `(key, value)` pairs.
+    pub fn collect_range(mut self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Some(pair) = self.current() {
+            out.push(pair);
+            if !self.next() {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Is the current position valid and within the upper bound?
+    fn current_within_bound(&self) -> bool {
+        if self.current_slot as usize >= self.current_leaf.key_count() as usize {
+            return false;
+        }
+        if let Some(ref end) = self.end_key
+            && let Some(k) = leaf_key_at(&self.current_leaf, self.current_slot)
+            && k.as_slice() >= end.as_slice()
+        {
+            return false;
+        }
+        true
+    }
+
+    /// The page id of the leaf the cursor currently sits on (for testing).
+    pub fn current_leaf_id(&self) -> PageId {
+        self.current_leaf_id
+    }
+}
+
+/// Decode a leaf record `[key_len: u16 BE][key][value]` into `(key, value)`.
+fn decode_kv(kv: &[u8]) -> Option<(&[u8], &[u8])> {
+    if kv.len() < 2 {
+        return None;
+    }
+    let key_len = u16::from_be_bytes([kv[0], kv[1]]) as usize;
+    if 2 + key_len > kv.len() {
+        return None;
+    }
+    Some((&kv[2..2 + key_len], &kv[2 + key_len..]))
+}
+
+/// Decode the key portion of a leaf slot as a [`CompositeKey`].
+fn leaf_key_at(page: &BTreePage, slot: u16) -> Option<CompositeKey> {
+    let (k, _) = decode_kv(page.key(slot)?)?;
+    Some(CompositeKey::from_slice(k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +442,75 @@ mod tests {
         let cursor = BTreeCursor::seek(&latch, page, &k2);
         let (key, _val) = cursor.current().unwrap();
         assert_eq!(key, k3.as_slice());
+    }
+
+    // ── Tree-backed range cursor (Task 172) ───────────────────────────────
+
+    use crate::index::btree::{BPlusTree, BPlusTreeConfig};
+
+    #[test]
+    fn range_cursor_spans_multiple_leaves() {
+        // Insert enough keys to force several leaves, then scan a range that
+        // straddles leaf boundaries.  The cursor must follow sibling pointers.
+        let tree = BPlusTree::new(BPlusTreeConfig::default());
+        let n = 1500u128;
+        for i in 1..=n {
+            tree.insert(&node_id_key(i), &i.to_be_bytes()).unwrap();
+        }
+        let from = node_id_key(1);
+        let to = node_id_key(n + 1);
+        let results = tree.into_range(&from, &to);
+        assert_eq!(results.len() as u128, n, "cursor must visit every key across leaves");
+        // Keys must be returned in ascending order.
+        for w in results.windows(2) {
+            assert!(w[0].0 < w[1].0, "range cursor must yield sorted keys");
+        }
+
+        // Crossing at least one leaf boundary: confirm by scanning a window in
+        // the middle and checking the count.
+        let mid = tree.into_range(&node_id_key(500), &node_id_key(800));
+        assert_eq!(mid.len(), 300, "half-open [500,800) must contain 300 keys");
+    }
+
+    #[test]
+    fn range_cursor_advance_to_skips_ahead_across_leaves() {
+        let tree = BPlusTree::new(BPlusTreeConfig::default());
+        for i in 1u128..=1500 {
+            tree.insert(&node_id_key(i), &i.to_be_bytes()).unwrap();
+        }
+        let mut cursor = tree
+            .cursor_from(&node_id_key(1), None)
+            .expect("cursor should construct");
+        // Skip directly to key 1234, which lives on a later leaf.
+        assert!(cursor.advance_to(&node_id_key(1234)));
+        let (k, _v) = cursor.current().unwrap();
+        assert_eq!(k, node_id_key(1234).as_slice());
+        // Iterate to the end and ensure monotonic progression.
+        let mut last = 1234u128;
+        while cursor.next() {
+            let (k, _) = cursor.current().unwrap();
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&k[..16]);
+            let cur = u128::from_be_bytes(a);
+            assert!(cur > last, "must advance strictly forward");
+            last = cur;
+        }
+        assert_eq!(last, 1500, "cursor must reach the final key");
+    }
+
+    #[test]
+    fn range_cursor_respects_upper_bound() {
+        let tree = BPlusTree::new(BPlusTreeConfig::default());
+        for i in 1u128..=1000 {
+            tree.insert(&node_id_key(i), &i.to_be_bytes()).unwrap();
+        }
+        let results = tree.into_range(&node_id_key(10), &node_id_key(20));
+        assert_eq!(results.len(), 10, "[10,20) is exactly 10 keys");
+        // The bound is exclusive: key 20 must not appear.
+        assert!(results.iter().all(|(k, _)| {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&k[..16]);
+            u128::from_be_bytes(a) < 20
+        }));
     }
 }

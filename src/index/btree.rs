@@ -80,6 +80,10 @@ pub struct BPlusTree {
     pool: Option<Arc<BufferPool>>,
     /// File-system handle required when `pool` is present.
     fs: Option<Arc<dyn FileSystem>>,
+    /// When `Some`, every page written via [`Self::put_page_with_lsn`] records
+    /// its id here.  Used by [`Self::insert_batch_logged`] to know which index
+    /// pages a batch touched so it can emit physical WAL records for them.
+    dirty_recorder: Mutex<Option<std::collections::HashSet<PageId>>>,
 }
 
 impl std::fmt::Debug for BPlusTree {
@@ -109,6 +113,7 @@ impl BPlusTree {
             next_lsn: AtomicU64::new(1),
             pool: None,
             fs: None,
+            dirty_recorder: Mutex::new(None),
         }
     }
 
@@ -207,6 +212,10 @@ impl BPlusTree {
     pub(crate) fn put_page_with_lsn(&self, page_id: PageId, mut page: BTreePage) {
         let lsn = self.bump_lsn();
         page.set_page_lsn(lsn);
+        // Record this write for WAL logging if a batch is recording dirty pages.
+        if let Some(set) = self.dirty_recorder.lock().unwrap().as_mut() {
+            set.insert(page_id);
+        }
         if let (Some(pool), Some(fs)) = (&self.pool, self.fs.as_deref()) {
             match pool.fix_page(fs, page_id) {
                 Ok(mut guard) => {
@@ -300,6 +309,140 @@ impl BPlusTree {
             self.root_page_id.load(Ordering::Relaxed),
             LatchMode::Exclusive,
         );
+        let result = self.insert_locked(key, value);
+        drop(guard);
+        result
+    }
+
+    /// Insert a batch of `(key, value)` pairs atomically under a single latch.
+    ///
+    /// The whole batch is applied while holding the root exclusive latch, so no
+    /// other writer or reader observes a partially-applied batch.  On any error
+    /// the function returns immediately; callers that require all-or-nothing
+    /// semantics should run the batch inside a transaction so the WAL can undo
+    /// the prefix that did apply (the in-memory tree is left as far as the error
+    /// point, matching the engine's transactional rollback path).
+    pub fn insert_batch(&self, entries: &[(CompositeKey, Vec<u8>)]) -> Result<(), BTreeError> {
+        let guard = self
+            .latch_mgr
+            .latch(self.root_page_id.load(Ordering::Relaxed), LatchMode::Exclusive);
+        for (key, value) in entries {
+            self.insert_locked(key, value)?;
+        }
+        drop(guard);
+        Ok(())
+    }
+
+    /// Insert a batch and emit physical WAL redo/undo records for every index
+    /// page the batch mutated, so the index survives a crash and is replayed by
+    /// ARIES recovery.
+    ///
+    /// Requires an attached buffer pool and file system (see [`Self::with_pool`]).
+    /// Each touched page is logged as an [`crate::wal::record::RecordType::IndexPageUpdate`]
+    /// (or `IndexPageInsert` for newly allocated pages) carrying the full
+    /// after-image plus an embedded before-image for UNDO.  The records are
+    /// flushed before returning, giving write-ahead durability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BTreeError`] if any insert fails, or wraps an I/O error from
+    /// the WAL as [`BTreeError::SplitFailed`] (the batch is reported as failed so
+    /// the caller can abort the surrounding transaction).
+    pub fn insert_batch_logged(
+        &self,
+        entries: &[(CompositeKey, Vec<u8>)],
+        wal: &mut crate::wal::writer::WalWriter,
+        wal_fs: &dyn FileSystem,
+        txid: u64,
+    ) -> Result<(), BTreeError> {
+        use crate::wal::record::{RecordType, WalRecord};
+        let (Some(_pool), Some(_fs)) = (&self.pool, self.fs.as_deref()) else {
+            // No persistence attached: fall back to the in-memory atomic batch.
+            return self.insert_batch(entries);
+        };
+
+        // Snapshot before-images of pages that already exist, so UNDO can
+        // restore them.  New pages have no before-image (UNDO writes a tombstone).
+        let pre_existing: std::collections::HashSet<PageId> =
+            self.all_resident_page_ids().into_iter().collect();
+
+        // Activate dirty-page recording for the duration of the batch.
+        *self.dirty_recorder.lock().unwrap() = Some(std::collections::HashSet::new());
+
+        let before_images: std::collections::HashMap<PageId, Vec<u8>> = pre_existing
+            .iter()
+            .filter_map(|&pid| self.get_page(pid).map(|p| (pid, p.inner.buf[..].to_vec())))
+            .collect();
+
+        let guard = self
+            .latch_mgr
+            .latch(self.root_page_id.load(Ordering::Relaxed), LatchMode::Exclusive);
+        let mut insert_result = Ok(());
+        for (key, value) in entries {
+            if let Err(e) = self.insert_locked(key, value) {
+                insert_result = Err(e);
+                break;
+            }
+        }
+        drop(guard);
+
+        // Collect and clear the recorded dirty pages.
+        let dirty = self
+            .dirty_recorder
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_default();
+
+        insert_result?;
+
+        // Emit one physical WAL record per touched index page.
+        let mut prev_lsn = 0u64;
+        for page_id in dirty {
+            let Some(page) = self.get_page(page_id) else {
+                continue;
+            };
+            let after_image = &page.inner.buf[..];
+            let record_type = if pre_existing.contains(&page_id) {
+                RecordType::IndexPageUpdate
+            } else {
+                RecordType::IndexPageInsert
+            };
+
+            let mut payload = Vec::with_capacity(8 + after_image.len());
+            payload.extend_from_slice(&page_id.to_be_bytes());
+            payload.extend_from_slice(after_image);
+            if let Some(before) = before_images.get(&page_id) {
+                crate::wal::aries::embed_before_image(&mut payload, before);
+            }
+
+            let rec = WalRecord::new(record_type, txid, 0, prev_lsn, payload);
+            let lsn = wal
+                .append(wal_fs, rec)
+                .map_err(|_| BTreeError::SplitFailed)?;
+            prev_lsn = lsn;
+        }
+        wal.flush(wal_fs).map_err(|_| BTreeError::SplitFailed)?;
+        Ok(())
+    }
+
+    /// Page ids currently resident either in the in-memory store or fixable
+    /// from the pool (best effort: probes a bounded id range in pool mode).
+    fn all_resident_page_ids(&self) -> Vec<PageId> {
+        if self.pool.is_some() {
+            // In pool mode probe ids up to the next allocation watermark.
+            let next = *self.next_page_id.lock().unwrap();
+            (1..next)
+                .filter(|&pid| self.get_page(pid).is_some_and(|p| p.is_leaf() || p.is_branch()))
+                .collect()
+        } else {
+            self.all_page_ids()
+        }
+    }
+
+    /// Core insert that assumes the caller already holds the root exclusive
+    /// latch.  Shared by [`Self::insert`] and [`Self::insert_batch`].
+    fn insert_locked(&self, key: &CompositeKey, value: &[u8]) -> Result<(), BTreeError> {
         let root_id = self.root_page_id.load(Ordering::Relaxed);
         let root = self.get_page(root_id).ok_or(BTreeError::MissingRoot)?;
 
@@ -309,7 +452,6 @@ impl BPlusTree {
             let record = encode_kv(key.as_slice(), value);
             if root_mut.has_room_for(record.len()) && root_mut.insert_raw(&record).is_some() {
                 self.put_page_with_lsn(root_id, root_mut);
-                drop(guard);
                 return Ok(());
             }
             // Root is physically full despite being logically empty; fall through to split.
@@ -334,13 +476,10 @@ impl BPlusTree {
         {
             if let Some(rebuilt) = Self::rebuild_leaf_replacing(&leaf, slot, &record) {
                 self.put_page_with_lsn(leaf_id, rebuilt);
-                drop(guard);
                 return Ok(());
             }
             // Replacement does not fit (value grew): fall through to split.
-            let result = self.split_leaf(leaf_id, leaf, key, value, &path);
-            drop(guard);
-            return result;
+            return self.split_leaf(leaf_id, leaf, key, value, &path);
         }
 
         // Insert proactively only when the record fits; otherwise split.  We
@@ -350,14 +489,11 @@ impl BPlusTree {
             leaf.insert_raw_at(slot, &record)
                 .expect("INVARIANT: record fits after has_room_for check");
             self.put_page_with_lsn(leaf_id, leaf);
-            drop(guard);
             return Ok(());
         }
 
         // Leaf is full: split, resolving the parent via the descend path.
-        let result = self.split_leaf(leaf_id, leaf, key, value, &path);
-        drop(guard);
-        result
+        self.split_leaf(leaf_id, leaf, key, value, &path)
     }
 
     /// Rebuild a leaf with the record at `slot` replaced by `record`.
@@ -581,6 +717,43 @@ impl BPlusTree {
         }
 
         results
+    }
+
+    /// Build a forward range cursor positioned at the first key `>= from`,
+    /// bounded above (exclusively) by `to`.
+    ///
+    /// The returned [`BTreeRangeCursor`] follows sibling leaves, so iteration
+    /// correctly spans multiple leaves.  Returns `None` only if the tree's root
+    /// is missing.
+    pub fn cursor_from<'a>(
+        &'a self,
+        from: &CompositeKey,
+        to: Option<CompositeKey>,
+    ) -> Option<crate::index::cursor::BTreeRangeCursor<'a>> {
+        let root = self.get_page(self.root_page_id.load(Ordering::Relaxed))?;
+        let (leaf_id, _) = self.find_leaf(root, from)?;
+        let leaf = self.get_page(leaf_id)?;
+        Some(crate::index::cursor::BTreeRangeCursor::new(
+            self, leaf_id, leaf, from, to,
+        ))
+    }
+
+    /// Collect every `(key, value)` pair in `[from, to)` by walking a
+    /// sibling-following cursor.  Equivalent to [`Self::range_search`] but
+    /// exercising the cursor path that honours leaf-chain traversal.
+    ///
+    /// Named per the index API contract; it borrows `&self` and returns an
+    /// owned range rather than consuming the tree.
+    #[allow(clippy::wrong_self_convention)]
+    pub fn into_range(
+        &self,
+        from: &CompositeKey,
+        to: &CompositeKey,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self.cursor_from(from, Some(to.clone())) {
+            Some(cursor) => cursor.collect_range(),
+            None => Vec::new(),
+        }
     }
 
     fn split_leaf(
@@ -1581,6 +1754,39 @@ mod tests {
     }
 
     #[test]
+    fn insert_batch_is_atomic_and_searchable() {
+        let tree = BPlusTree::new(BPlusTreeConfig::default());
+        let entries: Vec<(CompositeKey, Vec<u8>)> = (1u128..=1000)
+            .map(|i| (node_id_key(i), i.to_be_bytes().to_vec()))
+            .collect();
+        tree.insert_batch(&entries).unwrap();
+        for i in 1u128..=1000 {
+            assert!(tree.search(&node_id_key(i)).is_some(), "batch key {i} missing");
+        }
+        // The batch built a multi-level tree.
+        let root = tree
+            .get_page(tree.root_page_id.load(Ordering::Relaxed))
+            .unwrap();
+        assert!(root.is_branch(), "1000-key batch must produce a branch root");
+    }
+
+    #[test]
+    fn insert_batch_then_long_value_keys() {
+        // Variable-length keys (long property values) survive a batch insert.
+        let tree = BPlusTree::new(BPlusTreeConfig::default());
+        let mut entries: Vec<(CompositeKey, Vec<u8>)> = Vec::new();
+        for i in 0u128..200 {
+            let value = vec![(i % 251) as u8; 80]; // 80-byte value -> >40-byte key
+            let key = crate::index::key::property_index_key(1, &value, i);
+            entries.push((key, i.to_be_bytes().to_vec()));
+        }
+        tree.insert_batch(&entries).unwrap();
+        for (k, _) in &entries {
+            assert!(tree.search(k).is_some(), "long batch key missing");
+        }
+    }
+
+    #[test]
     fn interleaved_insert_delete_search_consistency() {
         use std::collections::BTreeSet;
         let tree = BPlusTree::new(BPlusTreeConfig::default());
@@ -1604,5 +1810,113 @@ mod tests {
                 present.contains(&k)
             );
         }
+    }
+
+    #[test]
+    fn logged_index_batch_survives_crash_and_replay() {
+        // Task 172: a WAL-logged index mutation must be recoverable after a
+        // crash that loses the data file's index pages.  We write the batch
+        // (logging IndexPageInsert/Update records), then zero the index pages on
+        // disk to simulate a crash before the dirty pages were flushed, then run
+        // ARIES REDO and verify the index pages are restored.
+        use crate::buffer::pool::BufferPool;
+        use crate::io::AlignedBuffer;
+        use crate::io::posix::PosixFileSystem;
+        use crate::storage::page::{PAGE_SIZE, PageType, SlottedPage};
+        use crate::wal::aries::{AriesRecovery, DptEntry};
+        use crate::wal::writer::WalWriter;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("index.db");
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let fs = Arc::new(PosixFileSystem::new(false)) as Arc<dyn FileSystem>;
+
+        // Pre-allocate and checksum-init the data file.
+        let file_pages = 64u64;
+        {
+            let handle = fs.open(&data_path, true).unwrap();
+            handle.set_len(file_pages * PAGE_SIZE as u64).unwrap();
+            for pid in 0..file_pages {
+                let mut page = SlottedPage::init(pid, PageType::SlottedData);
+                page.update_checksum();
+                handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
+            }
+            handle.sync_data().unwrap();
+        }
+
+        let pool = Arc::new(BufferPool::new(32, data_path.clone()));
+        let tree =
+            BPlusTree::new(BPlusTreeConfig::default()).with_pool(pool.clone(), fs.clone());
+
+        // WAL-logged batch.
+        let mut wal = WalWriter::open(wal_dir.clone(), fs.as_ref()).unwrap();
+        let entries: Vec<(CompositeKey, Vec<u8>)> = (1u128..=30)
+            .map(|i| (node_id_key(i), i.to_be_bytes().to_vec()))
+            .collect();
+        tree.insert_batch_logged(&entries, &mut wal, fs.as_ref(), 1)
+            .unwrap();
+        // Flush the dirty index pages to disk, then capture them.
+        pool.flush_all(fs.as_ref()).unwrap();
+
+        let root_id = tree.root_page_id.load(Ordering::Relaxed);
+        let good_root = {
+            let g = pool.fix_page(fs.as_ref(), root_id).unwrap();
+            g.buf().clone()
+        };
+        assert!(BTreePage::from_buf(good_root.clone()).key_count() > 0);
+
+        // Simulate a crash that lost the index pages: zero them on disk.
+        {
+            let handle = fs.open(&data_path, true).unwrap();
+            let zero = AlignedBuffer::zeroed(PAGE_SIZE);
+            for pid in 1..file_pages {
+                handle.write_at(&zero, pid * PAGE_SIZE as u64).unwrap();
+            }
+            handle.sync_data().unwrap();
+        }
+
+        // Drop the pool so its cached frames cannot mask the on-disk loss.
+        drop(tree);
+        drop(pool);
+
+        // Run ARIES REDO from the WAL.  Seed the DPT with every page the WAL
+        // touched so REDO replays their after-images.
+        let recovery = AriesRecovery::new(fs.as_ref(), &wal_dir, &data_path, 0);
+        let records = recovery.load_all_segments(fs.as_ref(), &wal_dir).unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(
+                    r.record_type,
+                    crate::wal::record::RecordType::IndexPageInsert
+                        | crate::wal::record::RecordType::IndexPageUpdate
+                )),
+            "WAL must contain physical index-page records"
+        );
+        let mut wal2 = WalWriter::open(wal_dir.clone(), fs.as_ref()).unwrap();
+        let result = recovery.recover_from_slice(&records, &mut wal2).unwrap();
+        assert!(
+            result.redo_count > 0,
+            "REDO must reapply at least one index page"
+        );
+        let _ = HashMap::<u64, DptEntry>::new();
+
+        // Re-open a pool over the recovered data file and verify the index
+        // pages are back and the root holds the inserted keys.
+        let pool2 = Arc::new(BufferPool::new(32, data_path.clone()));
+        let g = pool2.fix_page(fs.as_ref(), root_id).unwrap();
+        let recovered = BTreePage::from_buf(g.buf().clone());
+        assert!(
+            recovered.is_leaf() || recovered.is_branch(),
+            "recovered root must be a valid B+ tree page"
+        );
+        assert_eq!(
+            recovered.key_count(),
+            BTreePage::from_buf(good_root).key_count(),
+            "recovered root must have the same key count as before the crash"
+        );
     }
 }

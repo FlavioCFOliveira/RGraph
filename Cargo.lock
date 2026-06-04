@@ -1811,6 +1811,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "smallvec",
  "tempfile",
  "text-size",
  "thiserror 2.0.18",

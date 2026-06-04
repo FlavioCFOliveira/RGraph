@@ -155,5 +155,3 @@ fn bench_csr_full_traversal(c: &mut Criterion) {
 
 criterion_group!(benches, bench_linked_list, bench_csr, bench_csr_full_traversal);
 criterion_main!(benches);
-</content>
-</invoke>

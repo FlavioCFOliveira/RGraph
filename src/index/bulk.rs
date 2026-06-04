@@ -220,6 +220,22 @@ impl BulkLoader {
         self.load_into(&tree);
         tree
     }
+
+    /// Atomically insert all staged entries into an existing `tree` via
+    /// [`BPlusTree::insert_batch`], i.e. as a single latched batch.
+    ///
+    /// This is the wrapper form of the loader: it reuses the online insert path
+    /// (correct splits, WAL-friendly) under one latch, rather than the bespoke
+    /// bottom-up [`Self::load_into`].  Prefer it when inserting into a tree that
+    /// already contains data, or when the one-latch atomicity is what matters.
+    pub fn insert_all(self, tree: &BPlusTree) -> Result<(), crate::index::btree::BTreeError> {
+        let entries: Vec<(CompositeKey, Vec<u8>)> = self
+            .sorted_entries()
+            .into_iter()
+            .map(|(k, v)| (CompositeKey::from_slice(&k), v))
+            .collect();
+        tree.insert_batch(&entries)
+    }
 }
 
 fn encode_kv(key: &[u8], value: &[u8]) -> Vec<u8> {

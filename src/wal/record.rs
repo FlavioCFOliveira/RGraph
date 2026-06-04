@@ -87,6 +87,22 @@ pub enum RecordType {
     /// Payload: an 8-byte big-endian count of reclaimed slots.  Logical
     /// record: a no-op for REDO/UNDO.
     CompactionEnd = 0x61,
+    /// A B+ tree index page was created during an index mutation.
+    ///
+    /// Physical page record: payload is `[8-byte page_id][full page image]`,
+    /// optionally followed by an embedded before-image for UNDO.  Treated
+    /// exactly like [`PageInsert`] by REDO/UNDO but kept distinct so that
+    /// recovery and tooling can attribute the change to a secondary index.
+    IndexPageInsert = 0x70,
+    /// A B+ tree index page was modified during an index mutation.
+    ///
+    /// Physical page record with the same payload layout as
+    /// [`IndexPageInsert`]; treated like [`PageUpdate`] by REDO/UNDO.
+    IndexPageUpdate = 0x71,
+    /// A B+ tree index page was freed during an index mutation.
+    ///
+    /// Physical page record; treated like [`PageFree`] by REDO/UNDO.
+    IndexPageFree = 0x72,
 }
 
 /// A single WAL record.
@@ -243,6 +259,9 @@ impl WalRecord {
             0x50 => RecordType::SegmentDescriptor,
             0x60 => RecordType::CompactionBegin,
             0x61 => RecordType::CompactionEnd,
+            0x70 => RecordType::IndexPageInsert,
+            0x71 => RecordType::IndexPageUpdate,
+            0x72 => RecordType::IndexPageFree,
             _ => return None,
         };
         cursor += 1;
@@ -351,6 +370,9 @@ mod tests {
             RecordType::SegmentDescriptor,
             RecordType::CompactionBegin,
             RecordType::CompactionEnd,
+            RecordType::IndexPageInsert,
+            RecordType::IndexPageUpdate,
+            RecordType::IndexPageFree,
         ] {
             let rec = WalRecord::new(rt, 42, 0, 0, vec![0xAB, 0xCD]);
             let bytes = rec.encode();

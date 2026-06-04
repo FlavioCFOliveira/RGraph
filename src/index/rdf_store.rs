@@ -43,6 +43,55 @@ impl RdfQuad {
     }
 }
 
+/// The three RDF index permutations.  Each stores the same triples under a
+/// different field ordering so that any partial pattern can be answered by a
+/// prefix scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Permutation {
+    /// `subject (16) | predicate (8) | object (16)`.
+    Spo,
+    /// `predicate (8) | object (16) | subject (16)`.
+    Pos,
+    /// `object (16) | subject (16) | predicate (8)`.
+    Osp,
+}
+
+impl Permutation {
+    /// De-permute a 40-byte index key back into a canonical [`RdfTriple`].
+    ///
+    /// Returns `None` if the key is too short.
+    fn decode_triple(self, key: &[u8]) -> Option<RdfTriple> {
+        if key.len() < 40 {
+            return None;
+        }
+        use crate::index::key::{decode_u128_be, decode_u64_be};
+        let (subject, predicate, object) = match self {
+            Permutation::Spo => (
+                decode_u128_be(&key[0..16]),
+                decode_u64_be(&key[16..24]),
+                decode_u128_be(&key[24..40]),
+            ),
+            Permutation::Pos => {
+                let predicate = decode_u64_be(&key[0..8]);
+                let object = decode_u128_be(&key[8..24]);
+                let subject = decode_u128_be(&key[24..40]);
+                (subject, predicate, object)
+            }
+            Permutation::Osp => {
+                let object = decode_u128_be(&key[0..16]);
+                let subject = decode_u128_be(&key[16..32]);
+                let predicate = decode_u64_be(&key[32..40]);
+                (subject, predicate, object)
+            }
+        };
+        Some(RdfTriple {
+            subject,
+            predicate,
+            object,
+        })
+    }
+}
+
 /// RDF store backed by three B+ tree indexes.
 #[derive(Debug)]
 pub struct RdfStore {
@@ -122,6 +171,7 @@ impl RdfStore {
     ) -> Vec<(RdfTriple, SlotRef, Option<u64>)> {
         self.scan_prefix(
             &self.spo,
+            Permutation::Spo,
             &rdf_spo_key(subject, predicate, 0).as_slice()[..24],
         )
     }
@@ -130,6 +180,7 @@ impl RdfStore {
     pub fn scan_by_subject(&self, subject: u128) -> Vec<(RdfTriple, SlotRef, Option<u64>)> {
         self.scan_prefix(
             &self.spo,
+            Permutation::Spo,
             &rdf_spo_key(subject, 0, 0).as_slice()[..16],
         )
     }
@@ -142,6 +193,7 @@ impl RdfStore {
     ) -> Vec<(RdfTriple, SlotRef, Option<u64>)> {
         self.scan_prefix(
             &self.pos,
+            Permutation::Pos,
             &rdf_pos_key(predicate, object, 0).as_slice()[..24],
         )
     }
@@ -150,6 +202,7 @@ impl RdfStore {
     pub fn scan_by_object(&self, object: u128) -> Vec<(RdfTriple, SlotRef, Option<u64>)> {
         self.scan_prefix(
             &self.osp,
+            Permutation::Osp,
             &rdf_osp_key(object, 0, 0).as_slice()[..16],
         )
     }
@@ -159,9 +212,14 @@ impl RdfStore {
     // ------------------------------------------------------------------
 
     /// Generic prefix scan over one of the three indexes.
+    ///
+    /// `perm` identifies the index ordering so that each matched key is
+    /// de-permuted back to a canonical triple — without it, POS/OSP scans would
+    /// return triples with scrambled subject/predicate/object fields.
     fn scan_prefix(
         &self,
         tree: &BPlusTree,
+        perm: Permutation,
         prefix: &[u8],
     ) -> Vec<(RdfTriple, SlotRef, Option<u64>)> {
         let mut results = Vec::new();
@@ -185,7 +243,9 @@ impl RdfStore {
                     if !key.starts_with(prefix) {
                         continue;
                     }
-                    if let Some((triple, slot, graph)) = decode_key_and_value(key, &kv[2 + key_len..], tree) {
+                    if let Some((triple, slot, graph)) =
+                        decode_key_and_value(perm, key, &kv[2 + key_len..])
+                    {
                         results.push((triple, slot, graph));
                     }
                 }
@@ -235,33 +295,15 @@ fn decode_value(page: &BTreePage, slot: u16) -> Option<(SlotRef, Option<u64>)> {
 }
 
 /// Reconstruct a triple and metadata from a raw index key + value.
+///
+/// `perm` selects how the 40-byte key is de-permuted back into canonical
+/// `(subject, predicate, object)` order.
 fn decode_key_and_value(
+    perm: Permutation,
     key: &[u8],
     value: &[u8],
-    _tree: &BPlusTree,
 ) -> Option<(RdfTriple, SlotRef, Option<u64>)> {
-    // All three key formats use 40 bytes:
-    //   spo: subject (16) + predicate (8) + object (16)
-    //   pos: predicate (8) + object (16) + subject (16)
-    //   osp: object (16) + subject (16) + predicate (8)
-    if key.len() < 40 {
-        return None;
-    }
-    // For simplicity we assume the caller used the SPO key ordering
-    // when reconstructing from the SPO scan; for POS/OSP scans the
-    // field extraction differs, but the test coverage focuses on
-    // SPO exact match and partial scans.
-    let subject = crate::index::key::decode_u128_be(&key[0..16]);
-    let predicate = u64::from_be_bytes([
-        key[16], key[17], key[18], key[19],
-        key[20], key[21], key[22], key[23],
-    ]);
-    let object = crate::index::key::decode_u128_be(&key[24..40]);
-    let triple = RdfTriple {
-        subject,
-        predicate,
-        object,
-    };
+    let triple = perm.decode_triple(key)?;
     if value.len() < 4 {
         return None;
     }
@@ -440,6 +482,48 @@ mod tests {
 
         let results = store.scan_by_predicate_object(10, 99);
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn pos_scan_returns_correctly_depermuted_triples() {
+        // A POS scan reads keys laid out as predicate|object|subject; without
+        // de-permutation the returned triple fields would be scrambled.
+        let store = RdfStore::new();
+        let t1 = RdfTriple { subject: 11, predicate: 7, object: 99 };
+        let t2 = RdfTriple { subject: 22, predicate: 7, object: 99 };
+        store.insert(&t1, SlotRef::new(1, 0), None).unwrap();
+        store.insert(&t2, SlotRef::new(2, 0), None).unwrap();
+
+        let results = store.scan_by_predicate_object(7, 99);
+        assert_eq!(results.len(), 2);
+        let mut subjects: Vec<u128> = results.iter().map(|(t, _, _)| t.subject).collect();
+        subjects.sort_unstable();
+        assert_eq!(subjects, vec![11, 22], "subjects must be de-permuted correctly");
+        for (t, _, _) in &results {
+            assert_eq!(t.predicate, 7, "predicate must round-trip");
+            assert_eq!(t.object, 99, "object must round-trip");
+        }
+    }
+
+    #[test]
+    fn osp_scan_returns_correctly_depermuted_triples() {
+        // An OSP scan reads keys laid out as object|subject|predicate.
+        let store = RdfStore::new();
+        let t1 = RdfTriple { subject: 5, predicate: 30, object: 100 };
+        let t2 = RdfTriple { subject: 6, predicate: 40, object: 100 };
+        store.insert(&t1, SlotRef::new(1, 0), None).unwrap();
+        store.insert(&t2, SlotRef::new(2, 0), None).unwrap();
+
+        let results = store.scan_by_object(100);
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().any(|(t, _, _)| *t == t1),
+            "OSP scan must reconstruct {t1:?} exactly"
+        );
+        assert!(
+            results.iter().any(|(t, _, _)| *t == t2),
+            "OSP scan must reconstruct {t2:?} exactly"
+        );
     }
 
     #[test]

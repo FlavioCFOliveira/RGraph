@@ -43,7 +43,7 @@ pub use key::{CompositeKey, KeyEncoder};
 pub use page::{BTreePage, BTreePageType, BTREE_HEADER_SIZE};
 pub use latch::{LatchCoupling, LatchMode};
 pub use btree::{BPlusTree, BPlusTreeConfig};
-pub use cursor::{BTreeCursor, BTreeRangeScan};
+pub use cursor::{BTreeCursor, BTreeRangeCursor, BTreeRangeScan};
 pub use bulk::BulkLoader;
 pub use label::LabelIndex;
 pub use property::PropertyIndex;

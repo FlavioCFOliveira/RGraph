@@ -36,40 +36,61 @@
 //!
 //! All multi-byte fields are big-endian so that lexicographic byte order
 //! matches numeric order.
+//!
+//! # Variable-length storage
+//!
+//! [`CompositeKey`] stores its bytes in a [`SmallVec`] with an inline capacity
+//! of [`MAX_KEY_LEN`] bytes.  Keys up to that length live entirely on the stack
+//! (no allocation); longer keys (long property values, long RDF literals) spill
+//! to the heap **without truncation**, so ordering and uniqueness are preserved
+//! for keys of any length.  `SmallVec`'s `Ord`/`PartialOrd` compare the byte
+//! contents element-wise, identical to comparing the underlying slices.
 
-/// Fixed-size buffer large enough for any composite key (max 40 bytes).
+use smallvec::SmallVec;
+
+/// Inline capacity, in bytes, for a composite key before it spills to the heap.
+///
+/// Chosen to cover the largest fixed-layout key (40 bytes: adjacency / RDF SPO)
+/// so common keys never allocate.  It is **not** a maximum: longer keys are
+/// stored on the heap.
 pub const MAX_KEY_LEN: usize = 40;
 
-/// A composite key stored inline on the stack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Backing storage for a [`CompositeKey`]: inline up to [`MAX_KEY_LEN`] bytes,
+/// heap-allocated beyond.
+pub type KeyBytes = SmallVec<[u8; MAX_KEY_LEN]>;
+
+/// A composite key with variable length.
+///
+/// Short keys are stored inline; long keys spill to the heap.  Lexicographic
+/// byte order is preserved by `SmallVec`'s element-wise comparison.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CompositeKey {
-    pub bytes: [u8; MAX_KEY_LEN],
-    pub len: u8,
+    bytes: KeyBytes,
 }
 
 impl CompositeKey {
     /// Create an empty key.
     pub fn empty() -> Self {
         Self {
-            bytes: [0; MAX_KEY_LEN],
-            len: 0,
+            bytes: SmallVec::new(),
         }
     }
 
-    /// Create from a byte slice (truncates at `MAX_KEY_LEN`).
+    /// Create from a byte slice.  The full slice is stored without truncation.
     pub fn from_slice(data: &[u8]) -> Self {
-        let len = data.len().min(MAX_KEY_LEN);
-        let mut bytes = [0; MAX_KEY_LEN];
-        bytes[..len].copy_from_slice(&data[..len]);
         Self {
-            bytes,
-            len: len as u8,
+            bytes: SmallVec::from_slice(data),
         }
     }
 
-    /// Return the active prefix of the key.
+    /// Create from owned bytes.
+    pub fn from_bytes(bytes: KeyBytes) -> Self {
+        Self { bytes }
+    }
+
+    /// Return the key bytes.
     pub fn as_slice(&self) -> &[u8] {
-        &self.bytes[..self.len as usize]
+        &self.bytes
     }
 
     /// Compare two keys lexicographically.
@@ -79,11 +100,41 @@ impl CompositeKey {
 
     /// Length of the key in bytes.
     pub fn len(&self) -> usize {
-        self.len as usize
+        self.bytes.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.bytes.is_empty()
+    }
+}
+
+/// A small builder that accumulates key bytes, used by the fixed-layout key
+/// constructors below.  Encapsulates the inline-vs-heap storage decision.
+struct KeyBuilder {
+    bytes: KeyBytes,
+}
+
+impl KeyBuilder {
+    fn new() -> Self {
+        Self {
+            bytes: SmallVec::new(),
+        }
+    }
+
+    fn push_u64_be(&mut self, v: u64) {
+        self.bytes.extend_from_slice(&v.to_be_bytes());
+    }
+
+    fn push_u128_be(&mut self, v: u128) {
+        self.bytes.extend_from_slice(&v.to_be_bytes());
+    }
+
+    fn push_slice(&mut self, s: &[u8]) {
+        self.bytes.extend_from_slice(s);
+    }
+
+    fn finish(self) -> CompositeKey {
+        CompositeKey { bytes: self.bytes }
     }
 }
 
@@ -119,91 +170,90 @@ pub fn decode_u128_be(bytes: &[u8]) -> u128 {
 
 /// Build a node-id primary key.
 pub fn node_id_key(node_id: u128) -> CompositeKey {
-    let mut bytes = [0; MAX_KEY_LEN];
-    encode_u128_be(node_id, &mut bytes);
-    CompositeKey { bytes, len: 16 }
+    let mut b = KeyBuilder::new();
+    b.push_u128_be(node_id);
+    b.finish()
 }
 
 /// Build an edge-id primary key.
 pub fn edge_id_key(edge_id: u128) -> CompositeKey {
-    let mut bytes = [0; MAX_KEY_LEN];
-    encode_u128_be(edge_id, &mut bytes);
-    CompositeKey { bytes, len: 16 }
+    let mut b = KeyBuilder::new();
+    b.push_u128_be(edge_id);
+    b.finish()
 }
 
 /// Build an edge adjacency key.
 pub fn edge_adjacency_key(source_id: u128, type_id: u64, target_id: u128) -> CompositeKey {
-    let mut bytes = [0; MAX_KEY_LEN];
-    let mut off = 0;
-    off += encode_u128_be(source_id, &mut bytes[off..]);
-    off += encode_u64_be(type_id, &mut bytes[off..]);
-    off += encode_u128_be(target_id, &mut bytes[off..]);
-    CompositeKey { bytes, len: off as u8 }
+    let mut b = KeyBuilder::new();
+    b.push_u128_be(source_id);
+    b.push_u64_be(type_id);
+    b.push_u128_be(target_id);
+    b.finish()
 }
 
 /// Build a label index key.
 pub fn label_index_key(label_hash: u64, node_id: u128) -> CompositeKey {
-    let mut bytes = [0; MAX_KEY_LEN];
-    let mut off = 0;
-    off += encode_u64_be(label_hash, &mut bytes[off..]);
-    off += encode_u128_be(node_id, &mut bytes[off..]);
-    CompositeKey { bytes, len: off as u8 }
+    let mut b = KeyBuilder::new();
+    b.push_u64_be(label_hash);
+    b.push_u128_be(node_id);
+    b.finish()
 }
 
 /// Build a type index key for edge type lookups.
 pub fn type_index_key(type_id: u64, edge_id: u128) -> CompositeKey {
-    let mut bytes = [0; MAX_KEY_LEN];
-    let mut off = 0;
-    off += encode_u64_be(type_id, &mut bytes[off..]);
-    off += encode_u128_be(edge_id, &mut bytes[off..]);
-    CompositeKey { bytes, len: off as u8 }
+    let mut b = KeyBuilder::new();
+    b.push_u64_be(type_id);
+    b.push_u128_be(edge_id);
+    b.finish()
 }
 
 /// Build a property index key.
 ///
-/// Layout: `property_id (8 BE) | serialized_value (up to 16 BE) | entity_id (16 BE)`.
-/// The serialized value is truncated to fit within [`MAX_KEY_LEN`] (40 bytes).
-/// This preserves enough ordering for practical range scans while keeping
-/// the key size fixed.
-pub fn property_index_key(property_id: u64, serialized_value: &[u8], entity_id: u128) -> CompositeKey {
-    let mut bytes = [0; MAX_KEY_LEN];
-    let mut off = 0;
-    off += encode_u64_be(property_id, &mut bytes[off..]);
-    let value_len = serialized_value.len().min(MAX_KEY_LEN - off - 16);
-    bytes[off..off + value_len].copy_from_slice(&serialized_value[..value_len]);
-    off += value_len;
-    off += encode_u128_be(entity_id, &mut bytes[off..]);
-    CompositeKey { bytes, len: off as u8 }
+/// Layout: `property_id (8 BE) | serialized_value (variable) | entity_id (16 BE)`.
+/// The serialized value is stored **in full** — no truncation — so ordering and
+/// uniqueness are preserved for property values of any length.  Because the
+/// value is variable-length, the trailing `entity_id` is unambiguous only when
+/// callers serialize values order-preservingly (see [`value_codec`]); that is
+/// the contract for the property index.
+///
+/// [`value_codec`]: crate::index::value_codec
+pub fn property_index_key(
+    property_id: u64,
+    serialized_value: &[u8],
+    entity_id: u128,
+) -> CompositeKey {
+    let mut b = KeyBuilder::new();
+    b.push_u64_be(property_id);
+    b.push_slice(serialized_value);
+    b.push_u128_be(entity_id);
+    b.finish()
 }
 
 /// Build an RDF SPO triple key.
 pub fn rdf_spo_key(subject: u128, predicate: u64, object: u128) -> CompositeKey {
-    let mut bytes = [0; MAX_KEY_LEN];
-    let mut off = 0;
-    off += encode_u128_be(subject, &mut bytes[off..]);
-    off += encode_u64_be(predicate, &mut bytes[off..]);
-    off += encode_u128_be(object, &mut bytes[off..]);
-    CompositeKey { bytes, len: off as u8 }
+    let mut b = KeyBuilder::new();
+    b.push_u128_be(subject);
+    b.push_u64_be(predicate);
+    b.push_u128_be(object);
+    b.finish()
 }
 
 /// Build an RDF POS triple key.
 pub fn rdf_pos_key(predicate: u64, object: u128, subject: u128) -> CompositeKey {
-    let mut bytes = [0; MAX_KEY_LEN];
-    let mut off = 0;
-    off += encode_u64_be(predicate, &mut bytes[off..]);
-    off += encode_u128_be(object, &mut bytes[off..]);
-    off += encode_u128_be(subject, &mut bytes[off..]);
-    CompositeKey { bytes, len: off as u8 }
+    let mut b = KeyBuilder::new();
+    b.push_u64_be(predicate);
+    b.push_u128_be(object);
+    b.push_u128_be(subject);
+    b.finish()
 }
 
 /// Build an RDF OSP triple key.
 pub fn rdf_osp_key(object: u128, subject: u128, predicate: u64) -> CompositeKey {
-    let mut bytes = [0; MAX_KEY_LEN];
-    let mut off = 0;
-    off += encode_u128_be(object, &mut bytes[off..]);
-    off += encode_u128_be(subject, &mut bytes[off..]);
-    off += encode_u64_be(predicate, &mut bytes[off..]);
-    CompositeKey { bytes, len: off as u8 }
+    let mut b = KeyBuilder::new();
+    b.push_u128_be(object);
+    b.push_u128_be(subject);
+    b.push_u64_be(predicate);
+    b.finish()
 }
 
 #[cfg(test)]
@@ -293,10 +343,35 @@ mod tests {
     }
 
     #[test]
-    fn from_slice_truncates() {
+    fn from_slice_preserves_long_keys() {
+        // Keys longer than the inline capacity must be stored in full (no
+        // truncation) so ordering and uniqueness hold.
         let long = vec![0xAB; MAX_KEY_LEN + 10];
         let k = CompositeKey::from_slice(&long);
-        assert_eq!(k.len(), MAX_KEY_LEN);
+        assert_eq!(k.len(), MAX_KEY_LEN + 10);
+        assert_eq!(k.as_slice(), long.as_slice());
+    }
+
+    #[test]
+    fn long_property_keys_round_trip_and_order() {
+        // Two distinct long values that share a 60-byte prefix must remain
+        // distinct and correctly ordered — the old 40-byte buffer truncated
+        // both to the same key, collapsing them.
+        let mut v1 = vec![0x10u8; 60];
+        let mut v2 = v1.clone();
+        v1.push(0x01);
+        v2.push(0x02);
+        let k1 = property_index_key(7, &v1, 100);
+        let k2 = property_index_key(7, &v2, 100);
+        assert_ne!(k1, k2, "long values must not collapse to the same key");
+        assert!(k1.as_slice() < k2.as_slice(), "ordering must follow value bytes");
+        // Round-trip: the serialized value is recoverable between the 8-byte
+        // property id and the trailing 16-byte entity id.
+        let buf = k1.as_slice();
+        assert_eq!(decode_u64_be(&buf[0..8]), 7);
+        let value = &buf[8..buf.len() - 16];
+        assert_eq!(value, v1.as_slice());
+        assert_eq!(decode_u128_be(&buf[buf.len() - 16..]), 100);
     }
 
     #[test]
