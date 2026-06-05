@@ -604,11 +604,18 @@ impl BufferPool {
     /// Unpin a frame (called automatically by [`PageGuard::drop`]).
     pub fn unfix_page(&self, frame_id: FrameId) {
         let frame = self.frame(frame_id);
-        let old = frame.desc.pin_count.fetch_sub(1, Ordering::Relaxed);
-        if old == 0 {
-            // Underflow guard: clamp back to 0 rather than wrapping to u16::MAX.
-            frame.desc.pin_count.store(0, Ordering::Relaxed);
-        }
+        // Atomic saturating decrement (finding H10/L10): a stray double-unpin
+        // (a caller bug) must never transiently wrap `pin_count` to `u16::MAX` —
+        // which a concurrent CLOCK sweep would misread as "pinned" — nor clobber
+        // a concurrent pin via a separate non-atomic clamp store.  `fetch_update`
+        // performs the decrement-and-clamp as one CAS, so the value is never
+        // momentarily observable as the wrapped sentinel.
+        let _ = frame
+            .desc
+            .pin_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                Some(c.saturating_sub(1))
+            });
     }
 
     /// Find a free or evictable frame using a CLOCK-Pro sweep.
@@ -619,14 +626,23 @@ impl BufferPool {
     /// is momentarily saturated by in-flight I/O simply spins-yields rather
     /// than overflowing the stack.
     fn find_free_frame(&self, fs: &dyn FileSystem) -> std::io::Result<FrameId> {
-        loop {
+        // Bound the spin so a pool whose frames are ALL pinned (or have in-flight
+        // I/O that never clears) surfaces backpressure instead of livelocking a
+        // core forever (finding M27).  The yields between sweeps let the flusher
+        // and concurrent unpins make progress; if after `MAX_SWEEPS` no frame has
+        // become reclaimable, the caller gets a `WouldBlock` to handle (retry at
+        // a higher level, shed load, etc.) rather than hanging.
+        const MAX_SWEEPS: u32 = 100_000;
+        for _ in 0..MAX_SWEEPS {
             if let Some(fid) = self.sweep_for_victim(fs)? {
                 return Ok(fid);
             }
-            // No victim this sweep (everything pinned / in-flight); yield and
-            // retry so the flusher and concurrent unpins can make progress.
             std::thread::yield_now();
         }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "buffer pool exhausted: all frames are pinned or have in-flight I/O",
+        ))
     }
 
     /// Try to find a free or evictable frame in a single bounded sweep.
@@ -966,6 +982,37 @@ mod tests {
             hdr_page_id, 12,
             "prefetched page 12 must contain page 12, not a neighbouring page"
         );
+    }
+
+    #[test]
+    fn unfix_saturates_at_zero_on_double_unpin() {
+        // Regression gate for finding L10 (2026-06-04): a stray extra unpin must
+        // leave pin_count saturated at 0, never wrap to u16::MAX (which a CLOCK
+        // sweep would misread as "pinned").
+        let (_dir, fs, pool) = temp_pool(4);
+        let g = pool.fix_page(&fs, 3).unwrap();
+        let fid = g.frame_id;
+        drop(g); // 1 -> 0
+        pool.unfix_page(fid); // spurious extra unpin
+        pool.unfix_page(fid); // and another
+        assert_eq!(
+            pool.frame(fid).desc.pin_count.load(Ordering::Relaxed),
+            0,
+            "pin_count must saturate at 0, never wrap"
+        );
+    }
+
+    #[test]
+    fn find_free_frame_surfaces_backpressure_when_all_pinned() {
+        // Regression gate for finding M27 (2026-06-04): a fully-pinned pool must
+        // surface bounded backpressure (WouldBlock) instead of livelocking a core
+        // forever.
+        let (_dir, fs, pool) = temp_pool(2);
+        let _g0 = pool.fix_page(&fs, 10).unwrap();
+        let _g1 = pool.fix_page(&fs, 11).unwrap();
+        // Both frames pinned; a third distinct page cannot obtain a frame.
+        let err = pool.fix_page(&fs, 12).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
