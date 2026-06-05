@@ -1449,6 +1449,33 @@ impl GraphStorageEngine {
         Ok(result)
     }
 
+    /// Take a fuzzy checkpoint now, regardless of the interval.
+    ///
+    /// Flushes dirty pages up to the checkpoint LSN, writes the `CheckpointEnd`
+    /// dirty-page table, advances `last_checkpoint_lsn` (so ARIES ANALYSIS bounds
+    /// its scan on the next restart), and reclaims archived WAL segments that are
+    /// now entirely before the checkpoint — bounding both recovery time and disk
+    /// usage (finding H7).  A no-op (counter reset only) when no pool is attached.
+    pub fn checkpoint(&mut self, fs: &dyn FileSystem) -> Result<(), StorageError> {
+        let Some(pool) = self.page_manager.buffer_pool() else {
+            // No pool attached: clear the counter so needs_checkpoint() does not
+            // spin, but there is nothing to flush.
+            self.wal_writer.reset_checkpoint_counter();
+            return Ok(());
+        };
+        let wal_fs = Arc::new(crate::io::posix::PosixFileSystem::new(false));
+        let ckpt_lsn = crate::wal::checkpoint::Checkpoint::run(&pool, wal_fs, &mut self.wal_writer)
+            .map_err(StorageError::from)?;
+        self.page_manager.superblock.last_checkpoint_lsn = ckpt_lsn;
+        self.wal_writer.reset_checkpoint_counter();
+        // Archived segments entirely before the checkpoint can never be scanned
+        // again (recovery starts at last_checkpoint_lsn) — reclaim them.
+        let _ = self
+            .wal_writer
+            .reclaim_archived_segments_before(ckpt_lsn, fs);
+        Ok(())
+    }
+
     /// Sync the WAL, superblock, and bitmap to durable storage.
     ///
     /// If the WAL has accumulated more than [`WalWriter::CHECKPOINT_INTERVAL`]
@@ -1459,24 +1486,10 @@ impl GraphStorageEngine {
         self.wal_writer.sync(fs)?;
 
         // Trigger a fuzzy checkpoint when the interval threshold is exceeded.
+        // A checkpoint failure is non-fatal — the engine continues and recovery
+        // simply replays more WAL on the next restart.
         if self.wal_writer.needs_checkpoint() {
-            if let Some(pool) = self.page_manager.buffer_pool() {
-                let wal_fs = std::sync::Arc::new(crate::io::posix::PosixFileSystem::new(false));
-                match crate::wal::checkpoint::Checkpoint::run(&pool, wal_fs, &mut self.wal_writer) {
-                    Ok(ckpt_lsn) => {
-                        self.page_manager.superblock.last_checkpoint_lsn = ckpt_lsn;
-                        self.wal_writer.reset_checkpoint_counter();
-                    }
-                    Err(_) => {
-                        // Checkpoint failure is non-fatal — the engine can continue.
-                        // Recovery will simply replay more WAL on the next restart.
-                    }
-                }
-            } else {
-                // No buffer pool attached (e.g. in single-segment mode):
-                // reset the counter to avoid repeated no-op checks.
-                self.wal_writer.reset_checkpoint_counter();
-            }
+            let _ = self.checkpoint(fs);
         }
 
         // Flush every dirty pool frame to disk so `sync()` means "durable on

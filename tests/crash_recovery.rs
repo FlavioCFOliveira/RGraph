@@ -465,6 +465,57 @@ fn create_relationship_survives_crash_atomically() {
 /// engine's `Drop`-flush), reopen, then more writes — asserting every committed
 /// node survives, `next_free_page_id` was reconciled, and no committed node is
 /// overwritten by a post-reopen allocation.
+/// Regression gate for finding H7 (Task 197, 2026-06-05): a checkpoint on the
+/// live path advances (and persists) last_checkpoint_lsn — bounding ARIES
+/// recovery to start from the checkpoint — and committed data survives the reopen.
+#[test]
+fn checkpoint_advances_last_checkpoint_lsn_and_survives_reopen() {
+    use rgraph::graph::engine::GraphStorageEngine;
+    use rgraph::graph::graph::Graph;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fs = PosixFileSystem::new(false);
+    let data_path = dir.path().join("ckpt.rgraph");
+
+    let ids = {
+        let engine = GraphStorageEngine::init(data_path.clone(), &fs).unwrap();
+        assert_eq!(
+            engine.page_manager.superblock.last_checkpoint_lsn, 0,
+            "a fresh database has no checkpoint yet"
+        );
+
+        let mut graph = Graph::new(engine);
+        let mut ids = Vec::new();
+        for _ in 0..30 {
+            let (_s, id) = graph.create_node(NodeBuilder::new().label(3), &fs).unwrap();
+            ids.push(id);
+        }
+
+        // Take a checkpoint directly (no need to write 8 MiB to cross the interval).
+        graph.engine_mut().checkpoint(&fs).unwrap();
+        assert!(
+            graph.engine().page_manager.superblock.last_checkpoint_lsn > 0,
+            "the checkpoint must advance last_checkpoint_lsn"
+        );
+        graph.engine_mut().sync(&fs).unwrap();
+        ids
+    };
+
+    // Reopen: the checkpoint LSN is persisted and all data survives.
+    let engine = GraphStorageEngine::open(data_path, &fs).unwrap();
+    assert!(
+        engine.page_manager.superblock.last_checkpoint_lsn > 0,
+        "the checkpoint LSN must persist across reopen (bounding recovery)"
+    );
+    let graph = Graph::new(engine);
+    for id in &ids {
+        assert!(
+            graph.get_node(*id, &fs).unwrap().is_some(),
+            "committed data must survive a checkpoint + reopen"
+        );
+    }
+}
+
 /// Regression gate for finding H-INT (Task 194, 2026-06-05): a freshly opened
 /// engine must have a live buffer pool wired into the page manager (so
 /// read_page/write_page route through the cache) and a background flusher, on

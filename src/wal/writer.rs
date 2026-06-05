@@ -587,6 +587,35 @@ impl WalWriter {
         }
         Ok(())
     }
+
+    /// Delete archived WAL segments whose entire range is before the checkpoint
+    /// segment.
+    ///
+    /// Recovery's ANALYSIS starts from `last_checkpoint_lsn`, so any archived
+    /// segment with a lower segment id can never be scanned again and is dead
+    /// weight.  Without this, the `wal-archive/` directory grows without bound as
+    /// checkpoints advance — recovery time stays bounded but disk usage does not
+    /// (finding H7).  Returns the number of segments reclaimed.
+    pub fn reclaim_archived_segments_before(
+        &self,
+        checkpoint_lsn: u64,
+        fs: &dyn FileSystem,
+    ) -> io::Result<usize> {
+        let ckpt_seg = lsn_segment_id(checkpoint_lsn) as u64;
+        let archive_dir = self.wal_dir.join(Self::ARCHIVE_DIR);
+        if ckpt_seg == 0 || !fs.exists(&archive_dir) {
+            return Ok(0);
+        }
+        let mut reclaimed = 0;
+        for seg_id in 0..ckpt_seg {
+            let path = archive_dir.join(format!("wal-{:09}", seg_id));
+            if fs.exists(&path) {
+                fs.remove(&path)?;
+                reclaimed += 1;
+            }
+        }
+        Ok(reclaimed)
+    }
 }
 
 #[cfg(test)]
@@ -616,6 +645,37 @@ mod tests {
         assert_eq!(decoded.lsn, lsn);
         assert_eq!(decoded.record_type, RecordType::Begin);
         assert_eq!(size, len);
+    }
+
+    /// Regression gate for finding H7 (Task 197, 2026-06-05): archived WAL
+    /// segments entirely before the checkpoint segment are reclaimed (deleted),
+    /// while the checkpoint segment and later ones are kept — so disk usage stays
+    /// bounded as checkpoints advance.
+    #[test]
+    fn reclaim_deletes_archived_segments_before_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let writer = WalWriter::open(dir.path().to_path_buf(), &fs).unwrap();
+
+        // Lay down fake archived segments 0..4.
+        let archive = dir.path().join(WalWriter::ARCHIVE_DIR);
+        fs.create_dir_all(&archive).unwrap();
+        for seg in 0..4u64 {
+            let h = fs
+                .open(&archive.join(format!("wal-{:09}", seg)), true)
+                .unwrap();
+            h.write_at(b"x", 0).unwrap();
+        }
+
+        // Checkpoint in segment 2 → segments 0 and 1 are reclaimable; 2 and 3 stay.
+        let reclaimed = writer
+            .reclaim_archived_segments_before(make_lsn(2, 0), &fs)
+            .unwrap();
+        assert_eq!(reclaimed, 2);
+        assert!(!fs.exists(&archive.join("wal-000000000")));
+        assert!(!fs.exists(&archive.join("wal-000000001")));
+        assert!(fs.exists(&archive.join("wal-000000002")));
+        assert!(fs.exists(&archive.join("wal-000000003")));
     }
 
     #[test]
