@@ -193,7 +193,12 @@ impl SlottedPage {
     ///
     /// The checksum field (bytes 28..32) is treated as zero during computation.
     pub fn compute_checksum_bytes(buf: &[u8]) -> u32 {
-        assert_eq!(buf.len(), PAGE_SIZE, "buffer must be PAGE_SIZE");
+        // Invariant: callers pass a PAGE_SIZE frame/page buffer (enforced at
+        // construction).  Use debug_assert so a violation is caught in tests but
+        // never panics a background flusher thread on the I/O path (finding L12);
+        // `verify_checksum_bytes` rejects wrong-size buffers gracefully before
+        // reaching here.
+        debug_assert_eq!(buf.len(), PAGE_SIZE, "buffer must be PAGE_SIZE");
         let mut cksum = crc32c::crc32c(&buf[..28]);
         cksum = crc32c::crc32c_append(cksum, &[0, 0, 0, 0]); // checksum field as zeros
         cksum = crc32c::crc32c_append(cksum, &buf[32..]);
@@ -201,15 +206,23 @@ impl SlottedPage {
     }
 
     /// Verify the stored checksum in a page buffer.
+    ///
+    /// A buffer that is not exactly [`PAGE_SIZE`] cannot be a valid page, so this
+    /// returns `false` rather than panicking — keeping the read/verify I/O path
+    /// panic-free (finding L12).
     pub fn verify_checksum_bytes(buf: &[u8]) -> bool {
-        assert_eq!(buf.len(), PAGE_SIZE, "buffer must be PAGE_SIZE");
+        if buf.len() != PAGE_SIZE {
+            return false;
+        }
         let stored = u32::from_ne_bytes([buf[28], buf[29], buf[30], buf[31]]);
         stored == Self::compute_checksum_bytes(buf)
     }
 
     /// Recalculate and write the checksum into a page buffer.
     pub fn update_checksum_bytes(buf: &mut [u8]) {
-        assert_eq!(buf.len(), PAGE_SIZE, "buffer must be PAGE_SIZE");
+        // See `compute_checksum_bytes`: PAGE_SIZE is a construction invariant, so
+        // debug_assert (no I/O-path panic in release) — finding L12.
+        debug_assert_eq!(buf.len(), PAGE_SIZE, "buffer must be PAGE_SIZE");
         let cksum = Self::compute_checksum_bytes(buf);
         buf[28..32].copy_from_slice(&cksum.to_ne_bytes());
     }
@@ -501,6 +514,18 @@ impl SlottedPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_checksum_bytes_rejects_wrong_size_without_panicking() {
+        // Regression gate for finding L12 (2026-06-04): a non-PAGE_SIZE buffer
+        // must be reported invalid, never panic on the read/verify I/O path.
+        assert!(!SlottedPage::verify_checksum_bytes(&[]));
+        assert!(!SlottedPage::verify_checksum_bytes(&[0u8; 10]));
+        assert!(!SlottedPage::verify_checksum_bytes(&[0u8; 100]));
+        assert!(!SlottedPage::verify_checksum_bytes(
+            &[0u8; PAGE_SIZE + 1]
+        ));
+    }
 
     #[test]
     fn header_size_is_64() {
