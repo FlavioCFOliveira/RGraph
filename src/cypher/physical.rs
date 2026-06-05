@@ -52,80 +52,115 @@ pub trait PhysicalOperator {
 
 /// Runtime state shared across all operators in a query.
 ///
-/// `engine_cell` provides interior-mutable access to the engine for write
-/// operators.  The engine pointer stored in the `UnsafeCell` comes from the
-/// caller of [`ExecutionContext::new_with_write`] which must guarantee
-/// exclusive access for the duration of the execution.
+/// The engine is stored as a raw pointer rather than a reference so that read
+/// operators (which need `&GraphStorageEngine`) and write operators (which need
+/// `&mut GraphStorageEngine`) never hold coexisting `&`/`&mut` borrows of the
+/// same engine — a previous design held BOTH a `&'a engine` field and a
+/// `*mut engine`, so any write op's `&mut` aliased the still-live `&` field,
+/// which is undefined behaviour under Rust's aliasing rules even single-threaded
+/// (finding M19).  References are now reborrowed from the pointer at each point
+/// of use via [`engine`](ExecutionContext::engine) / [`engine_mut`] and dropped
+/// before control returns to a sibling operator.
 pub struct ExecutionContext<'a> {
-    /// Read-only reference to the graph storage engine (used by read operators
-    /// and for the public API where mutability is not needed).
-    pub engine: &'a GraphStorageEngine,
-    /// Interior-mutable engine pointer for write operators.
-    /// See [`engine_ptr_mut`](ExecutionContext::engine_ptr_mut) for the invariants.
-    engine_ptr: std::cell::UnsafeCell<*mut GraphStorageEngine>,
+    /// Raw pointer to the graph storage engine.
+    ///
+    /// For a context built with [`new`](ExecutionContext::new) this points at a
+    /// shared (`&`) borrow and must never be dereferenced as `&mut`.  For a
+    /// context built with [`new_with_write`](ExecutionContext::new_with_write) it
+    /// points at an exclusive (`&mut`) borrow and may be reborrowed mutably.  The
+    /// pointee outlives the context (it is derived from a borrow of lifetime
+    /// `'a`, tracked by `_engine_life`).
+    engine: *mut GraphStorageEngine,
+    /// Whether [`engine_mut`](ExecutionContext::engine_mut) is permitted (i.e. the
+    /// context was constructed from a `&mut` borrow).
+    writable: bool,
     /// Reference to the file-system abstraction (for I/O).
     pub fs: &'a dyn FileSystem,
     /// Optional parameter bindings for this execution (e.g. `$name → "Alice"`).
     pub parameters: std::collections::HashMap<String, Value>,
+    /// Binds the engine pointer's provenance to `'a` without holding a live
+    /// reference to the engine (which would alias the `&mut` reborrows).
+    _engine_life: std::marker::PhantomData<fn() -> &'a GraphStorageEngine>,
 }
 
 // SAFETY: `ExecutionContext` is only used within a single thread during query
-// execution.  The `UnsafeCell<*mut GraphStorageEngine>` is not shared across
-// threads.
+// execution.  The raw engine pointer is never shared across threads, and write
+// access is serialised by the caller (the server takes an exclusive write lock
+// before constructing a writable context).  No interior reference outlives a
+// single operator call.
 unsafe impl<'a> Send for ExecutionContext<'a> {}
 
 impl<'a> ExecutionContext<'a> {
     /// Create a context backed by a shared (read-only) engine reference.
     ///
-    /// Write operators will fail at runtime if used with this constructor.
-    /// Use [`new_with_write`] when write operators are present in the plan.
+    /// Write operators will fail (panic via [`engine_mut`]) if used with this
+    /// constructor.  Use [`new_with_write`](ExecutionContext::new_with_write)
+    /// when write operators are present in the plan.
     pub fn new(engine: &'a GraphStorageEngine, fs: &'a dyn FileSystem) -> Self {
         Self {
-            engine,
-            engine_ptr: std::cell::UnsafeCell::new(engine as *const _ as *mut _),
+            engine: engine as *const GraphStorageEngine as *mut GraphStorageEngine,
+            writable: false,
             fs,
             parameters: std::collections::HashMap::new(),
+            _engine_life: std::marker::PhantomData,
         }
     }
 
     /// Create a context backed by a mutable engine reference (for write queries).
+    ///
+    /// The `&mut` borrow is consumed for the whole lifetime `'a`, so the caller
+    /// cannot alias the engine while the context lives.
     pub fn new_with_write(engine: &'a mut GraphStorageEngine, fs: &'a dyn FileSystem) -> Self {
-        let ptr = engine as *mut _;
         Self {
-            engine,
-            engine_ptr: std::cell::UnsafeCell::new(ptr),
+            engine: engine as *mut GraphStorageEngine,
+            writable: true,
             fs,
             parameters: std::collections::HashMap::new(),
+            _engine_life: std::marker::PhantomData,
         }
     }
 
-    /// Obtain the raw, mutable engine pointer.
+    /// Reborrow the engine as a shared reference for the duration of the call.
     ///
-    /// A raw pointer (rather than `&mut`) is returned deliberately: producing a
-    /// `&mut` from `&self` would launder a mutable borrow out of a shared one,
-    /// which clippy denies (`mut_from_ref`) because it is unsound in the general
-    /// case.  Returning the pointer keeps the aliasing obligation explicit at
-    /// every call site, where it must be dereferenced inside an `unsafe` block.
+    /// The returned reference is tied to `&self`, so it cannot outlive the borrow
+    /// of the context and is dropped before any sibling operator can derive a
+    /// `&mut` from the same context.
+    pub(crate) fn engine(&self) -> &GraphStorageEngine {
+        // SAFETY: `self.engine` is non-null (always set from a live borrow in a
+        // constructor) and valid for `'a`, which outlives `&self`.  No `&mut`
+        // reborrow of the engine (see `engine_mut`) is live at the same time
+        // because execution is single-threaded and no operator retains an engine
+        // reference across a call into a sibling operator.
+        unsafe { &*self.engine }
+    }
+
+    /// Reborrow the engine as an exclusive reference for the duration of the call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the context was built with [`new`] (read-only) — converting a
+    /// would-be soundness bug (a `&mut` aliasing a `&`-only pointer) into a loud,
+    /// deterministic failure.
     ///
     /// # Safety
     ///
-    /// Dereferencing the returned pointer as `&mut GraphStorageEngine` is sound
-    /// only when no other live reference to the engine exists for the duration
-    /// of the borrow.  That invariant holds when:
-    ///
-    /// 1. The context was created with [`new_with_write`] from a `&mut` borrow,
-    ///    giving the context exclusive ownership of the engine pointer.
-    /// 2. Query execution is single-threaded — at most one write operator runs
-    ///    at any point, and no concurrent thread aliases the engine.
-    /// 3. The caller does not retain the derived `&mut` across any `.await` or
-    ///    other re-entrant call that could produce a second mutable reference.
-    ///
-    /// A context built with [`new`] (read-only) holds a `&`-derived pointer, so
-    /// callers must never derive a `&mut` from it.
-    pub(crate) fn engine_ptr_mut(&self) -> *mut GraphStorageEngine {
-        // The pointer is returned as-is; the `unsafe` obligation lives at the
-        // dereference site, documented above.
-        unsafe { *self.engine_ptr.get() }
+    /// Sound only when, for the duration of the returned reference: (1) the
+    /// context is `writable` (built with [`new_with_write`], giving exclusive
+    /// provenance); (2) no other reference to the engine — shared
+    /// ([`engine`](ExecutionContext::engine)) or exclusive — is live (execution
+    /// is single-threaded and operators never retain an engine reference across a
+    /// call into a child, so the read reborrow used to pull a child row is
+    /// dropped before this `&mut` is taken); and (3) the reborrow is not held
+    /// across a re-entrant call that could derive a second `&mut`.
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn engine_mut(&self) -> &mut GraphStorageEngine {
+        assert!(
+            self.writable,
+            "engine_mut called on a read-only ExecutionContext (built with `new`); \
+             write operators require `new_with_write`",
+        );
+        // SAFETY: guaranteed by the caller per the `# Safety` contract above.
+        unsafe { &mut *self.engine }
     }
 }
 
@@ -189,7 +224,7 @@ impl PhysicalOperator for AllNodesScanOp {
         if self.cursor.is_empty() {
             let start = crate::index::key::node_id_key(0);
             let end = crate::index::key::node_id_key(u128::MAX);
-            self.cursor = ctx.engine.node_index.range_search(&start, &end);
+            self.cursor = ctx.engine().node_index.range_search(&start, &end);
         }
         loop {
             if self.idx >= self.cursor.len() {
@@ -199,7 +234,7 @@ impl PhysicalOperator for AllNodesScanOp {
             self.idx += 1;
             let node_id =
                 u128::from_be_bytes(key.as_slice()[..16].try_into().unwrap_or([0u8; 16])) as u64;
-            match load_node_value(ctx.engine, node_id, ctx.fs)? {
+            match load_node_value(ctx.engine(), node_id, ctx.fs)? {
                 Some(node_val) => {
                     let mut row = empty_row();
                     row.insert(self.node_variable.clone(), node_val);
@@ -243,9 +278,9 @@ impl PhysicalOperator for NodeByLabelScanOp {
     fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>, ExecError> {
         if self.cursor.is_empty() {
             // Resolve label name → catalog id → storage u64 label id.
-            let label_id = ctx.engine.storage_label_id_for(&self.label).unwrap_or(0u64);
+            let label_id = ctx.engine().storage_label_id_for(&self.label).unwrap_or(0u64);
             let records = ctx
-                .engine
+                .engine()
                 .scan_nodes_by_label(label_id, ctx.fs)
                 .map_err(|e| ExecError::Eval(e.to_string()))?;
             self.cursor = records
@@ -260,7 +295,7 @@ impl PhysicalOperator for NodeByLabelScanOp {
             }
             let node_id = self.cursor[self.idx];
             self.idx += 1;
-            match load_node_value(ctx.engine, node_id, ctx.fs)? {
+            match load_node_value(ctx.engine(), node_id, ctx.fs)? {
                 Some(node_val) => {
                     let mut row = empty_row();
                     row.insert(self.node_variable.clone(), node_val);
@@ -325,12 +360,12 @@ impl PhysicalOperator for ExpandOp {
 
                 // Bind relationship variable.
                 if let Some(rv) = &self.rel_variable {
-                    row.insert(rv.clone(), edge_record_to_value(edge, ctx.engine, ctx.fs));
+                    row.insert(rv.clone(), edge_record_to_value(edge, ctx.engine(), ctx.fs));
                 }
 
                 // Bind end-node variable.
                 let end_var = self.end_node_variable.as_deref().unwrap_or("_end_node");
-                match load_node_value(ctx.engine, end_node_id, ctx.fs)? {
+                match load_node_value(ctx.engine(), end_node_id, ctx.fs)? {
                     Some(nv) => {
                         row.insert(end_var.to_string(), nv);
                     }
@@ -356,9 +391,9 @@ impl PhysicalOperator for ExpandOp {
                 .rel_types
                 .iter()
                 .filter_map(|t| {
-                    ctx.engine.storage_label_id_for(t).or_else(|| {
+                    ctx.engine().storage_label_id_for(t).or_else(|| {
                         // Try rel-type catalog (label and rel-type share namespace in storage).
-                        ctx.engine
+                        ctx.engine()
                             .catalog()
                             .read()
                             .ok()
@@ -371,20 +406,20 @@ impl PhysicalOperator for ExpandOp {
             // Traverse adjacency lists.
             let edges = match self.direction {
                 crate::cypher::ast::Direction::Outgoing => ctx
-                    .engine
+                    .engine()
                     .scan_outgoing_edges(start_node_id, &type_ids, ctx.fs)
                     .map_err(|e| ExecError::Eval(e.to_string()))?,
                 crate::cypher::ast::Direction::Incoming => ctx
-                    .engine
+                    .engine()
                     .scan_incoming_edges(start_node_id, &type_ids, ctx.fs)
                     .map_err(|e| ExecError::Eval(e.to_string()))?,
                 crate::cypher::ast::Direction::Both => {
                     let mut out = ctx
-                        .engine
+                        .engine()
                         .scan_outgoing_edges(start_node_id, &type_ids, ctx.fs)
                         .map_err(|e| ExecError::Eval(e.to_string()))?;
                     let inc = ctx
-                        .engine
+                        .engine()
                         .scan_incoming_edges(start_node_id, &type_ids, ctx.fs)
                         .map_err(|e| ExecError::Eval(e.to_string()))?;
                     out.extend(inc);
@@ -667,8 +702,8 @@ impl CreateOp {
 
         // SAFETY: we are the only caller deriving a `&mut` from the engine
         // pointer during this operator's next_row invocation, and execution is
-        // single-threaded. See ExecutionContext::engine_ptr_mut for invariants.
-        let engine = unsafe { &mut *ctx.engine_ptr_mut() };
+        // single-threaded. See ExecutionContext::engine_mut for invariants.
+        let engine = unsafe { ctx.engine_mut() };
 
         // We need a row eval context for property expression evaluation.
         let eval_ctx = row_to_eval_context(row, ctx);
@@ -970,20 +1005,20 @@ impl VarLenExpandOp {
             // Expand edges.
             let edges = match self.direction {
                 crate::cypher::ast::Direction::Outgoing => ctx
-                    .engine
+                    .engine()
                     .scan_outgoing_edges(node_id, type_ids, ctx.fs)
                     .map_err(|e| ExecError::Eval(e.to_string()))?,
                 crate::cypher::ast::Direction::Incoming => ctx
-                    .engine
+                    .engine()
                     .scan_incoming_edges(node_id, type_ids, ctx.fs)
                     .map_err(|e| ExecError::Eval(e.to_string()))?,
                 crate::cypher::ast::Direction::Both => {
                     let mut o = ctx
-                        .engine
+                        .engine()
                         .scan_outgoing_edges(node_id, type_ids, ctx.fs)
                         .map_err(|e| ExecError::Eval(e.to_string()))?;
                     let i = ctx
-                        .engine
+                        .engine()
                         .scan_incoming_edges(node_id, type_ids, ctx.fs)
                         .map_err(|e| ExecError::Eval(e.to_string()))?;
                     o.extend(i);
@@ -1017,7 +1052,7 @@ impl PhysicalOperator for VarLenExpandOp {
                 let mut row = base_row.clone();
 
                 if let Some(ev) = &self.end_node_variable
-                    && let Ok(Some(nv)) = load_node_value(ctx.engine, end_node_id, ctx.fs)
+                    && let Ok(Some(nv)) = load_node_value(ctx.engine(), end_node_id, ctx.fs)
                 {
                     row.insert(ev.clone(), nv);
                 }
@@ -1026,7 +1061,7 @@ impl PhysicalOperator for VarLenExpandOp {
                     // Bind the path as a list of relationship values.
                     let rels: Vec<Value> = path
                         .iter()
-                        .map(|e| edge_record_to_value(e, ctx.engine, ctx.fs))
+                        .map(|e| edge_record_to_value(e, ctx.engine(), ctx.fs))
                         .collect();
                     row.insert(rv.clone(), Value::List(rels));
                 }
@@ -1048,8 +1083,8 @@ impl PhysicalOperator for VarLenExpandOp {
                 .rel_types
                 .iter()
                 .filter_map(|t| {
-                    ctx.engine.storage_label_id_for(t).or_else(|| {
-                        ctx.engine
+                    ctx.engine().storage_label_id_for(t).or_else(|| {
+                        ctx.engine()
                             .catalog()
                             .read()
                             .ok()
@@ -1091,7 +1126,7 @@ impl PhysicalOperator for NodeByIdScanOp {
             return Ok(None);
         }
         self.emitted = true;
-        match load_node_value(ctx.engine, self.node_id, ctx.fs)? {
+        match load_node_value(ctx.engine(), self.node_id, ctx.fs)? {
             Some(nv) => {
                 let mut row = empty_row();
                 row.insert("_node".to_string(), nv);
@@ -1347,7 +1382,7 @@ impl PhysicalOperator for DeleteOp {
         while let Some(row) = self.input.next_row(ctx)? {
             let eval_ctx = row_to_eval_context(&row, ctx);
             // SAFETY: single-threaded execution; exclusive engine access.
-            let engine = unsafe { &mut *ctx.engine_ptr_mut() };
+            let engine = unsafe { ctx.engine_mut() };
             for expr in &self.expressions {
                 let val = evaluate(expr, &eval_ctx).map_err(|e| ExecError::Eval(e.to_string()))?;
                 match val {
@@ -1533,8 +1568,8 @@ fn apply_set_items_durable(
     }
 
     // SAFETY: single-threaded execution; the context holds the sole mutable
-    // engine borrow. See ExecutionContext::engine_ptr_mut for the invariants.
-    let engine = unsafe { &mut *ctx.engine_ptr_mut() };
+    // engine borrow. See ExecutionContext::engine_mut for the invariants.
+    let engine = unsafe { ctx.engine_mut() };
     for var in &mutated {
         match row.get(var) {
             Some(Value::Node(n)) => {
@@ -1666,13 +1701,13 @@ impl MergeOp {
         // the pattern is unlabelled.
         let records = match node.labels.first() {
             Some(label) => {
-                let label_id = ctx.engine.storage_label_id_for(label).unwrap_or(0u64);
-                ctx.engine
+                let label_id = ctx.engine().storage_label_id_for(label).unwrap_or(0u64);
+                ctx.engine()
                     .scan_nodes_by_label(label_id, ctx.fs)
                     .map_err(|e| ExecError::Eval(e.to_string()))?
             }
             None => ctx
-                .engine
+                .engine()
                 .scan_all_nodes(ctx.fs)
                 .map_err(|e| ExecError::Eval(e.to_string()))?,
         };
@@ -1681,7 +1716,7 @@ impl MergeOp {
             if record.flags & node_flags::DELETED != 0 {
                 continue;
             }
-            let Some(Value::Node(candidate)) = load_node_value(ctx.engine, record.node_id, ctx.fs)?
+            let Some(Value::Node(candidate)) = load_node_value(ctx.engine(), record.node_id, ctx.fs)?
             else {
                 continue;
             };
@@ -1748,8 +1783,8 @@ impl PhysicalOperator for MergeOp {
             // CREATE branch: build the node with its inline properties so they
             // are persisted, bind it, then apply ON CREATE.
             // SAFETY: single-threaded execution; the context holds the sole
-            // mutable engine borrow. See ExecutionContext::engine_ptr_mut.
-            let engine = unsafe { &mut *ctx.engine_ptr_mut() };
+            // mutable engine borrow. See ExecutionContext::engine_mut.
+            let engine = unsafe { ctx.engine_mut() };
             let label_id = node
                 .labels
                 .first()
@@ -2549,7 +2584,7 @@ mod tests {
             )],
         };
         let mut create = CreateOp::new(pattern, Some(input));
-        let ctx = mock_ctx();
+        let ctx = mock_ctx_write();
         let mut rows = 0;
         while let Some(row) = create.next_row(&ctx).unwrap() {
             assert!(row.contains_key("m"), "created variable must be bound");
@@ -2573,7 +2608,7 @@ mod tests {
             )],
         };
         let mut create = CreateOp::new(pattern, None);
-        let ctx = mock_ctx();
+        let ctx = mock_ctx_write();
         assert!(create.next_row(&ctx).unwrap().is_some());
         assert!(create.next_row(&ctx).unwrap().is_none());
     }
@@ -2607,6 +2642,21 @@ mod tests {
         }
     }
 
+    /// A writable context backed by a real (leaked) engine on a unique temp
+    /// path, for tests that drive a write operator (CREATE/SET/MERGE/DELETE).
+    fn mock_ctx_write() -> ExecutionContext<'static> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rgraph-mockw-{}-{n}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let fs = crate::io::posix::PosixFileSystem::new(false);
+        let engine = GraphStorageEngine::init(dir.join("data.db"), &fs).unwrap();
+        let fs_ref: &'static dyn FileSystem = Box::leak(Box::new(fs));
+        let engine_ref: &'static mut GraphStorageEngine = Box::leak(Box::new(engine));
+        ExecutionContext::new_with_write(engine_ref, fs_ref)
+    }
+
     fn mock_ctx() -> ExecutionContext<'static> {
         // A dummy context for tests that do not touch storage.
         // We create an empty engine on a temp path; it will never be used
@@ -2619,5 +2669,17 @@ mod tests {
         let fs_ref: &'static dyn FileSystem = Box::leak(Box::new(fs));
         let engine_ref: &'static GraphStorageEngine = Box::leak(Box::new(engine));
         ExecutionContext::new(engine_ref, fs_ref)
+    }
+
+    #[test]
+    #[should_panic(expected = "read-only ExecutionContext")]
+    fn engine_mut_on_read_only_ctx_panics() {
+        // Regression gate for finding M19 (2026-06-04): a read-only context must
+        // refuse a write reborrow (the `writable` guard) rather than silently
+        // producing a `&mut` that aliases a `&`-derived pointer.  The previous
+        // design only *documented* this invariant; nothing enforced it.
+        let ctx = mock_ctx(); // built with `new` => writable == false
+        // SAFETY: deliberately violating the precondition to assert the guard fires.
+        let _ = unsafe { ctx.engine_mut() };
     }
 }
