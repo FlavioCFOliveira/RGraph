@@ -397,7 +397,9 @@ impl PageManager {
         }
 
         // Direct path (no pool).
-        let handle = self.data_handle.as_ref().expect("data file not open");
+        let handle = self.data_handle.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "data file not open")
+        })?;
         let offset = page_id * PAGE_SIZE as u64;
         handle.read_at(buf, offset)?;
         if !crate::storage::page::SlottedPage::verify_checksum_bytes(buf) {
@@ -424,7 +426,9 @@ impl PageManager {
         if let Some(pool) = self.pool.upgrade() {
             // Ensure the file is large enough for this page before the pool
             // tries to read it (fix_page reads on miss).
-            let handle = self.data_handle.as_ref().expect("data file not open");
+            let handle = self.data_handle.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "data file not open")
+        })?;
             let required_len = page_id * PAGE_SIZE as u64 + PAGE_SIZE as u64;
             let current_len = handle.len()?;
             if current_len < required_len {
@@ -453,7 +457,9 @@ impl PageManager {
 
         // Direct path (no pool): update checksum and write synchronously.
         crate::storage::page::SlottedPage::update_checksum_bytes(buf);
-        let handle = self.data_handle.as_ref().expect("data file not open");
+        let handle = self.data_handle.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "data file not open")
+        })?;
         let offset = page_id * PAGE_SIZE as u64;
         let required_len = offset + PAGE_SIZE as u64;
         let current_len = handle.len()?;
@@ -505,7 +511,9 @@ impl PageManager {
     /// to the primary) is always unambiguous.
     pub fn sync_superblock(&mut self, _fs: &dyn FileSystem) -> io::Result<()> {
         let base = self.superblock.generation;
-        let handle = self.data_handle.as_ref().expect("data file not open");
+        let handle = self.data_handle.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "data file not open")
+        })?;
 
         // 1. Mirror at gen+1, made durable before the primary is touched.
         let mut mirror = self.superblock;
@@ -530,7 +538,9 @@ impl PageManager {
 
     /// Persist ALL bitmap pages to disk.
     pub fn sync_bitmaps(&mut self, _fs: &dyn FileSystem) -> io::Result<()> {
-        let handle = self.data_handle.as_ref().expect("data file not open");
+        let handle = self.data_handle.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "data file not open")
+        })?;
         for bitmap in &mut self.bitmaps {
             let page_id = bitmap.page.header().page_id;
             let buf = &mut bitmap.page.buf;
@@ -552,7 +562,9 @@ impl PageManager {
     /// This is a backward-compatibility alias for [`sync_bitmaps`] that
     /// writes only bitmap slot 0 (the common case for small databases).
     pub fn sync_bitmap(&mut self, _fs: &dyn FileSystem) -> io::Result<()> {
-        let handle = self.data_handle.as_ref().expect("data file not open");
+        let handle = self.data_handle.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "data file not open")
+        })?;
         let bitmap = &mut self.bitmaps[0];
         let page_id = bitmap.page.header().page_id;
         let buf = &mut bitmap.page.buf;
@@ -986,6 +998,34 @@ mod tests {
         assert_eq!(
             pm.superblock.free_page_count, free_now,
             "freeing superblock/bitmap pages must be a no-op"
+        );
+    }
+
+    /// Regression gate for finding M6 (Task 216, 2026-06-05): the storage hot
+    /// path must surface a missing data handle as an error, not panic.
+    #[test]
+    fn storage_ops_without_handle_error_instead_of_panicking() {
+        let (_dir, fs, path) = temp_fs();
+        let mut pm = PageManager::init(path, PAGE_SIZE as u32, &fs).unwrap();
+        // Simulate a closed / not-yet-opened data file.
+        pm.data_handle = None;
+
+        let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        assert!(
+            pm.read_page(&fs, FIRST_DATA_PAGE_ID, &mut buf).is_err(),
+            "read_page must error without a data handle"
+        );
+        assert!(
+            pm.write_page(&fs, FIRST_DATA_PAGE_ID, &mut buf).is_err(),
+            "write_page must error without a data handle"
+        );
+        assert!(
+            pm.sync_superblock(&fs).is_err(),
+            "sync_superblock must error without a data handle"
+        );
+        assert!(
+            pm.sync_bitmaps(&fs).is_err(),
+            "sync_bitmaps must error without a data handle"
         );
     }
 
