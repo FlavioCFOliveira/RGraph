@@ -103,7 +103,26 @@ A property store (PostgreSQL) never hits this because relationships are separate
 rows, not intrusive pointers. This makes "version the whole record" much larger
 and riskier than a header prepend.
 
-### Resolution options (needs a call)
+### DECISION (2026-06-05, user): **Version values only (option 1).**
+
+Concretely: the on-disk record still carries the whole `NodeRecord`/`EdgeRecord`
+behind a `VersionHeader`, but the two read modes are split:
+
+- **Value reads** (label / properties — `get_node`, scans, property walks) walk
+  the version chain and return the **snapshot-visible** version.
+- **Adjacency reads/writes** (scan_outgoing/incoming, edge splice on insert)
+  always use the **head (latest) version** in place — topology is effectively
+  single-version, so an edge insert mutates the head's adjacency without minting
+  a new version, and adjacency walks are never snapshot-filtered.
+- **Value UPDATE (SET)** mints a new head version (copying the head's topology,
+  carrying the new `first_property`), chains `next_version` to the old head, sets
+  the old head's `xmax`, and repoints the index to the new head.
+
+This closes 220's property UPDATE gate without re-architecting adjacency. (A
+follow-up can make topology MVCC-isolated — option 2 — if write-skew on adjacency
+ever needs catching.)
+
+### Resolution options (history)
 
 1. **Version only the value part; keep topology single-version.** Split each
    record into an immutable-topology part (adjacency pointers) that stays

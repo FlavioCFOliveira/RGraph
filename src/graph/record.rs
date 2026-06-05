@@ -75,6 +75,89 @@ impl SlotRef {
     }
 }
 
+/// On-disk MVCC version header (24 bytes) prepended to a versioned entity record.
+///
+/// A versioned record slot stores `[VersionHeader][entity record]`.  The
+/// secondary index points to the newest version (the head); `next_version` links
+/// head → … → oldest.  A value read walks from the head and returns the first
+/// version visible to its snapshot; adjacency always uses the head (topology is
+/// single-version — see docs/design/MVCC_VERSION_CHAINS.md, task 220).
+///
+/// ```text
+/// 0x00  xmin          u64       creating TxId (0 = bootstrap)
+/// 0x08  xmax          u64       deleting/superseding TxId (0 = live)
+/// 0x10  next_version  SlotRef   older version (NULL = oldest)
+/// 0x14  flags         u16       cached commit/abort hints (infomask)
+/// 0x16  _pad          u16
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub struct VersionHeader {
+    pub xmin: u64,
+    pub xmax: u64,
+    pub next_version: SlotRef,
+    pub flags: u16,
+    pub _pad: u16,
+}
+
+impl VersionHeader {
+    /// Size of the header in bytes (always 24).
+    pub const SIZE: usize = 24;
+
+    /// A live (undeleted) head version created by `xmin`, with no older version.
+    pub fn live(xmin: u64) -> Self {
+        Self {
+            xmin,
+            xmax: 0,
+            next_version: SlotRef::NULL,
+            flags: 0,
+            _pad: 0,
+        }
+    }
+
+    /// Whether this version has been deleted or superseded (`xmax` set).
+    pub fn is_deleted(&self) -> bool {
+        self.xmax != 0
+    }
+
+    /// Encode into a 24-byte slice.
+    pub fn encode(&self, out: &mut [u8]) {
+        assert_eq!(out.len(), Self::SIZE, "version header buffer must be 24 bytes");
+        // SAFETY: `VersionHeader` is `#[repr(C)]` and `out` is exactly 24 bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self as *const _ as *const u8,
+                out.as_mut_ptr(),
+                Self::SIZE,
+            );
+        }
+    }
+
+    /// Decode from the first 24 bytes of `bytes`.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::SIZE {
+            return None;
+        }
+        // SAFETY: length checked; `read_unaligned` tolerates alignment.
+        Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const VersionHeader) })
+    }
+}
+
+/// Build a versioned slot blob: `[VersionHeader][entity]`.
+pub fn encode_versioned(header: &VersionHeader, entity: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; VersionHeader::SIZE + entity.len()];
+    header.encode(&mut out[..VersionHeader::SIZE]);
+    out[VersionHeader::SIZE..].copy_from_slice(entity);
+    out
+}
+
+/// Split a versioned slot blob into `(header, entity_bytes)`, or `None` if it is
+/// shorter than a header.
+pub fn split_versioned(slot: &[u8]) -> Option<(VersionHeader, &[u8])> {
+    let header = VersionHeader::decode(slot)?;
+    Some((header, &slot[VersionHeader::SIZE..]))
+}
+
 /// Fixed-size node record (32 bytes).
 ///
 /// ```text
@@ -684,5 +767,57 @@ mod tests {
     #[test]
     fn edge_record_alignment_is_4() {
         assert_eq!(size_of::<EdgeRecord>() % 4, 0);
+    }
+
+    #[test]
+    fn version_header_size_is_24() {
+        assert_eq!(size_of::<VersionHeader>(), VersionHeader::SIZE);
+        assert_eq!(VersionHeader::SIZE, 24);
+    }
+
+    #[test]
+    fn version_header_encode_decode_roundtrip() {
+        let h = VersionHeader {
+            xmin: 0x1122_3344_5566_7788,
+            xmax: 0x99AA_BBCC_DDEE_FF00,
+            next_version: SlotRef::new(0x0ABCDE, 7),
+            flags: 0x1234,
+            _pad: 0,
+        };
+        let mut buf = [0u8; VersionHeader::SIZE];
+        h.encode(&mut buf);
+        assert_eq!(VersionHeader::decode(&buf), Some(h));
+    }
+
+    #[test]
+    fn version_header_live_defaults() {
+        let h = VersionHeader::live(42);
+        assert_eq!(h.xmin, 42);
+        assert_eq!(h.xmax, 0);
+        assert_eq!(h.next_version, SlotRef::NULL);
+        assert!(!h.is_deleted());
+        let mut deleted = h;
+        deleted.xmax = 100;
+        assert!(deleted.is_deleted());
+    }
+
+    #[test]
+    fn versioned_slot_split_roundtrip() {
+        let header = VersionHeader::live(7);
+        let entity = NodeRecord::new(99, 3);
+        let mut entity_bytes = [0u8; NodeRecord::SIZE];
+        entity.encode(&mut entity_bytes);
+
+        let blob = encode_versioned(&header, &entity_bytes);
+        assert_eq!(blob.len(), VersionHeader::SIZE + NodeRecord::SIZE);
+
+        let (decoded_header, decoded_entity) = split_versioned(&blob).unwrap();
+        assert_eq!(decoded_header, header);
+        let node = NodeRecord::decode(decoded_entity).unwrap();
+        assert_eq!(node.node_id, 99);
+        assert_eq!(node.label_id, 3);
+
+        // Too-short blobs are rejected.
+        assert!(split_versioned(&blob[..10]).is_none());
     }
 }
