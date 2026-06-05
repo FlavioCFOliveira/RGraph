@@ -500,8 +500,21 @@ impl GraphStorageEngine {
             }
 
             let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
-            if self.page_manager.read_page(fs, page_id, &mut buf).is_err() {
-                continue; // skip unreadable pages
+            if let Err(e) = self.page_manager.read_page(fs, page_id, &mut buf) {
+                // read_page already attempts repair from the double-write buffer.
+                // An allocated page that is still unreadable is genuine data loss
+                // (bit-rot with no redundant copy): fail the rebuild loudly with
+                // the offending page id rather than silently dropping its records
+                // from the secondary indexes (finding M5).
+                eprintln!(
+                    "rebuild_indexes: allocated page {page_id} is corrupt and unrepairable: {e}"
+                );
+                return Err(StorageError::from(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "index rebuild aborted: allocated page {page_id} is corrupt and could not be repaired: {e}"
+                    ),
+                )));
             }
             let page = SlottedPage::new(buf);
             let count = page.header().slot_count;

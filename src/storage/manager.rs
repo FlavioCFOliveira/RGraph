@@ -403,6 +403,19 @@ impl PageManager {
         let offset = page_id * PAGE_SIZE as u64;
         handle.read_at(buf, offset)?;
         if !crate::storage::page::SlottedPage::verify_checksum_bytes(buf) {
+            // Best-effort runtime bit-rot repair: if the doublewrite buffer still
+            // holds a checksum-valid image for this page (a write staged but not
+            // yet cleared), restore it in place and return the good data instead
+            // of erroring (finding M5).
+            if let Some(dw) = &self.doublewrite
+                && let Some(image) = dw.valid_image_for(page_id, fs)?
+            {
+                let len = image.len().min(PAGE_SIZE);
+                buf[..len].copy_from_slice(&image[..len]);
+                handle.write_at(buf, offset)?;
+                handle.sync_data()?;
+                return Ok(());
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("page {} checksum mismatch", page_id),
@@ -1168,6 +1181,59 @@ mod tests {
         assert!(
             pm.write_page(&fault, pid, &mut page2.buf).is_err(),
             "write_page must propagate a doublewrite clear() failure"
+        );
+    }
+
+    /// Regression gate for finding M5 (Task 215, 2026-06-05): a read that detects
+    /// a corrupt in-place page self-heals from a checksum-valid doublewrite image
+    /// when one is staged, returning the good data and repairing the page on disk.
+    #[test]
+    fn read_page_repairs_bit_rot_from_the_doublewrite_buffer() {
+        use crate::io::posix::PosixFileSystem;
+        use crate::storage::page::{PageType, SlottedPage};
+        use crate::wal::doublewrite::DoubleWriteBuffer;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let data_path = dir.path().join(PageManager::DATA_FILE);
+
+        let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32, &fs).unwrap();
+        let dw = Arc::new(DoubleWriteBuffer::open(dir.path().join("r.dw"), &fs).unwrap());
+        pm.set_doublewrite(dw.clone());
+
+        let pid = pm.allocate_page();
+        let mut page = SlottedPage::init(pid, PageType::SlottedData);
+        page.buf[SlottedPage::HEADER_SIZE] = 0x7E;
+        page.update_checksum();
+        pm.write_page(&fs, pid, &mut page.buf).unwrap();
+
+        // A good image is still staged in the DW (write staged but not cleared).
+        dw.write_batch(&[(pid, &page.buf[..])], &fs).unwrap();
+
+        // Corrupt the in-place page on disk.
+        let handle = fs.open(&data_path, false).unwrap();
+        let off = pid * PAGE_SIZE as u64 + SlottedPage::HEADER_SIZE as u64;
+        handle.write_at(&[0xFFu8; 16], off).unwrap();
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        // read_page self-heals from the DW image and returns the good data.
+        let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        pm.read_page(&fs, pid, &mut buf).unwrap();
+        assert_eq!(
+            buf[SlottedPage::HEADER_SIZE],
+            0x7E,
+            "read_page must repair bit-rot from the doublewrite image"
+        );
+
+        // The repair is persisted: the in-place page is now checksum-valid.
+        let handle = fs.open(&data_path, false).unwrap();
+        let mut raw = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut raw, pid * PAGE_SIZE as u64).unwrap();
+        assert!(
+            SlottedPage::verify_checksum_bytes(&raw),
+            "the in-place page must be repaired on disk"
         );
     }
 

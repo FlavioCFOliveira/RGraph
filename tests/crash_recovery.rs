@@ -465,6 +465,44 @@ fn create_relationship_survives_crash_atomically() {
 /// engine's `Drop`-flush), reopen, then more writes — asserting every committed
 /// node survives, `next_free_page_id` was reconciled, and no committed node is
 /// overwritten by a post-reopen allocation.
+/// Regression gate for finding M5 (Task 215, 2026-06-05): a corrupt, unrepairable
+/// allocated data page must make open fail loudly (the records are genuine data
+/// loss) rather than being silently dropped from the secondary indexes.
+#[test]
+fn corrupt_allocated_page_fails_open_loudly() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = PosixFileSystem::new(false);
+    let db_path = dir.path().join("db");
+
+    // Create a node and persist the bitmap/superblock so its page is in the
+    // allocated set on reopen.
+    {
+        let mut db = Database::init(&db_path, &fs, GraphMode::Lpg).unwrap();
+        db.create_node(NodeBuilder::new().label(5), &fs).unwrap();
+        db.sync(&fs).unwrap();
+    }
+
+    // Corrupt the first data page (where the node record lives).
+    let data_file = db_path.join(PageManager::DATA_FILE);
+    let handle = fs.open(&data_file, false).unwrap();
+    let off = 3 * PAGE_SIZE as u64 + SlottedPage::HEADER_SIZE as u64 + 4;
+    handle.write_at(&[0xFFu8; 8], off).unwrap();
+    handle.sync_data().unwrap();
+    drop(handle);
+
+    // Reopen must fail loudly: the corrupt allocated page is unrepairable (the
+    // doublewrite buffer was cleared after the write).  open() wraps the rebuild
+    // failure (M21), so assert on the surfaced message rather than the kind.
+    // (The corrupt page id is logged to stderr by rebuild_indexes; the returned
+    // error reports that the index rebuild was aborted.)
+    let err = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rebuild"),
+        "open must fail loudly on the corrupt allocated page, got: {msg}"
+    );
+}
+
 #[test]
 fn server_path_high_water_mark_reconciled_on_reopen() {
     use rgraph::graph::engine::GraphStorageEngine;

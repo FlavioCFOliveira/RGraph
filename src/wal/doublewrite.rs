@@ -172,6 +172,27 @@ impl DoubleWriteBuffer {
         Ok(())
     }
 
+    /// Return a checksum-valid page image for `page_id` if one is currently
+    /// staged in the doublewrite buffer.
+    ///
+    /// Used for best-effort runtime bit-rot repair: when a read detects a torn
+    /// or corrupt in-place page and the doublewrite buffer still holds a good
+    /// copy (a write that was staged but whose clear has not yet run), the read
+    /// path can restore it instead of erroring (finding M5).  The image is
+    /// returned only if it passes its own checksum.
+    pub fn valid_image_for(
+        &self,
+        page_id: u64,
+        fs: &dyn FileSystem,
+    ) -> io::Result<Option<Vec<u8>>> {
+        for (pid, image) in self.read_entries(fs)? {
+            if pid == page_id && verify_page_checksum(&image) {
+                return Ok(Some(image));
+            }
+        }
+        Ok(None)
+    }
+
     /// Read all `(page_id, image)` entries from the doublewrite file.
     ///
     /// Returns an empty [`Vec`] if the file is empty or malformed.
