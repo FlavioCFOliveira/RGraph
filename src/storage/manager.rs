@@ -20,6 +20,12 @@ pub const FIRST_BITMAP_PAGE_ID: PageId = 2;
 pub const FIRST_DATA_PAGE_ID: PageId = 3;
 /// Minimum file size: must contain primary SB, mirror SB, and one bitmap page.
 pub const MIN_FILE_SIZE: u64 = FIRST_DATA_PAGE_ID * PAGE_SIZE as u64;
+/// Highest page id whose byte offset (`page_id * PAGE_SIZE + PAGE_SIZE`) still
+/// fits in a `u64`.  Beyond this the address space is exhausted; the allocator
+/// returns a defined error rather than producing a wrapped, wild offset
+/// (finding L15).  At 8 KiB pages this is ~2^51 pages (16 EiB) — not reachable
+/// in practice, so it is a defense-in-depth backstop.
+pub const MAX_ADDRESSABLE_PAGE_ID: PageId = (u64::MAX / PAGE_SIZE as u64) - 1;
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
@@ -248,24 +254,54 @@ impl PageManager {
         }
     }
 
-    /// Allocate a new page id.
+    /// Byte offset of `page_id` in the data file, guarding the
+    /// `page_id * PAGE_SIZE` multiplication against `u64` overflow (finding L15).
+    ///
+    /// Returns the offset such that `[offset, offset + PAGE_SIZE)` is valid, or
+    /// an error if the page id is beyond the addressable range — so a too-large
+    /// id surfaces as a defined error instead of a wrapped, wild offset.
+    pub fn page_offset(page_id: PageId) -> io::Result<u64> {
+        page_id
+            .checked_mul(PAGE_SIZE as u64)
+            .filter(|off| off.checked_add(PAGE_SIZE as u64).is_some())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("page id {page_id} offset overflows the address space"),
+                )
+            })
+    }
+
+    /// Allocate a new page id, returning a defined error when the addressable
+    /// range is exhausted.
     ///
     /// Prioritises the free-list cache (which only ever holds data pages), then
     /// extends from `next_free_page_id`, **skipping** any physical page reserved
     /// for a region bitmap so a bitmap page is never handed out as data and a
-    /// data page never overwrites a bitmap (finding C7).
-    pub fn allocate_page(&mut self) -> PageId {
+    /// data page never overwrites a bitmap (finding C7).  If `next_free_page_id`
+    /// would exceed [`MAX_ADDRESSABLE_PAGE_ID`], the allocation fails with an
+    /// error rather than handing out a page whose byte offset would wrap
+    /// (finding L15).
+    pub fn try_allocate_page(&mut self) -> io::Result<PageId> {
         if let Some(pid) = self.free_cache.pop() {
             let bitmap_idx = (pid as usize) / PAGES_PER_BITMAP;
             if bitmap_idx < self.bitmaps.len() {
                 self.bitmaps[bitmap_idx].allocate(pid);
             }
             self.superblock.free_page_count = self.superblock.free_page_count.saturating_sub(1);
-            return pid;
+            return Ok(pid);
         }
 
         loop {
             let pid = self.superblock.next_free_page_id;
+            if pid > MAX_ADDRESSABLE_PAGE_ID {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!(
+                        "page allocation exceeded the addressable range (max page id {MAX_ADDRESSABLE_PAGE_ID})"
+                    ),
+                ));
+            }
             self.superblock.next_free_page_id += 1;
             self.superblock.total_page_count += 1;
 
@@ -281,8 +317,19 @@ impl PageManager {
             }
 
             self.bitmaps[slot].allocate(pid);
-            return pid;
+            return Ok(pid);
         }
+    }
+
+    /// Allocate a new page id (infallible convenience wrapper around
+    /// [`try_allocate_page`]).
+    ///
+    /// Panics only at the [`MAX_ADDRESSABLE_PAGE_ID`] backstop — a ~16 EiB
+    /// boundary that is not reachable in practice.  Call [`try_allocate_page`]
+    /// where graceful handling of capacity exhaustion is required.
+    pub fn allocate_page(&mut self) -> PageId {
+        self.try_allocate_page()
+            .expect("page allocation exceeded the addressable range")
     }
 
     /// Reconcile the in-memory allocation state against what is actually on
@@ -400,7 +447,7 @@ impl PageManager {
         let handle = self.data_handle.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "data file not open")
         })?;
-        let offset = page_id * PAGE_SIZE as u64;
+        let offset = Self::page_offset(page_id)?;
         handle.read_at(buf, offset)?;
         if !crate::storage::page::SlottedPage::verify_checksum_bytes(buf) {
             // Best-effort runtime bit-rot repair: if the doublewrite buffer still
@@ -473,7 +520,7 @@ impl PageManager {
         let handle = self.data_handle.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "data file not open")
         })?;
-        let offset = page_id * PAGE_SIZE as u64;
+        let offset = Self::page_offset(page_id)?;
         let required_len = offset + PAGE_SIZE as u64;
         let current_len = handle.len()?;
         if current_len < required_len {
@@ -565,7 +612,7 @@ impl PageManager {
             let page_id = bitmap.page.header().page_id;
             let buf = &mut bitmap.page.buf;
             crate::storage::page::SlottedPage::update_checksum_bytes(buf);
-            let offset = page_id * PAGE_SIZE as u64;
+            let offset = Self::page_offset(page_id)?;
             let required_len = offset + PAGE_SIZE as u64;
             let current_len = handle.len()?;
             if current_len < required_len {
@@ -589,7 +636,7 @@ impl PageManager {
         let page_id = bitmap.page.header().page_id;
         let buf = &mut bitmap.page.buf;
         crate::storage::page::SlottedPage::update_checksum_bytes(buf);
-        let offset = page_id * PAGE_SIZE as u64;
+        let offset = Self::page_offset(page_id)?;
         let required_len = offset + PAGE_SIZE as u64;
         let current_len = handle.len()?;
         if current_len < required_len {
@@ -1234,6 +1281,31 @@ mod tests {
         assert!(
             SlottedPage::verify_checksum_bytes(&raw),
             "the in-place page must be repaired on disk"
+        );
+    }
+
+    /// Regression gate for finding L15 (Task 219, 2026-06-05): allocation past
+    /// the addressable range returns a defined error, and offset computation
+    /// surfaces overflow instead of producing a wild, wrapped offset.
+    #[test]
+    fn allocation_at_the_capacity_boundary_returns_a_defined_error() {
+        let (_dir, fs, path) = temp_fs();
+        let mut pm = PageManager::init(path, PAGE_SIZE as u32, &fs).unwrap();
+
+        // Drive the allocator to the addressable ceiling without real allocations.
+        pm.superblock.next_free_page_id = MAX_ADDRESSABLE_PAGE_ID + 1;
+        let err = pm.try_allocate_page().unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::OutOfMemory,
+            "allocation past the addressable range must return a defined error"
+        );
+
+        // Offset computation surfaces overflow instead of a wrapped offset.
+        assert!(PageManager::page_offset(MAX_ADDRESSABLE_PAGE_ID + 1).is_err());
+        assert_eq!(
+            PageManager::page_offset(FIRST_DATA_PAGE_ID).unwrap(),
+            FIRST_DATA_PAGE_ID * PAGE_SIZE as u64
         );
     }
 
