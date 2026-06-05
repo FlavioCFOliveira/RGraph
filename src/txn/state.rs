@@ -24,10 +24,10 @@ use crate::txn::{
     snapshot::Snapshot,
     txid::{TxId, TxIdAllocator, TX_ID_INVALID},
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
 
 /// Global transaction state, shared across all active transactions.
@@ -40,6 +40,11 @@ pub struct GlobalTxState {
     global_xmax: AtomicU64,
     /// Protected state: the set of active TxIds and the TxId allocator.
     inner: Mutex<Inner>,
+    /// Shared commit/abort log: TxIds that aborted.  Consulted by snapshot
+    /// visibility so a tuple created by an aborted transaction stays invisible
+    /// even after `global_xmin` advances past it (finding M14).  Grows until a
+    /// future vacuum can forget entries whose versions are all gone.
+    aborted: Arc<Mutex<HashSet<TxId>>>,
 }
 
 struct Inner {
@@ -61,6 +66,7 @@ impl GlobalTxState {
                 active: BTreeSet::new(),
                 allocator,
             }),
+            aborted: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -76,6 +82,7 @@ impl GlobalTxState {
                 active: BTreeSet::new(),
                 allocator,
             }),
+            aborted: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -125,7 +132,8 @@ impl GlobalTxState {
 
         drop(guard);
 
-        let snapshot = Snapshot::new(xmin, xmax, active_snapshot, txid);
+        let snapshot =
+            Snapshot::new(xmin, xmax, active_snapshot, txid).with_aborted(Arc::clone(&self.aborted));
         (txid, snapshot)
     }
 
@@ -138,7 +146,14 @@ impl GlobalTxState {
     }
 
     /// Mark a transaction as aborted and remove it from the active set.
+    ///
+    /// The TxId is recorded in the abort log so its versions stay invisible to
+    /// every snapshot, even after `global_xmin` advances past it (finding M14).
     pub fn abort_tx(&self, txid: TxId) {
+        self.aborted
+            .lock()
+            .expect("INVARIANT: abort log mutex must not be poisoned")
+            .insert(txid);
         self.remove_active(txid);
     }
 
@@ -207,7 +222,7 @@ impl GlobalTxState {
 
         drop(guard);
 
-        Snapshot::new(xmin, xmax, active, TX_ID_INVALID)
+        Snapshot::new(xmin, xmax, active, TX_ID_INVALID).with_aborted(Arc::clone(&self.aborted))
     }
 
     /// Return the current global xmin (read from the atomic — no lock needed).
@@ -249,6 +264,42 @@ mod tests {
         let snap = state.active_snapshot();
         // Fresh state should have no active transactions.
         assert!(!snap.is_active(TX_ID_BOOTSTRAP));
+    }
+
+    /// Regression gate for finding M14 (Task 225, 2026-06-05): a tuple created by
+    /// an aborted transaction must be invisible to later snapshots even after
+    /// global_xmin advances past the aborted TxId, while a committed creator
+    /// below xmin stays visible.
+    #[test]
+    fn aborted_creator_is_invisible_after_xmin_advances() {
+        use crate::txn::txid::TX_ID_INVALID;
+
+        let state = GlobalTxState::new();
+        let (t1, _) = state.begin_tx();
+        let (t2, _) = state.begin_tx();
+        let (_t3, _) = state.begin_tx();
+
+        // t2 commits, t1 aborts; the lowest remaining active txn is t3.
+        state.commit_tx(t2);
+        state.abort_tx(t1);
+
+        // A later snapshot has xmin = t3, so both t1 and t2 are below xmin.
+        let (_t4, s4) = state.begin_tx();
+        assert!(
+            t1 < s4.xmin && t2 < s4.xmin,
+            "xmin must have advanced past both finished txns"
+        );
+
+        // The aborted creator t1 is invisible despite being below xmin.
+        assert!(
+            !s4.is_visible(t1, TX_ID_INVALID, false, false),
+            "a tuple created by an aborted txn must be invisible even below xmin"
+        );
+        // The committed creator t2 (below xmin, not in the abort log) is visible.
+        assert!(
+            s4.is_visible(t2, TX_ID_INVALID, false, false),
+            "a committed creator below xmin must remain visible"
+        );
     }
 
     #[test]

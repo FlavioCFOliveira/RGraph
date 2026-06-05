@@ -26,6 +26,8 @@
 //!    snapshot time (in the active list).
 
 use crate::txn::txid::{TxId, TX_ID_INVALID};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 /// A point-in-time snapshot of the global transaction state.
 ///
@@ -46,6 +48,14 @@ pub struct Snapshot {
     /// The TxId of the transaction that owns this snapshot, used to allow
     /// self-modification visibility (a transaction sees its own writes).
     pub owner_txid: TxId,
+    /// Shared registry of aborted TxIds (the commit/abort log).
+    ///
+    /// `None` for bare snapshots constructed in isolation (tests).  When present
+    /// (snapshots minted by [`GlobalTxState`]), a tuple created by an aborted
+    /// transaction is invisible even once `global_xmin` has advanced past it —
+    /// without this, an aborted creator below `xmin` was wrongly treated as
+    /// committed (finding M14).
+    aborted: Option<Arc<Mutex<HashSet<TxId>>>>,
 }
 
 impl Snapshot {
@@ -62,7 +72,22 @@ impl Snapshot {
             xmax,
             active,
             owner_txid,
+            aborted: None,
         }
+    }
+
+    /// Attach a shared aborted-TxId registry so visibility can distinguish a
+    /// committed creator from an aborted one (finding M14).
+    pub fn with_aborted(mut self, aborted: Arc<Mutex<HashSet<TxId>>>) -> Self {
+        self.aborted = Some(aborted);
+        self
+    }
+
+    /// Whether `txid` is recorded as aborted in the attached registry.
+    fn is_aborted(&self, txid: TxId) -> bool {
+        self.aborted
+            .as_ref()
+            .is_some_and(|a| a.lock().expect("aborted registry mutex poisoned").contains(&txid))
     }
 
     /// Returns `true` if `txid` was active (uncommitted) at snapshot time.
@@ -133,6 +158,13 @@ impl Snapshot {
     /// the xmin/xmax/active rules.
     fn txid_committed_before_snapshot(&self, txid: TxId, committed_hint: bool) -> bool {
         if txid == TX_ID_INVALID {
+            return false;
+        }
+
+        // An aborted transaction never committed — its changes are invisible no
+        // matter how far global_xmin has advanced past it (finding M14).  Checked
+        // before every other rule, including the infomask hint.
+        if self.is_aborted(txid) {
             return false;
         }
 
