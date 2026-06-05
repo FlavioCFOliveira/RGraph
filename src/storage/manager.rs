@@ -477,9 +477,16 @@ impl PageManager {
         handle.write_at(buf, offset)?;
         handle.sync_data()?;
 
-        // Clear the DW buffer after the in-place write succeeded.
+        // Clear the DW buffer after the in-place write succeeded, and PROPAGATE
+        // a clear failure (finding M7).  The previous `let _ = dw.clear(fs)`
+        // swallowed the error, so a failed clear reported success while leaving a
+        // stale page image in the doublewrite buffer.  recover_torn_pages only
+        // reinstates a DW image over a *torn* in-place page, so a newer good page
+        // is safe — but surfacing the failure lets the caller retry instead of
+        // silently shipping a buffer that may later be replayed over an
+        // unrelated torn write.
         if let Some(dw) = &self.doublewrite {
-            let _ = dw.clear(fs);
+            dw.clear(fs)?;
         }
 
         Ok(())
@@ -1026,6 +1033,141 @@ mod tests {
         assert!(
             pm.sync_bitmaps(&fs).is_err(),
             "sync_bitmaps must error without a data handle"
+        );
+    }
+
+    /// Regression gate for finding M7 (Task 217, 2026-06-05): a stale image left
+    /// in the doublewrite buffer by a failed clear() must NOT be reinstated over
+    /// a newer, valid in-place page during recovery.
+    #[test]
+    fn stale_doublewrite_image_does_not_overwrite_a_newer_good_page() {
+        use crate::io::posix::PosixFileSystem;
+        use crate::storage::page::{PageType, SlottedPage};
+        use crate::wal::doublewrite::DoubleWriteBuffer;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let data_path = dir.path().join(PageManager::DATA_FILE);
+        let dw_path = dir.path().join("stale.dw");
+
+        let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32, &fs).unwrap();
+        pm.sync_superblock(&fs).unwrap();
+        pm.sync_bitmap(&fs).unwrap();
+        let dw = Arc::new(DoubleWriteBuffer::open(dw_path, &fs).unwrap());
+        pm.set_doublewrite(dw.clone());
+
+        let pid = pm.allocate_page();
+
+        // Write old content v1, then new content v2 (each staged + cleared).
+        let mut v1 = SlottedPage::init(pid, PageType::SlottedData);
+        v1.buf[SlottedPage::HEADER_SIZE] = 0x11;
+        v1.update_checksum();
+        pm.write_page(&fs, pid, &mut v1.buf).unwrap();
+
+        let mut v2 = SlottedPage::init(pid, PageType::SlottedData);
+        v2.buf[SlottedPage::HEADER_SIZE] = 0x22;
+        v2.update_checksum();
+        pm.write_page(&fs, pid, &mut v2.buf).unwrap();
+
+        // Simulate a clear() that failed after the v1 write: a stale v1 image
+        // lingers in the doublewrite buffer while the in-place page is the newer,
+        // valid v2.
+        let stale: Vec<(u64, &[u8])> = vec![(pid, &v1.buf[..])];
+        dw.write_batch(&stale, &fs).unwrap();
+
+        // Recovery must not reinstate the stale v1 over the valid v2.
+        let restored = pm.recover_torn_pages(&fs).unwrap();
+        assert_eq!(
+            restored, 0,
+            "a valid newer page must not be restored from a stale doublewrite image"
+        );
+        let mut check = AlignedBuffer::zeroed(PAGE_SIZE);
+        pm.read_page(&fs, pid, &mut check).unwrap();
+        assert_eq!(
+            check[SlottedPage::HEADER_SIZE],
+            0x22,
+            "the newer page must survive recovery intact"
+        );
+    }
+
+    /// Finding M7: `clear()` must surface an fsync failure so the `?` in
+    /// `write_page` propagates it instead of silently shipping a stale buffer.
+    #[test]
+    fn doublewrite_clear_surfaces_an_fsync_failure() {
+        use crate::io::fault::{FaultConfig, FaultInjectFileSystem, FaultKind, FaultRule, OpMask};
+        use crate::io::posix::PosixFileSystem;
+        use crate::wal::doublewrite::DoubleWriteBuffer;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fault = FaultInjectFileSystem::new(Box::new(PosixFileSystem::new(false)));
+        let dw = DoubleWriteBuffer::open(dir.path().join("c.dw"), &fault).unwrap();
+
+        // Stage an entry with faults off.
+        let img = vec![0u8; PAGE_SIZE];
+        dw.write_batch(&[(3u64, &img[..])], &fault).unwrap();
+
+        // Now fail every fsync and assert clear() surfaces it.
+        fault.set_config(FaultConfig {
+            rules: vec![FaultRule {
+                op_mask: OpMask {
+                    sync_data: true,
+                    ..OpMask::default()
+                },
+                kind: FaultKind::FsyncFail,
+                every_n: None,
+            }],
+        });
+        assert!(
+            dw.clear(&fault).is_err(),
+            "clear() must surface an fsync failure"
+        );
+    }
+
+    /// Finding M7: write_page must propagate (not swallow) a doublewrite clear()
+    /// failure.  On a fresh fault FS the only counted ops are the DW ones (the
+    /// in-place write uses the base data handle): write_batch's write_at(0),
+    /// set_len(1), sync_data(2); clear's set_len(3), sync_data(4).  `every_n=4`
+    /// on sync_data therefore fails ONLY the clear's fsync.
+    #[test]
+    fn write_page_propagates_a_doublewrite_clear_failure() {
+        use crate::io::fault::{FaultConfig, FaultInjectFileSystem, FaultKind, FaultRule, OpMask};
+        use crate::io::posix::PosixFileSystem;
+        use crate::storage::page::{PageType, SlottedPage};
+        use crate::wal::doublewrite::DoubleWriteBuffer;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = PosixFileSystem::new(false);
+        let data_path = dir.path().join(PageManager::DATA_FILE);
+
+        let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32, &base).unwrap();
+        let dw = Arc::new(DoubleWriteBuffer::open(dir.path().join("p.dw"), &base).unwrap());
+        pm.set_doublewrite(dw);
+        let pid = pm.allocate_page();
+
+        // Pre-size the data file with the plain FS so the faulted write does not grow it.
+        let mut page = SlottedPage::init(pid, PageType::SlottedData);
+        page.update_checksum();
+        pm.write_page(&base, pid, &mut page.buf).unwrap();
+
+        let fault = FaultInjectFileSystem::new(Box::new(PosixFileSystem::new(false)));
+        fault.set_config(FaultConfig {
+            rules: vec![FaultRule {
+                op_mask: OpMask {
+                    sync_data: true,
+                    ..OpMask::default()
+                },
+                kind: FaultKind::FsyncFail,
+                every_n: Some(4),
+            }],
+        });
+        let mut page2 = SlottedPage::init(pid, PageType::SlottedData);
+        page2.buf[SlottedPage::HEADER_SIZE] = 0x33;
+        page2.update_checksum();
+        assert!(
+            pm.write_page(&fault, pid, &mut page2.buf).is_err(),
+            "write_page must propagate a doublewrite clear() failure"
         );
     }
 
