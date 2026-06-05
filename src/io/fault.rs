@@ -47,6 +47,8 @@ pub struct OpMask {
     pub sync_all: bool,
     pub sync_data: bool,
     pub set_len: bool,
+    /// Directory `fsync` (e.g. the durability barrier after an atomic rename).
+    pub sync_dir: bool,
 }
 
 /// A fault-injecting `FileSystem` implementation.
@@ -88,6 +90,7 @@ fn matches_op(op: OpMask, mask: OpMask) -> bool {
         || (op.sync_all && mask.sync_all)
         || (op.sync_data && mask.sync_data)
         || (op.set_len && mask.set_len)
+        || (op.sync_dir && mask.sync_dir)
 }
 
 impl FileSystem for FaultInjectFileSystem {
@@ -119,6 +122,42 @@ impl FileSystem for FaultInjectFileSystem {
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         self.inner.create_dir_all(path)
+    }
+
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        // Directory fsync is a `FileSystem`-level operation (the default impl
+        // opens the directory directly), so it cannot be faulted via a file
+        // handle.  Apply the rule set here against the shared op counter so a
+        // test can inject a failure on the post-rename durability barrier.
+        let n = self.op_counter.fetch_add(1, Ordering::Relaxed);
+        let kind = {
+            let cfg = self.config.lock().unwrap();
+            let op = OpMask {
+                sync_dir: true,
+                ..OpMask::default()
+            };
+            cfg.rules.iter().find_map(|rule| {
+                if !matches_op(op, rule.op_mask) {
+                    return None;
+                }
+                if let Some(every) = rule.every_n
+                    && !n.is_multiple_of(every)
+                {
+                    return None;
+                }
+                Some(rule.kind)
+            })
+        };
+        match kind {
+            Some(FaultKind::FsyncFail) | Some(FaultKind::Eio) => {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            Some(FaultKind::Delay { delay_ms }) => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            _ => {}
+        }
+        self.inner.sync_dir(dir)
     }
 }
 

@@ -275,8 +275,23 @@ impl Catalog {
     ///
     /// Propagates any I/O failure from the underlying file system.
     pub fn persist(&self, path: &Path, fs: &dyn FileSystem) -> io::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+
         let framed = self.frame();
-        let tmp_path = path.with_extension("catalog.tmp");
+
+        // Unique temp name in the same directory: the rename stays atomic (same
+        // filesystem) and two concurrent persists never share — and thus never
+        // corrupt — one another's temp file (finding M3).  pid distinguishes
+        // processes; the monotonic nonce distinguishes calls within a process.
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "catalog".to_string());
+        let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = dir.join(format!(".{file_name}.{}.{nonce}.tmp", std::process::id()));
+
         {
             let handle = fs.open(&tmp_path, true)?;
             handle.set_len(0)?;
@@ -284,6 +299,12 @@ impl Catalog {
             handle.sync_all()?;
         }
         fs.rename(&tmp_path, path)?;
+
+        // POSIX: the new directory entry created by the rename is only durable
+        // after the parent directory itself is fsync'd.  Without this, a crash
+        // after the rename can lose the catalog entirely — labelled MATCH then
+        // returns zero rows (finding M3).
+        fs.sync_dir(dir)?;
         Ok(())
     }
 
@@ -541,6 +562,91 @@ mod tests {
         let path = dir.path().join("does-not-exist.catalog");
         let fs = PosixFileSystem::new(false);
         assert!(Catalog::load(&path, &fs).unwrap().is_none());
+    }
+
+    #[test]
+    fn persist_surfaces_directory_fsync_failure() {
+        // Regression gate for finding M3 (2026-06-05): persist must fsync the
+        // parent directory after the atomic rename and surface that failure,
+        // so a crash after rename cannot silently lose the catalog.
+        use crate::io::fault::{FaultConfig, FaultInjectFileSystem, FaultKind, FaultRule, OpMask};
+        use crate::io::posix::PosixFileSystem;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rgraph.db.catalog");
+        let fs = FaultInjectFileSystem::new(Box::new(PosixFileSystem::new(false)));
+
+        let mut c = Catalog::new();
+        c.get_or_create_label("Person");
+
+        // Fail ONLY the directory fsync (the temp file's own sync_all is untouched).
+        fs.set_config(FaultConfig {
+            rules: vec![FaultRule {
+                op_mask: OpMask {
+                    sync_dir: true,
+                    ..OpMask::default()
+                },
+                kind: FaultKind::FsyncFail,
+                every_n: None,
+            }],
+        });
+        assert!(
+            c.persist(&path, &fs).is_err(),
+            "a directory fsync failure must be surfaced, not swallowed"
+        );
+
+        // With faults cleared, persist succeeds and the catalog is durable.
+        fs.set_config(FaultConfig::default());
+        c.persist(&path, &fs).unwrap();
+        assert!(Catalog::load(&path, &fs).unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_persist_never_clobbers_the_live_catalog() {
+        // Regression gate for finding M3 (2026-06-05): a persist that fails
+        // before the rename must leave the existing catalog intact (atomic
+        // rename) and must not reuse the old fixed temp name.
+        use crate::io::fault::{FaultConfig, FaultInjectFileSystem, FaultKind, FaultRule, OpMask};
+        use crate::io::posix::PosixFileSystem;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rgraph.db.catalog");
+        let fs = FaultInjectFileSystem::new(Box::new(PosixFileSystem::new(false)));
+
+        // A good catalog is persisted first.
+        let mut good = Catalog::new();
+        let person = good.get_or_create_label("Person");
+        good.persist(&path, &fs).unwrap();
+
+        // A second persist whose temp write fails before the rename.
+        fs.set_config(FaultConfig {
+            rules: vec![FaultRule {
+                op_mask: OpMask {
+                    write: true,
+                    ..OpMask::default()
+                },
+                kind: FaultKind::Eio,
+                every_n: None,
+            }],
+        });
+        let mut other = Catalog::new();
+        other.get_or_create_label("Movie");
+        assert!(other.persist(&path, &fs).is_err());
+
+        // The original catalog must still be intact (never clobbered).
+        fs.set_config(FaultConfig::default());
+        let loaded = Catalog::load(&path, &fs).unwrap().unwrap();
+        assert_eq!(loaded.label_id("Person"), Some(person));
+        assert!(
+            loaded.label_id("Movie").is_none(),
+            "a failed persist must not leak into the live catalog"
+        );
+
+        // The old fixed temp name must never be used.
+        assert!(
+            !fs.exists(&path.with_extension("catalog.tmp")),
+            "persist must use a unique temp name, not the fixed *.catalog.tmp"
+        );
     }
 
     #[test]
