@@ -539,29 +539,23 @@ impl BufferPool {
             return Ok(());
         }
 
-        // Issue a single vectored read into the reserved buffers, all held
-        // under their respective io_mutexes for the duration of the read.
-        let offset = start_page * PAGE_SIZE as u64;
+        // Read each reserved page at ITS OWN offset.  A single contiguous
+        // vectored read from `start_page` would be incorrect: resident pages in
+        // the range are skipped (not reserved), so the reserved frames are not
+        // contiguous on disk — a contiguous read would fill a frame with a
+        // neighbouring page's bytes, which would then be published under the
+        // wrong page id (cache poisoning — finding H9).
         let handle = fs.open(&self.data_path, false)?;
-        {
-            // Collect io_mutex guards so no background flush can touch these
-            // buffers while the vectored read is in flight.
-            let guards: Vec<_> = frames_to_fill
-                .iter()
-                .map(|(fid, _)| self.frame(*fid).io_mutex.lock())
-                .collect();
-
-            let mut bufs: Vec<&mut [u8]> = Vec::with_capacity(frames_to_fill.len());
-            for (fid, _) in &frames_to_fill {
-                let frame = self.frame(*fid);
-                // SAFETY: this frame's io_mutex is held in `guards`, and it has
-                // not been published to the shard map yet, so no other thread
-                // can reach these bytes.
-                let buf = unsafe { frame.buf.get_mut() };
-                bufs.push(&mut buf[..]);
-            }
-            handle.readv_at(&mut bufs, offset)?;
-            drop(guards);
+        for (fid, page_id) in &frames_to_fill {
+            let frame = self.frame(*fid);
+            // Hold this frame's io_mutex for the read so no background flush can
+            // touch the buffer while the read is in flight.
+            let _io_guard = frame.io_mutex.lock();
+            // SAFETY: the io_mutex is held and the frame has not been published to
+            // the shard map yet, so no other thread can reach these bytes.
+            let buf = unsafe { frame.buf.get_mut() };
+            let page_offset = *page_id * PAGE_SIZE as u64;
+            handle.read_at(&mut buf[..], page_offset)?;
         }
 
         // Verify checksums and publish each frame.
@@ -571,10 +565,19 @@ impl BufferPool {
             let valid = {
                 let _io_guard = frame.io_mutex.lock();
                 let bytes = unsafe { frame.buf.get() };
+                // Defence-in-depth (finding H9): a valid checksum alone is not
+                // enough — verify the page's own header id matches the id we
+                // intended to load, so a mis-read or wrong on-disk page can never
+                // be published under the wrong key.  page_id lives at bytes
+                // [8..16] of the page header (see `PageHeader`).
                 crate::storage::page::SlottedPage::verify_checksum_bytes(bytes)
+                    && u64::from_ne_bytes([
+                        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                        bytes[15],
+                    ]) == *page_id
             };
             if !valid {
-                // Corrupt page: discard the frame, do not publish it.
+                // Corrupt, unwritten, or wrong page: discard, do not publish.
                 frame.desc.reset();
                 continue;
             }
@@ -927,6 +930,34 @@ mod tests {
         drop(handle);
         let pool = BufferPool::new(frames, path);
         (dir, fs, pool)
+    }
+
+    #[test]
+    fn prefetch_does_not_poison_cache_with_neighbouring_pages() {
+        // Regression gate for finding H9 (2026-06-04): when an interior page in
+        // the prefetch range is already resident, the remaining pages must still
+        // be loaded with their OWN bytes — never a neighbour's, published under
+        // the wrong id.  `temp_pool` initialises each page with its own page_id,
+        // so a poisoned frame would carry the wrong header id.
+        let (_dir, fs, pool) = temp_pool(8);
+
+        // Make page 11 resident so prefetch_range skips it (the trigger).
+        let _g11 = pool.fix_page(&fs, 11).unwrap();
+
+        // Prefetch 10..=13; with the bug, page 12's frame would receive page 11's
+        // bytes (a contiguous read past the skipped page).
+        pool.prefetch_range(&fs, 10, 4).unwrap();
+
+        // Page 12 must carry its own header id, not page 11's.
+        let g12 = pool.fix_page(&fs, 12).unwrap();
+        let b = g12.buf();
+        let hdr_page_id = u64::from_ne_bytes([
+            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+        ]);
+        assert_eq!(
+            hdr_page_id, 12,
+            "prefetched page 12 must contain page 12, not a neighbouring page"
+        );
     }
 
     #[test]
