@@ -359,9 +359,15 @@ impl PageManager {
             return;
         }
         let bitmap_idx = (page_id as usize) / PAGES_PER_BITMAP;
-        if bitmap_idx < self.bitmaps.len() {
-            self.bitmaps[bitmap_idx].free(page_id);
+        // The bitmap is authoritative: only free a page that is currently
+        // allocated.  A double-free (bit already clear) or a page beyond the
+        // known bitmap chain is an idempotent no-op (finding M4) — otherwise the
+        // same id would be pushed onto free_cache twice and handed to two
+        // callers, and free_page_count would be double-incremented.
+        if bitmap_idx >= self.bitmaps.len() || !self.bitmaps[bitmap_idx].is_set(page_id) {
+            return;
         }
+        self.bitmaps[bitmap_idx].free(page_id);
         self.free_cache.push(page_id);
         self.superblock.free_page_count += 1;
 
@@ -943,6 +949,44 @@ mod tests {
         let recovered2 = load_superblock(&fs, &path).unwrap();
         assert_eq!(recovered2.next_free_page_id, 999);
         assert!(recovered2.verify_checksum());
+    }
+
+    /// Regression gate for finding M4 (Task 214, 2026-06-05): freeing the same
+    /// page twice must be idempotent — it must not double-count free_page_count
+    /// nor let two later allocations return the same page id.
+    #[test]
+    fn free_page_is_idempotent() {
+        let (_dir, fs, path) = temp_fs();
+        let mut pm = PageManager::init(path, PAGE_SIZE as u32, &fs).unwrap();
+
+        let p = pm.allocate_page();
+        let before = pm.superblock.free_page_count;
+
+        pm.free_page(p);
+        let after_one = pm.superblock.free_page_count;
+        assert_eq!(after_one, before + 1, "one free must count exactly once");
+
+        // The second free of the same id is a no-op.
+        pm.free_page(p);
+        assert_eq!(
+            pm.superblock.free_page_count, after_one,
+            "a double-free must not double-count free_page_count"
+        );
+
+        // Two allocations must never return the same id.
+        let a = pm.allocate_page();
+        let b = pm.allocate_page();
+        assert_ne!(a, b, "a double-free must not yield a duplicate allocation");
+        assert!(a == p || b == p, "the freed page must be reused exactly once");
+
+        // Freeing a metadata page is also a guarded no-op.
+        let free_now = pm.superblock.free_page_count;
+        pm.free_page(0);
+        pm.free_page(FIRST_BITMAP_PAGE_ID);
+        assert_eq!(
+            pm.superblock.free_page_count, free_now,
+            "freeing superblock/bitmap pages must be a no-op"
+        );
     }
 
     #[test]
