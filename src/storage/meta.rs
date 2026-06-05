@@ -41,8 +41,13 @@ pub struct Superblock {
     pub generation: u64,
     /// CRC32C of everything above, computed with `checksum` = 0.
     pub checksum: u32,
+    /// Persisted graph data model: `0` = unspecified (legacy databases created
+    /// before this field existed), `1` = LPG, `2` = RDF.  Validated on open so a
+    /// database created under one model can never be silently reopened under the
+    /// other (finding M2).  Covered by `checksum`.
+    pub graph_mode: u8,
     /// Reserved padding to keep the struct at 128 bytes.
-    pub _reserved: [u8; 52],
+    pub _reserved: [u8; 51],
 }
 
 impl Superblock {
@@ -59,7 +64,8 @@ impl Superblock {
             checkpoint_dirty_page_table_offset: 0,
             generation: 1,
             checksum: 0,
-            _reserved: [0; 52],
+            graph_mode: 0,
+            _reserved: [0; 51],
         }
     }
 

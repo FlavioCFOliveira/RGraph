@@ -22,6 +22,27 @@ pub enum GraphMode {
 }
 
 
+impl GraphMode {
+    /// Stable numeric code persisted in the superblock.  `0` is reserved for
+    /// "unspecified" (legacy databases written before the mode was stored).
+    pub fn to_superblock_code(self) -> u8 {
+        match self {
+            GraphMode::Lpg => 1,
+            GraphMode::Rdf => 2,
+        }
+    }
+
+    /// Decode a superblock graph-mode code, returning `None` for `0`
+    /// (unspecified) or any unrecognised value.
+    pub fn from_superblock_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(GraphMode::Lpg),
+            2 => Some(GraphMode::Rdf),
+            _ => None,
+        }
+    }
+}
+
 impl std::str::FromStr for GraphMode {
     type Err = RGraphError;
 

@@ -270,7 +270,11 @@ impl Database {
         let lock_file = Self::acquire_exclusive_lock(&path.join(Self::LOCK_FILE))?;
 
         let data_path = path.join(PageManager::DATA_FILE);
-        let engine = GraphStorageEngine::init(data_path, fs)?;
+        let mut engine = GraphStorageEngine::init(data_path, fs)?;
+        // Persist the graph data model in the superblock so a later open under a
+        // mismatching mode can be rejected (finding M2).
+        engine.page_manager.superblock.graph_mode = graph_mode.to_superblock_code();
+        engine.page_manager.sync_superblock(fs)?;
         Ok(Self {
             path: path.to_path_buf(),
             graph_mode,
@@ -327,9 +331,32 @@ impl Database {
         }
 
         let engine = GraphStorageEngine::open(data_path, fs)?;
+
+        // Validate the requested mode against the model the database was created
+        // with (finding M2).  The stored mode is authoritative: a database
+        // created as RDF must never be reopened as LPG (or vice versa), which
+        // would read the same bytes under the wrong data model.  Legacy
+        // databases (stored code 0, written before the mode was persisted) carry
+        // no model, so the caller's mode is trusted.
+        let stored = engine.page_manager.superblock.graph_mode;
+        let effective_mode = match GraphMode::from_superblock_code(stored) {
+            Some(stored_mode) => {
+                if stored_mode != graph_mode {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "database was created in {stored_mode:?} mode but opened as {graph_mode:?}"
+                        ),
+                    ));
+                }
+                stored_mode
+            }
+            None => graph_mode,
+        };
+
         Ok(Self {
             path: path.to_path_buf(),
-            graph_mode,
+            graph_mode: effective_mode,
             graph: Graph::new(engine),
             _lock: lock_file,
         })
@@ -343,6 +370,31 @@ mod tests {
     use crate::io::{AlignedBuffer, posix::PosixFileSystem};
     use crate::storage::meta::decode_superblock;
     use crate::storage::page::PAGE_SIZE;
+
+    #[test]
+    fn graph_mode_is_persisted_and_validated_on_open() {
+        // Regression gate for finding M2 (2026-06-05): the graph data model is
+        // persisted in the superblock, survives reopen, and a reopen under a
+        // mismatching mode is rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let db_path = dir.path().join("db");
+
+        // Create as RDF and drop (releasing the lock).
+        {
+            let _db = Database::init(&db_path, &fs, GraphMode::Rdf).unwrap();
+        }
+
+        // Reopening as RDF succeeds and the stored mode is authoritative.
+        {
+            let db = Database::open(&db_path, &fs, GraphMode::Rdf).unwrap();
+            assert_eq!(db.graph_mode, GraphMode::Rdf);
+        }
+
+        // Reopening as LPG must be rejected — the bytes belong to an RDF model.
+        let err = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn concurrent_open_is_rejected_by_the_lock() {
