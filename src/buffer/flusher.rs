@@ -37,6 +37,7 @@ pub enum FlushRequest {
 }
 
 /// Background thread that continuously writes dirty frames back to disk.
+#[derive(Debug)]
 pub struct Flusher {
     /// Handle to the background thread.
     handle: Option<JoinHandle<()>>,

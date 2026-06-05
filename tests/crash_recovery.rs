@@ -465,6 +465,65 @@ fn create_relationship_survives_crash_atomically() {
 /// engine's `Drop`-flush), reopen, then more writes — asserting every committed
 /// node survives, `next_free_page_id` was reconciled, and no committed node is
 /// overwritten by a post-reopen allocation.
+/// Regression gate for finding H-INT (Task 194, 2026-06-05): a freshly opened
+/// engine must have a live buffer pool wired into the page manager (so
+/// read_page/write_page route through the cache) and a background flusher, on
+/// both init and open, and data written through the pool must survive a reopen.
+#[test]
+fn engine_buffer_pool_is_live_on_the_write_path() {
+    use rgraph::graph::engine::GraphStorageEngine;
+    use rgraph::graph::graph::Graph;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fs = PosixFileSystem::new(false);
+    let data_path = dir.path().join("pool.rgraph");
+
+    let ids = {
+        let engine = GraphStorageEngine::init(data_path.clone(), &fs).unwrap();
+        assert!(
+            engine.page_manager.buffer_pool().is_some(),
+            "init must attach a live buffer pool"
+        );
+
+        let mut graph = Graph::new(engine);
+        let mut ids = Vec::new();
+        for _ in 0..20 {
+            let (_s, id) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
+            ids.push(id);
+        }
+
+        // Writes routed through the pool leave dirty frames pending flush (well
+        // under the flusher's ratio threshold for 20 nodes, so they persist).
+        let pool = graph.engine().page_manager.buffer_pool().unwrap();
+        assert!(
+            !pool.dirty_candidates().is_empty(),
+            "create_node writes must route through the pool (dirty frames present)"
+        );
+
+        // Nodes are readable before any explicit sync (served via the pool).
+        for id in &ids {
+            assert!(graph.get_node(*id, &fs).unwrap().is_some());
+        }
+        graph.engine_mut().sync(&fs).unwrap();
+        ids
+        // drop(graph) stops the flusher (no hang) and flushes on the way out.
+    };
+
+    // Reopen: the pool is re-attached and the data is intact.
+    let engine = GraphStorageEngine::open(data_path, &fs).unwrap();
+    assert!(
+        engine.page_manager.buffer_pool().is_some(),
+        "open must attach a live buffer pool"
+    );
+    let graph = Graph::new(engine);
+    for id in &ids {
+        assert!(
+            graph.get_node(*id, &fs).unwrap().is_some(),
+            "data written through the pool must survive reopen"
+        );
+    }
+}
+
 /// Regression gate for finding M5 (Task 215, 2026-06-05): a corrupt, unrepairable
 /// allocated data page must make open fail loudly (the records are genuine data
 /// loss) rather than being silently dropped from the secondary indexes.

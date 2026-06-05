@@ -288,10 +288,63 @@ pub struct GraphStorageEngine {
     /// Empty and idle in `GraphMode::Lpg`; populated by `add_triple`/`add_quad`
     /// in `GraphMode::Rdf`.  Rebuilt from the data pages on `open`.
     pub rdf_store: crate::rdf::RdfTripleStore,
+    /// Buffer pool backing `read_page`/`write_page` on the live path.  The
+    /// page manager holds a `Weak` to it; this is the owning strong reference
+    /// (finding H-INT).
+    buffer_pool: Option<Arc<crate::buffer::BufferPool>>,
+    /// Background flusher thread that writes dirty pool frames back to disk,
+    /// honouring WAL-before-data ordering via the WAL durable-LSN watermark.
+    ///
+    /// Declared LAST so it drops first — but `Drop` stops it explicitly before
+    /// the final sync regardless, so no flush races teardown (finding H-INT).
+    flusher: Option<crate::buffer::Flusher>,
 }
 
 impl GraphStorageEngine {
     /// Initialise a brand-new graph storage engine.
+    /// Number of frames in the live buffer pool (frame = one page).  256 frames
+    /// ≈ 2 MiB of cache — a conservative default; tune for server workloads.
+    const DEFAULT_POOL_FRAMES: u32 = 256;
+
+    /// Build the live buffer pool (sharing `dw` for torn-page protection) and
+    /// start its background flusher, wiring the pool into `pm` so that
+    /// `read_page`/`write_page` route through the cache (finding H-INT).
+    ///
+    /// The flusher owns a buffered `PosixFileSystem` (all production data I/O is
+    /// buffered, so OS page-cache coherence holds across handles) and reads the
+    /// WAL durable-LSN watermark so a dirty page is never written before its
+    /// redo record is durable.
+    fn attach_buffer_pool(
+        pm: &mut PageManager,
+        data_path: &std::path::Path,
+        dw: Arc<DoubleWriteBuffer>,
+        wal_writer: &WalWriter,
+    ) -> (Arc<crate::buffer::BufferPool>, crate::buffer::Flusher) {
+        let mut pool = crate::buffer::BufferPool::new(Self::DEFAULT_POOL_FRAMES, data_path.to_path_buf());
+        pool.set_doublewrite(dw);
+        let pool = Arc::new(pool);
+        pm.set_pool(&pool);
+
+        let flusher_fs: Arc<dyn FileSystem> =
+            Arc::new(crate::io::posix::PosixFileSystem::new(false));
+        let flusher = crate::buffer::Flusher::new(
+            pool.clone(),
+            flusher_fs,
+            crate::buffer::flusher::DEFAULT_DIRTY_RATIO,
+            crate::buffer::flusher::DEFAULT_FLUSH_INTERVAL_MS,
+            wal_writer.durable_lsn(),
+        );
+        (pool, flusher)
+    }
+
+    /// The live buffer pool backing this engine's page I/O, if attached.
+    ///
+    /// This is the owning strong reference; the page manager additionally holds
+    /// a `Weak` to it for routing `read_page`/`write_page` through the cache.
+    pub fn buffer_pool(&self) -> Option<&Arc<crate::buffer::BufferPool>> {
+        self.buffer_pool.as_ref()
+    }
+
     pub fn init(data_path: PathBuf, fs: &dyn FileSystem) -> io::Result<Self> {
         let mut pm = PageManager::init(data_path.clone(), PAGE_SIZE as u32, fs)?;
 
@@ -304,12 +357,15 @@ impl GraphStorageEngine {
         // The DW file lives next to the data file so it survives across restarts.
         let dw_path = data_path.with_extension("dw");
         let dw = Arc::new(DoubleWriteBuffer::open(dw_path, fs)?);
-        pm.set_doublewrite(dw);
+        pm.set_doublewrite(dw.clone());
 
         // Initialise WAL with a buffered filesystem (WAL does not use O_DIRECT).
         let wal_dir = data_path.parent().unwrap().join("wal");
         let wal_fs = crate::io::posix::PosixFileSystem::new(false);
         let wal_writer = WalWriter::open(wal_dir, &wal_fs)?;
+
+        // Attach the live buffer pool + background flusher (finding H-INT).
+        let (buffer_pool, flusher) = Self::attach_buffer_pool(&mut pm, &data_path, dw, &wal_writer);
 
         let config = BPlusTreeConfig::default();
         let wal_fs = Arc::new(crate::io::posix::PosixFileSystem::new(false));
@@ -332,6 +388,8 @@ impl GraphStorageEngine {
             edge_free_list: StdMutex::new(Vec::new()),
             csr: CsrHolder::new(),
             rdf_store: crate::rdf::RdfTripleStore::new(),
+            buffer_pool: Some(buffer_pool),
+            flusher: Some(flusher),
         })
     }
 
@@ -374,7 +432,7 @@ impl GraphStorageEngine {
         // them.
         let dw_path = data_path.with_extension("dw");
         let dw = Arc::new(DoubleWriteBuffer::open(dw_path, fs)?);
-        pm.set_doublewrite(dw);
+        pm.set_doublewrite(dw.clone());
         let torn = pm.recover_torn_pages(fs)?;
         if torn > 0 {
             // Non-fatal: ARIES will REDO any operations that updated these pages
@@ -424,6 +482,11 @@ impl GraphStorageEngine {
         // re-handing-out an in-use page (finding H12).
         pm.reconcile_from_disk(fs)?;
 
+        // Attach the live buffer pool + background flusher AFTER recovery and
+        // reconciliation (both of which read raw disk), so the pool starts with a
+        // coherent on-disk image (finding H-INT).
+        let (buffer_pool, flusher) = Self::attach_buffer_pool(&mut pm, &data_path, dw, &wal_writer);
+
         let config = BPlusTreeConfig::default();
         let wal_fs_arc = Arc::new(crate::io::posix::PosixFileSystem::new(false));
         let mut engine = Self {
@@ -445,6 +508,8 @@ impl GraphStorageEngine {
             edge_free_list: StdMutex::new(Vec::new()),
             csr: CsrHolder::new(),
             rdf_store: crate::rdf::RdfTripleStore::new(),
+            buffer_pool: Some(buffer_pool),
+            flusher: Some(flusher),
         };
 
         // Restore the persisted schema catalog from its sidecar file so that
@@ -1414,6 +1479,15 @@ impl GraphStorageEngine {
             }
         }
 
+        // Flush every dirty pool frame to disk so `sync()` means "durable on
+        // disk", matching the pre-pool direct-write semantics the rest of the
+        // engine and tests rely on.  The WAL was synced above, so each dirty
+        // frame's redo record is already durable — flushing any of them is
+        // WAL-before-data safe (finding H-INT).
+        if let Some(pool) = self.page_manager.buffer_pool() {
+            pool.flush_all(fs)?;
+        }
+
         // Write superblock (both copies at pages 0 and 1), then write the
         // bitmap page (page 2).
         self.page_manager.sync_superblock(fs)?;
@@ -2212,6 +2286,12 @@ impl Drop for GraphStorageEngine {
     /// The flush is wrapped in `catch_unwind` so a poisoned catalog lock (from an
     /// earlier panic) cannot turn a normal unwind into a process abort.
     fn drop(&mut self) {
+        // Stop the background flusher BEFORE the final sync so its thread cannot
+        // race the teardown or the sync's own flush_all (finding H-INT).  The
+        // flusher only writes already-WAL-durable dirty frames, so stopping it
+        // loses nothing — the sync below flushes everything that remains.
+        self.flusher = None;
+
         let fs = Arc::clone(&self.wal_fs);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = self.sync(fs.as_ref());
