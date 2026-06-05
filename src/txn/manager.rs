@@ -48,7 +48,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::time::Duration;
 use thiserror::Error;
+
+/// Bounded wait between re-validations while blocked on a contended lock.
+///
+/// A waiter parks on its wait-queue receiver for at most this long before
+/// waking to re-check its abort status and re-attempt acquisition, so a lost
+/// wakeup (a wounded holder that dropped our sender, or a notification that
+/// never fired) can never park a blocking-pool worker forever (finding M17).
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Shared set of TxIds that have been wounded and must abort at the next
 /// opportunity.  The set is populated by the wound-wait callback and cleared
@@ -494,6 +503,23 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Abort a transaction that was wounded while it was blocked waiting on a
+    /// contended lock: release everything it holds and read-locked, remove it
+    /// from global state, and clear its wound/SSI/abort tracking.  Returns the
+    /// [`TxError::WoundWait`] for the caller to propagate (finding M17).
+    fn abort_waiter(&self, tx: &mut Transaction) -> TxError {
+        tx.status = TxStatus::Aborted;
+        self.lock_table.release_all(tx.txid, &tx.held_locks);
+        tx.held_locks.clear();
+        self.lock_table.release_all(tx.txid, &tx.read_ranges);
+        tx.read_ranges.clear();
+        self.global_state.abort_tx(tx.txid);
+        self.wound_wait.cleanup(tx.txid);
+        self.abort_registry.clear(tx.txid);
+        self.ssi_tracker.cleanup(tx.txid);
+        TxError::WoundWait(tx.txid)
+    }
+
     /// Acquire a lock on `resource_id` for `tx` in `mode`.
     ///
     /// The wound-wait protocol is applied on conflict:
@@ -618,25 +644,24 @@ impl TransactionManager {
 
                     // No wound issued — block on the wait-queue receiver.
                     if let Some(rx) = rx_opt {
-                        // Block until notified.  We use recv() without timeout
-                        // because the wound-wait protocol guarantees progress:
-                        // either the holder commits/aborts (waking us) or we
-                        // get wounded and the holder's abort wakes us.
-                        let notified = rx.recv().unwrap_or(LockResult::Denied);
+                        // Block on the wait-queue receiver, but only for a bounded
+                        // interval: on a lost wakeup or dropped sender we re-check
+                        // our abort status and re-attempt acquisition rather than
+                        // park forever (finding M17).
+                        let notified = match rx.recv_timeout(LOCK_WAIT_TIMEOUT) {
+                            Ok(r) => r,
+                            Err(_) => {
+                                if self.abort_registry.is_aborted(tx.txid) {
+                                    return Err(self.abort_waiter(tx));
+                                }
+                                continue;
+                            }
+                        };
                         if notified == LockResult::Granted {
                             // Re-check abort status after waking: we may have
                             // been wounded while blocked.
                             if self.abort_registry.is_aborted(tx.txid) {
-                                tx.status = TxStatus::Aborted;
-                                self.lock_table.release_all(tx.txid, &tx.held_locks);
-                                tx.held_locks.clear();
-                                self.lock_table.release_all(tx.txid, &tx.read_ranges);
-                                tx.read_ranges.clear();
-                                self.global_state.abort_tx(tx.txid);
-                                self.wound_wait.cleanup(tx.txid);
-                                self.abort_registry.clear(tx.txid);
-                                self.ssi_tracker.cleanup(tx.txid);
-                                return Err(TxError::WoundWait(tx.txid));
+                                return Err(self.abort_waiter(tx));
                             }
                             if !tx.held_locks.contains(&resource_id) {
                                 tx.held_locks.push(resource_id);
@@ -735,7 +760,15 @@ impl TransactionManager {
                         continue;
                     }
                     if let Some(rx) = rx_opt {
-                        let notified = rx.recv().unwrap_or(LockResult::Denied);
+                        let notified = match rx.recv_timeout(LOCK_WAIT_TIMEOUT) {
+                            Ok(r) => r,
+                            Err(_) => {
+                                if self.abort_registry.is_aborted(tx.txid) {
+                                    return Err(self.abort_waiter(tx));
+                                }
+                                continue;
+                            }
+                        };
                         if notified == LockResult::Granted {
                             if !tx.read_ranges.contains(&range_id) {
                                 tx.read_ranges.push(range_id);
@@ -842,7 +875,15 @@ impl TransactionManager {
                         continue;
                     }
                     if let Some(rx) = rx_opt {
-                        let notified = rx.recv().unwrap_or(LockResult::Denied);
+                        let notified = match rx.recv_timeout(LOCK_WAIT_TIMEOUT) {
+                            Ok(r) => r,
+                            Err(_) => {
+                                if self.abort_registry.is_aborted(tx.txid) {
+                                    return Err(self.abort_waiter(tx));
+                                }
+                                continue;
+                            }
+                        };
                         if notified == LockResult::Granted {
                             if !tx.held_locks.contains(&range_id) {
                                 tx.held_locks.push(range_id);
@@ -989,6 +1030,44 @@ mod tests {
         let mut tx2 = mgr.begin();
         mgr.acquire_lock(&mut tx2, 42, LockMode::Exclusive).unwrap();
         assert!(!tx2.held_locks().is_empty());
+    }
+
+    /// Regression gate for finding M17 (Task 228, 2026-06-05): a waiter that is
+    /// wounded while blocked on a contended lock must wake via the bounded recv
+    /// timeout, re-validate its abort status, and return WoundWait within a
+    /// deadline — it must never park a worker forever.
+    #[test]
+    fn wounded_waiter_returns_within_deadline_not_parked_forever() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mgr = Arc::new(TransactionManager::new());
+
+        // tx_a (older) holds an exclusive lock and never releases it.
+        let mut tx_a = mgr.begin();
+        mgr.acquire_lock(&mut tx_a, 99, LockMode::Exclusive).unwrap();
+
+        // tx_b (younger) blocks waiting for the same lock in another thread.
+        let mgr_b = Arc::clone(&mgr);
+        let mut tx_b = mgr.begin();
+        let tx_b_id = tx_b.txid;
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let r = mgr_b.acquire_lock(&mut tx_b, 99, LockMode::Exclusive);
+            let _ = done_tx.send(r);
+        });
+
+        // Let tx_b park on the wait queue, then wound it WITHOUT notifying its
+        // sender (a lost-wakeup wound).
+        std::thread::sleep(Duration::from_millis(150));
+        mgr.abort_registry.mark_aborted(tx_b_id);
+
+        // tx_b must return WoundWait within the deadline; without the bounded
+        // timeout it would block on recv() forever.
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the wounded waiter must return within the deadline, not park forever");
+        assert!(matches!(result, Err(TxError::WoundWait(_))));
     }
 
     #[test]
