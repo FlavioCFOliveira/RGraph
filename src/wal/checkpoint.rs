@@ -64,20 +64,33 @@ impl Checkpoint {
         // This matches the format expected by `seed_dpt_from_checkpoint` in
         // `src/wal/aries.rs` so that ANALYSIS correctly seeds the DPT from
         // this record.
+        // Only pages with a REAL rec_lsn belong in the DPT.  A frame still
+        // carrying the u64::MAX sentinel (a page with no WAL dependency) is
+        // neither flushed by the loop above nor a valid REDO start point, so
+        // encoding it would make ANALYSIS seed the DPT with a nonsensical
+        // rec_lsn and defeat the recovery bound (finding M24).
+        let entries: Vec<(u64, u64)> = pool
+            .dirty_candidates()
+            .into_iter()
+            .filter_map(|fid| {
+                let frame = pool.frame(fid);
+                let rec_lsn = frame
+                    .desc
+                    .rec_lsn
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if rec_lsn == u64::MAX {
+                    return None;
+                }
+                let page_id = frame
+                    .desc
+                    .page_id
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                Some((page_id, rec_lsn))
+            })
+            .collect();
         let mut payload = Vec::new();
-        let dirty_pages = pool.dirty_candidates();
-        let count = dirty_pages.len() as u32;
-        payload.extend_from_slice(&count.to_be_bytes());
-        for fid in dirty_pages {
-            let frame = pool.frame(fid);
-            let page_id = frame
-                .desc
-                .page_id
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let rec_lsn = frame
-                .desc
-                .rec_lsn
-                .load(std::sync::atomic::Ordering::Relaxed);
+        payload.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (page_id, rec_lsn) in entries {
             payload.extend_from_slice(&page_id.to_be_bytes());
             payload.extend_from_slice(&rec_lsn.to_be_bytes());
         }
@@ -221,5 +234,110 @@ mod tests {
             }
         }
         assert!(found_end, "CheckpointEnd record must be present in WAL");
+    }
+
+    /// Regression gate for finding M24 (Task 202, 2026-06-05): the CheckpointEnd
+    /// DPT must contain only real rec_lsn values (never the u64::MAX sentinel),
+    /// and pages with rec_lsn <= ckpt_lsn must be flushed clean.
+    #[test]
+    fn checkpoint_dpt_excludes_sentinel_rec_lsn() {
+        use crate::storage::page::{PageType, SlottedPage};
+        use crate::wal::record::WalRecord;
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("rgraph.db");
+        let wal_dir = dir.path().join("wal");
+        let fs = Arc::new(PosixFileSystem::new(false));
+
+        let file_pages = 32u64;
+        {
+            let mut f = std::fs::File::create(&data_path).unwrap();
+            f.set_len(file_pages * crate::storage::page::PAGE_SIZE as u64)
+                .unwrap();
+            f.flush().unwrap();
+        }
+        let handle = fs.open(&data_path, false).unwrap();
+        for pid in 0..file_pages {
+            let mut page = SlottedPage::init(pid, PageType::SlottedData);
+            page.update_checksum();
+            handle
+                .write_at(&page.buf, pid * crate::storage::page::PAGE_SIZE as u64)
+                .unwrap();
+        }
+        handle.sync_data().unwrap();
+        drop(handle);
+
+        let pool = BufferPool::new(8, data_path);
+        let mut wal = WalWriter::open(wal_dir.clone(), fs.as_ref()).unwrap();
+
+        // Page 1: rec_lsn = 1 (<= ckpt_lsn) → must be flushed clean.
+        {
+            let mut g = pool.fix_page(fs.as_ref(), 1).unwrap();
+            g.buf_mut()[64] = 0xAA;
+            g.set_dirty(1);
+        }
+        // Page 2: the u64::MAX sentinel → must be EXCLUDED from the DPT.
+        {
+            let mut g = pool.fix_page(fs.as_ref(), 2).unwrap();
+            g.buf_mut()[64] = 0xBB;
+            g.set_dirty(u64::MAX);
+        }
+        // Page 3: a future rec_lsn (> ckpt_lsn) → stays dirty, belongs in the DPT.
+        {
+            let mut g = pool.fix_page(fs.as_ref(), 3).unwrap();
+            g.buf_mut()[64] = 0xCC;
+            g.set_dirty(1_000_000);
+        }
+
+        let ckpt_lsn = Checkpoint::run(&pool, fs.clone(), &mut wal).unwrap();
+
+        // Page 1 (rec_lsn <= ckpt_lsn) must be clean after the checkpoint.
+        let page1_clean = pool
+            .iter_frames()
+            .find(|f| f.desc.page_id.load(Ordering::Relaxed) == 1)
+            .map(|f| !f.desc.dirty.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        assert!(page1_clean, "a page with rec_lsn <= ckpt_lsn must be flushed clean");
+
+        // Decode the CheckpointEnd DPT.
+        let raw = std::fs::read(wal_dir.join("wal-000000000")).unwrap();
+        let mut offset = 0;
+        let mut dpt: Vec<(u64, u64)> = Vec::new();
+        let mut found_end = false;
+        while offset < raw.len() {
+            let Some((rec, size)) = WalRecord::decode(&raw, offset) else {
+                break;
+            };
+            if rec.record_type == crate::wal::record::RecordType::CheckpointEnd {
+                found_end = true;
+                let p = &rec.payload;
+                let count = u32::from_be_bytes(p[0..4].try_into().unwrap()) as usize;
+                for i in 0..count {
+                    let base = 4 + i * 16;
+                    let page_id = u64::from_be_bytes(p[base..base + 8].try_into().unwrap());
+                    let rec_lsn = u64::from_be_bytes(p[base + 8..base + 16].try_into().unwrap());
+                    dpt.push((page_id, rec_lsn));
+                }
+            }
+            offset += size;
+        }
+        assert!(found_end, "CheckpointEnd record must be present");
+        assert!(ckpt_lsn < 1_000_000, "the future rec_lsn must exceed ckpt_lsn");
+
+        // No DPT entry may carry the sentinel; page 2 (u64::MAX) is excluded.
+        assert!(
+            !dpt.iter().any(|(_, lsn)| *lsn == u64::MAX),
+            "the DPT must not encode the u64::MAX sentinel, got {dpt:?}"
+        );
+        assert!(
+            !dpt.iter().any(|(pid, _)| *pid == 2),
+            "the sentinel page 2 must not appear in the DPT, got {dpt:?}"
+        );
+        // Page 3 (real future rec_lsn) belongs in the DPT.
+        assert!(
+            dpt.contains(&(3, 1_000_000)),
+            "a page with a real rec_lsn > ckpt_lsn must be in the DPT, got {dpt:?}"
+        );
     }
 }

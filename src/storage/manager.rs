@@ -508,9 +508,17 @@ impl PageManager {
             // Copy caller's data into the pool frame.
             crate::storage::page::SlottedPage::update_checksum_bytes(buf);
             guard.buf_mut().copy_from_slice(buf);
-            // Mark dirty — the flusher will persist this in a batched write.
-            // LSN u64::MAX means "no WAL record" (WAL-before-data: always flushable).
-            guard.set_dirty(u64::MAX);
+            // Mark dirty with the page's REAL rec_lsn — the no-steal write path
+            // stamps `page_lsn` (the modifying WAL record's LSN) into the page
+            // header's first 8 bytes before calling write_page.  Using it (rather
+            // than the u64::MAX "no WAL record" sentinel) lets the flusher's
+            // WAL-before-data gate and the fuzzy checkpoint reason about this
+            // frame correctly: the checkpoint flushes pages with rec_lsn <=
+            // ckpt_lsn and the DPT records a real LSN (finding M24).  By the time
+            // write_page runs, the WAL up to this LSN is already durable (the
+            // commit flushed it), so the frame is immediately flushable.
+            let rec_lsn = u64::from_be_bytes(buf[0..8].try_into().expect("page buffer >= 8 bytes"));
+            guard.set_dirty(rec_lsn);
             // Guard drop unpins the frame.
             return Ok(());
         }
@@ -1306,6 +1314,39 @@ mod tests {
         assert_eq!(
             PageManager::page_offset(FIRST_DATA_PAGE_ID).unwrap(),
             FIRST_DATA_PAGE_ID * PAGE_SIZE as u64
+        );
+    }
+
+    /// Regression gate for finding M24 (Task 202, 2026-06-05): write_page's pool
+    /// path must stamp the page's page_lsn (bytes [0..8], set by the no-steal
+    /// write path) as the frame's rec_lsn, not the u64::MAX sentinel — so the
+    /// flusher and checkpoint can reason about it.
+    #[test]
+    fn write_page_stamps_real_rec_lsn_into_the_frame() {
+        use crate::buffer::pool::BufferPool;
+        use crate::storage::page::{PageType, SlottedPage};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let (_dir, fs, path) = temp_fs();
+        let mut pm = PageManager::init(path.clone(), PAGE_SIZE as u32, &fs).unwrap();
+        let pool = Arc::new(BufferPool::new(8, path));
+        pm.set_pool(&pool);
+
+        let pid = pm.allocate_page();
+        let mut page = SlottedPage::init(pid, PageType::SlottedData);
+        // Stamp a real page_lsn (big-endian) the way the no-steal path does.
+        page.buf[0..8].copy_from_slice(&777u64.to_be_bytes());
+        pm.write_page(&fs, pid, &mut page.buf).unwrap();
+
+        let frame_lsn = pool
+            .iter_frames()
+            .find(|f| f.desc.page_id.load(Ordering::Relaxed) == pid)
+            .map(|f| f.desc.rec_lsn.load(Ordering::Relaxed));
+        assert_eq!(
+            frame_lsn,
+            Some(777),
+            "write_page must stamp the page_lsn as rec_lsn, not u64::MAX"
         );
     }
 
