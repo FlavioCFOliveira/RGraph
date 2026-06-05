@@ -454,6 +454,27 @@ impl GraphEngineAdapter {
         let graph = Graph::new(engine);
         Ok(Self::new(graph))
     }
+
+    /// Open an existing graph engine at `path`, or initialise a new one if the
+    /// data file is absent.
+    ///
+    /// This is the correct server-startup path.  Calling [`init`] unconditionally
+    /// rewrites a fresh empty superblock over an existing database, discarding
+    /// every persisted node/edge/page on each restart — committed data would not
+    /// survive a server restart (finding C6).  `open` instead reads the existing
+    /// superblock and recovers, preserving the data.
+    pub fn open_or_init(path: PathBuf) -> Result<Self, RGraphError> {
+        let fs = PosixFileSystem::new(false);
+        let engine = if path.exists() {
+            GraphStorageEngine::open(path, &fs)
+                .map_err(|e| RGraphError::Storage(e.to_string().into()))?
+        } else {
+            GraphStorageEngine::init(path, &fs)
+                .map_err(|e| RGraphError::Storage(e.to_string().into()))?
+        };
+        let graph = Graph::new(engine);
+        Ok(Self::new(graph))
+    }
 }
 
 #[async_trait]
@@ -797,6 +818,36 @@ fn into_rgraph_err(e: StorageError) -> RGraphError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_or_init_does_not_clobber_existing_database() {
+        // Regression gate for finding C6 (2026-06-05): the server adapter must
+        // OPEN an existing database (recover) on restart, not re-init() it — which
+        // resets the superblock to empty and loses all committed data.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rgraph.db");
+        let fs = PosixFileSystem::new(false);
+
+        let node_id = {
+            let engine = GraphStorageEngine::init(path.clone(), &fs).unwrap();
+            let mut graph = Graph::new(engine);
+            let (_s, id) = graph
+                .create_node(NodeBuilder::new().label(9), &fs)
+                .unwrap();
+            id
+            // graph/engine Drop flushes superblock/bitmap/catalog (finding M21).
+        };
+
+        // Restart via the production server startup path.
+        let adapter = GraphEngineAdapter::open_or_init(path).unwrap();
+        let node = adapter
+            .graph_handle()
+            .blocking_read()
+            .get_node(node_id, &fs)
+            .unwrap()
+            .expect("node must survive a server restart (open, not re-init)");
+        assert_eq!(node.label_id, 9);
+    }
 
     // --- InMemoryStorageEngine CRUD property tests ---
 

@@ -335,13 +335,19 @@ fn main() {
             };
 
             let data_path = path.join("rgraph.db");
-            if !data_path.exists() {
+            if data_path.exists() {
+                info!("existing database found; opening (recovering) graph engine");
+            } else {
                 info!("database file not found; initialising new graph engine");
             }
-            let engine: Arc<dyn AsyncGraphEngine> = match GraphEngineAdapter::init(data_path) {
-                Ok(adapter) => Arc::new(adapter),
-                Err(e) => fail_startup(e),
-            };
+            // Open an EXISTING database (recover) or initialise a fresh one — never
+            // unconditionally init(), which would clobber persisted data on every
+            // restart (finding C6).
+            let engine: Arc<dyn AsyncGraphEngine> =
+                match GraphEngineAdapter::open_or_init(data_path) {
+                    Ok(adapter) => Arc::new(adapter),
+                    Err(e) => fail_startup(e),
+                };
 
             let metrics = MetricsCollector::new();
             let _dispatcher = match RequestDispatcher::new(cpu_threads) {
