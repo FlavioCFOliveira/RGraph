@@ -473,22 +473,53 @@ impl PageManager {
         Ok(())
     }
 
-    /// Persist the current superblock to both copies atomically.
+    /// Persist the current superblock to both copies using a **staggered**
+    /// double-write so a crash always leaves at least one self-consistent copy
+    /// and the generation tiebreak can pick the newest (finding 211).
     ///
-    /// Increments `generation` before writing so that the mirror-recovery
-    /// path can always identify the newest copy.  Uses `sync_all()` (not
-    /// just `sync_data()`) to ensure the directory entry is also durable.
-    pub fn sync_superblock(&self, _fs: &dyn FileSystem) -> io::Result<()> {
-        let mut sb = self.superblock;
-        sb.generation += 1;
-        sb.update_checksum();
-        let encoded = encode_superblock(&sb);
+    /// The previous protocol wrote both copies back-to-back at the *same*
+    /// generation under a single trailing `sync_all`, so a crash could leave
+    /// both copies in flight (both torn) or persist only one with no way to
+    /// tell which is newer.  Worse, it bumped a *local* copy's generation, so
+    /// the in-memory `generation` never advanced and consecutive syncs reused
+    /// the same number.
+    ///
+    /// The staggered protocol is:
+    ///   1. write the **mirror** at `gen + 1`, `sync_all` — the mirror now
+    ///      durably holds the new state while the *old* primary (still at the
+    ///      previous generation) remains a valid fallback;
+    ///   2. write the **primary** at `gen + 2`, `sync_all` — the primary
+    ///      becomes the newest copy; if its write is torn, the mirror at
+    ///      `gen + 1` is a fully-consistent fallback that still reflects this
+    ///      sync's state.
+    ///
+    /// The two copies are therefore always one generation apart and never both
+    /// in flight, and the persisted in-memory `generation` advances monotonically
+    /// so the tiebreak ([`load_superblock`] prefers the higher generation, ties
+    /// to the primary) is always unambiguous.
+    pub fn sync_superblock(&mut self, _fs: &dyn FileSystem) -> io::Result<()> {
+        let base = self.superblock.generation;
         let handle = self.data_handle.as_ref().expect("data file not open");
-        // Primary copy at page 0.
-        handle.write_at(&encoded, 0)?;
-        // Mirror copy at page 1.
-        handle.write_at(&encoded, PAGE_SIZE as u64)?;
-        handle.sync_all()
+
+        // 1. Mirror at gen+1, made durable before the primary is touched.
+        let mut mirror = self.superblock;
+        mirror.generation = base + 1;
+        mirror.update_checksum();
+        let mirror_enc = encode_superblock(&mirror);
+        handle.write_at(&mirror_enc, PAGE_SIZE as u64)?;
+        handle.sync_all()?;
+
+        // 2. Primary at gen+2, made durable after the mirror is safe.
+        let mut primary = self.superblock;
+        primary.generation = base + 2;
+        primary.update_checksum();
+        let primary_enc = encode_superblock(&primary);
+        handle.write_at(&primary_enc, 0)?;
+        handle.sync_all()?;
+
+        // Advance the in-memory generation so the next sync stays monotonic.
+        self.superblock.generation = base + 2;
+        Ok(())
     }
 
     /// Persist ALL bitmap pages to disk.
@@ -848,6 +879,70 @@ mod tests {
         // A fresh allocation must not collide with the recovered pages.
         let fresh = pm.allocate_page();
         assert!(fresh > p_b, "fresh allocation must not alias a recovered page");
+    }
+
+    /// Regression gate for finding 211 (Task 211, 2026-06-05): the staggered
+    /// superblock double-write must leave the two copies one generation apart
+    /// (so the tiebreak is unambiguous), advance the in-memory generation
+    /// monotonically, and survive a torn copy on either side — recovering the
+    /// latest committed state every time.
+    #[test]
+    fn staggered_superblock_survives_a_torn_copy() {
+        use crate::storage::meta::{decode_superblock, load_superblock};
+        let (_dir, fs, path) = temp_fs();
+        let mut pm = PageManager::init(path.clone(), PAGE_SIZE as u32, &fs).unwrap();
+        pm.sync_superblock(&fs).unwrap();
+
+        // The in-memory generation must advance across syncs (the old code bumped
+        // only a local copy, so consecutive syncs reused the same number).
+        let g1 = pm.superblock.generation;
+        pm.superblock.next_free_page_id = 999;
+        pm.sync_superblock(&fs).unwrap();
+        assert!(
+            pm.superblock.generation > g1,
+            "in-memory generation must advance monotonically across syncs"
+        );
+
+        // On disk, the primary must be exactly the newer (higher-generation)
+        // staggered copy, and both copies must individually validate and reflect
+        // the latest state.
+        let handle = fs.open(&path, false).unwrap();
+        let mut p0 = AlignedBuffer::zeroed(PAGE_SIZE);
+        let mut p1 = AlignedBuffer::zeroed(PAGE_SIZE);
+        handle.read_at(&mut p0, 0).unwrap();
+        handle.read_at(&mut p1, PAGE_SIZE as u64).unwrap();
+        let primary = decode_superblock(&p0).expect("primary copy must be self-consistent");
+        let mirror = decode_superblock(&p1).expect("mirror copy must be self-consistent");
+        assert_eq!(primary.next_free_page_id, 999);
+        assert_eq!(mirror.next_free_page_id, 999);
+        assert!(
+            primary.generation > mirror.generation,
+            "primary must be one generation ahead of the mirror (staggered), got primary={} mirror={}",
+            primary.generation,
+            mirror.generation
+        );
+
+        // Crash that tore the PRIMARY copy: the durable mirror still recovers the
+        // latest committed state.
+        let garbage = vec![0xA5u8; PAGE_SIZE];
+        handle.write_at(&garbage, 0).unwrap();
+        handle.sync_data().unwrap();
+        let recovered = load_superblock(&fs, &path).unwrap();
+        assert_eq!(
+            recovered.next_free_page_id, 999,
+            "a torn primary must still recover the latest state from the mirror"
+        );
+        assert!(recovered.verify_checksum());
+
+        // Crash that tore the MIRROR copy instead: re-persist a clean pair, then
+        // corrupt page 1 — the higher-generation primary recovers the state.
+        pm.sync_superblock(&fs).unwrap();
+        handle.write_at(&garbage, PAGE_SIZE as u64).unwrap();
+        handle.sync_data().unwrap();
+        drop(handle);
+        let recovered2 = load_superblock(&fs, &path).unwrap();
+        assert_eq!(recovered2.next_free_page_id, 999);
+        assert!(recovered2.verify_checksum());
     }
 
     #[test]
