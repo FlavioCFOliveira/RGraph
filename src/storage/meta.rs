@@ -112,19 +112,124 @@ pub fn encode_superblock(sb: &Superblock) -> AlignedBuffer {
     buf
 }
 
-/// Decode a superblock from a raw page buffer.
-pub fn decode_superblock(buf: &[u8]) -> Option<Superblock> {
+/// Why a superblock buffer failed validation.
+///
+/// Distinguishes genuine corruption (bad magic / checksum) from compatibility
+/// problems (unsupported version, wrong page size, opposite-endian file), so the
+/// reported error is actionable rather than a misleading "checksum failure"
+/// (finding L14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuperblockError {
+    /// Buffer too short to contain a superblock.
+    TooShort,
+    /// Magic signature absent — not an RGraph database or severe corruption.
+    BadMagic,
+    /// Magic matches the byte-swapped signature: the file was written on a
+    /// machine of the opposite endianness.  The on-disk format is native-endian
+    /// (the magic doubles as the endianness marker), so such a file is not
+    /// portable and must be rebuilt on this architecture.
+    EndiannessMismatch,
+    /// CRC32C mismatch — the superblock is corrupt.
+    ChecksumMismatch,
+    /// Format version this build does not support.
+    UnsupportedVersion { found: u32, supported: u32 },
+    /// Page size differs from this build's `PAGE_SIZE`.
+    WrongPageSize { found: u32, expected: u32 },
+}
+
+impl std::fmt::Display for SuperblockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SuperblockError::TooShort => write!(f, "superblock buffer too short"),
+            SuperblockError::BadMagic => {
+                write!(f, "not an RGraph superblock (bad magic) or severe corruption")
+            }
+            SuperblockError::EndiannessMismatch => write!(
+                f,
+                "superblock was written on a machine of the opposite endianness \
+                 (native-endian on-disk format); rebuild the database on this architecture"
+            ),
+            SuperblockError::ChecksumMismatch => write!(f, "superblock checksum mismatch (corrupt)"),
+            SuperblockError::UnsupportedVersion { found, supported } => write!(
+                f,
+                "unsupported superblock format version {found} (this build supports {supported})"
+            ),
+            SuperblockError::WrongPageSize { found, expected } => write!(
+                f,
+                "superblock page size {found} differs from this build's page size {expected}"
+            ),
+        }
+    }
+}
+
+impl SuperblockError {
+    /// The most appropriate [`io::ErrorKind`]: compatibility problems map to
+    /// `Unsupported`, genuine corruption to `InvalidData`.
+    fn error_kind(&self) -> io::ErrorKind {
+        match self {
+            SuperblockError::UnsupportedVersion { .. }
+            | SuperblockError::WrongPageSize { .. }
+            | SuperblockError::EndiannessMismatch => io::ErrorKind::Unsupported,
+            SuperblockError::TooShort
+            | SuperblockError::BadMagic
+            | SuperblockError::ChecksumMismatch => io::ErrorKind::InvalidData,
+        }
+    }
+
+    /// Specificity rank — a higher value is a more informative diagnosis when
+    /// both copies fail (a clear compatibility reason beats generic corruption).
+    fn specificity(&self) -> u8 {
+        match self {
+            SuperblockError::EndiannessMismatch => 5,
+            SuperblockError::UnsupportedVersion { .. } => 4,
+            SuperblockError::WrongPageSize { .. } => 3,
+            SuperblockError::ChecksumMismatch => 2,
+            SuperblockError::BadMagic => 1,
+            SuperblockError::TooShort => 0,
+        }
+    }
+}
+
+/// Validate a superblock buffer, returning the decoded superblock or the
+/// specific reason it is unacceptable.
+///
+/// Endianness and magic are checked before the (endianness-sensitive) checksum
+/// so an opposite-endian file is reported as such rather than as a checksum
+/// failure.
+pub fn validate_superblock(buf: &[u8]) -> Result<Superblock, SuperblockError> {
     if buf.len() < size_of::<Superblock>() {
-        return None;
+        return Err(SuperblockError::TooShort);
     }
-    let sb = unsafe {
-        std::ptr::read_unaligned(buf.as_ptr() as *const Superblock)
-    };
-    if sb.is_valid() {
-        Some(sb)
-    } else {
-        None
+    let sb = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const Superblock) };
+    if sb.magic != META_MAGIC {
+        if sb.magic == META_MAGIC.swap_bytes() {
+            return Err(SuperblockError::EndiannessMismatch);
+        }
+        return Err(SuperblockError::BadMagic);
     }
+    if !sb.verify_checksum() {
+        return Err(SuperblockError::ChecksumMismatch);
+    }
+    if sb.version != FORMAT_VERSION {
+        return Err(SuperblockError::UnsupportedVersion {
+            found: sb.version,
+            supported: FORMAT_VERSION,
+        });
+    }
+    if sb.page_size != PAGE_SIZE as u32 {
+        return Err(SuperblockError::WrongPageSize {
+            found: sb.page_size,
+            expected: PAGE_SIZE as u32,
+        });
+    }
+    Ok(sb)
+}
+
+/// Decode a superblock from a raw page buffer, returning `None` for any
+/// validation failure.  Use [`validate_superblock`] when the specific reason is
+/// needed.
+pub fn decode_superblock(buf: &[u8]) -> Option<Superblock> {
+    validate_superblock(buf).ok()
 }
 
 /// Open the database file at `path` and recover the best-available superblock.
@@ -161,11 +266,11 @@ pub fn load_superblock(fs: &dyn FileSystem, path: &Path) -> io::Result<Superbloc
     handle.read_at(&mut primary_buf, 0)?;
     handle.read_at(&mut mirror_buf, PAGE_SIZE as u64)?;
 
-    let primary = decode_superblock(&primary_buf);
-    let mirror = decode_superblock(&mirror_buf);
+    let primary = validate_superblock(&primary_buf);
+    let mirror = validate_superblock(&mirror_buf);
 
     match (primary, mirror) {
-        (Some(p), Some(m)) => {
+        (Ok(p), Ok(m)) => {
             // Both are valid: prefer the higher generation.
             if m.generation > p.generation {
                 Ok(m)
@@ -173,12 +278,20 @@ pub fn load_superblock(fs: &dyn FileSystem, path: &Path) -> io::Result<Superbloc
                 Ok(p)
             }
         }
-        (Some(p), None) => Ok(p),
-        (None, Some(m)) => Ok(m),
-        (None, None) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "both superblock copies failed checksum validation",
-        )),
+        (Ok(p), Err(_)) => Ok(p),
+        (Err(_), Ok(m)) => Ok(m),
+        (Err(ep), Err(em)) => {
+            // Both invalid: report the more informative reason (a clear
+            // version/page-size/endianness problem beats generic corruption), so
+            // a future-version or opposite-endian file is not misreported as a
+            // checksum failure (finding L14).
+            let reason = if em.specificity() > ep.specificity() {
+                em
+            } else {
+                ep
+            };
+            Err(io::Error::new(reason.error_kind(), reason.to_string()))
+        }
     }
 }
 
@@ -190,6 +303,51 @@ mod tests {
     #[test]
     fn superblock_size_is_128() {
         assert_eq!(size_of::<Superblock>(), 128);
+    }
+
+    /// Regression gate for finding L14 (Task 218, 2026-06-05): a future-version
+    /// superblock with a valid checksum must be reported as an unsupported-version
+    /// error, not a misleading checksum failure.
+    #[test]
+    fn load_superblock_reports_unsupported_version_not_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let fs = PosixFileSystem::new(false);
+
+        // A v2 superblock with a VALID checksum, written to both copies.
+        let mut sb = Superblock::new(PAGE_SIZE as u32);
+        sb.version = FORMAT_VERSION + 1;
+        sb.update_checksum();
+        let enc = encode_superblock(&sb);
+        let handle = fs.open(&path, true).unwrap();
+        handle.set_len(2 * PAGE_SIZE as u64).unwrap();
+        handle.write_at(&enc, 0).unwrap();
+        handle.write_at(&enc, PAGE_SIZE as u64).unwrap();
+        handle.sync_all().unwrap();
+        drop(handle);
+
+        let err = load_superblock(&fs, &path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("version"), "must report an unsupported version, got: {msg}");
+        assert!(
+            !msg.contains("checksum"),
+            "must NOT report a checksum failure, got: {msg}"
+        );
+    }
+
+    /// Finding L14: an opposite-endian file (byte-swapped magic) is detected as
+    /// an endianness mismatch rather than corruption.
+    #[test]
+    fn validate_superblock_detects_endianness_mismatch() {
+        let mut sb = Superblock::new(PAGE_SIZE as u32);
+        sb.update_checksum();
+        let mut enc = encode_superblock(&sb);
+        enc[..8].copy_from_slice(&META_MAGIC.swap_bytes().to_ne_bytes());
+        assert!(matches!(
+            validate_superblock(&enc),
+            Err(SuperblockError::EndiannessMismatch)
+        ));
     }
 
     #[test]
