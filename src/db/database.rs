@@ -317,6 +317,31 @@ mod tests {
     use crate::storage::page::PAGE_SIZE;
 
     #[test]
+    fn drop_without_sync_flushes_and_is_recoverable() {
+        // Regression gate for finding M21 (2026-06-04): dropping a handle WITHOUT
+        // an explicit sync() must still flush (superblock/bitmap/catalog) via the
+        // engine's Drop impl, so the node remains discoverable after reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let db_path = dir.path().join("db");
+
+        let node_id = {
+            let mut db = Database::init(&db_path, &fs, GraphMode::Lpg).unwrap();
+            let (_slot, id) = db.create_node(NodeBuilder::new().label(7), &fs).unwrap();
+            id
+            // NOTE: no db.sync(&fs) — the engine's Drop must flush.
+        };
+
+        let db = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap();
+        let node = db
+            .get_node(node_id, &fs)
+            .unwrap()
+            .expect("node must survive a drop without explicit sync");
+        assert_eq!(node.node_id, node_id);
+        assert_eq!(node.label_id, 7);
+    }
+
+    #[test]
     fn init_and_open_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let fs = PosixFileSystem::new(false);

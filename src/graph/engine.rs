@@ -448,8 +448,13 @@ impl GraphStorageEngine {
         }
 
         // Rebuild secondary indexes from primary data pages.  This also
-        // seeds the id_allocator with the highest id seen on disk.
-        let _ = engine.rebuild_indexes(fs);
+        // seeds the id_allocator with the highest id seen on disk.  A failure
+        // here means the indexes are incomplete, so MATCH/get_node would return
+        // wrong/empty results — surface it rather than returning a silently
+        // broken handle (finding M21).
+        engine
+            .rebuild_indexes(fs)
+            .map_err(|e| io::Error::other(format!("index rebuild failed during open: {e}")))?;
 
         // Rebuild the RDF term dictionary and permutation index from the RDF
         // primary records on the data pages.  No-op in LPG databases (no RDF
@@ -2164,6 +2169,29 @@ fn decode_slot_ref(bytes: &[u8]) -> Option<SlotRef> {
     }
     let raw = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     Some(SlotRef { raw })
+}
+
+impl Drop for GraphStorageEngine {
+    /// Best-effort durability barrier on handle drop (finding M21).
+    ///
+    /// `sync()` flushes the WAL, both superblock copies, the allocation bitmap,
+    /// and the schema-catalog sidecar.  The data file and WAL are written through
+    /// their own long-lived handles, so the only `FileSystem` `sync` actually
+    /// consumes is one for the buffered catalog sidecar — exactly what the
+    /// engine's own `wal_fs` provides.  Without this, dropping a handle WITHOUT an
+    /// explicit `sync()` silently loses committed in-memory superblock/bitmap/
+    /// catalog state.
+    ///
+    /// Errors are ignored (a `Drop` cannot return a `Result`); an explicit
+    /// `sync()` remains the supported way to observe and handle flush failures.
+    /// The flush is wrapped in `catch_unwind` so a poisoned catalog lock (from an
+    /// earlier panic) cannot turn a normal unwind into a process abort.
+    fn drop(&mut self) {
+        let fs = Arc::clone(&self.wal_fs);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self.sync(fs.as_ref());
+        }));
+    }
 }
 
 impl StorageEngine for GraphStorageEngine {
