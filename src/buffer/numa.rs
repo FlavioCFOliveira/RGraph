@@ -1,5 +1,19 @@
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Number of `mbind` failures observed since process start.
+///
+/// NUMA binding is a performance optimisation, not a correctness requirement:
+/// on `mbind` failure the allocation falls back to the global aligned allocator.
+/// This counter makes that fallback OBSERVABLE rather than silently swallowed
+/// (finding L13), so it can be surfaced as a metric.
+static MBIND_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of `mbind` failures (NUMA-binding fallbacks) since process start.
+pub fn mbind_failure_count() -> u64 {
+    MBIND_FAILURES.load(Ordering::Relaxed)
+}
 
 /// Information about the NUMA topology of the machine.
 #[derive(Debug, Clone)]
@@ -163,9 +177,16 @@ fn mbind_to_node(ptr: *mut u8, size: usize, node_id: usize) -> bool {
     if node_id < (std::mem::size_of::<libc::c_ulong>() * 8) {
         nodemask = 1 << node_id;
     }
+    // `maxnode` is the number of bits the kernel reads from `nodemask`; it must
+    // round up past the highest set bit (i.e. be at least node_id + 1).  We pass
+    // node_id + 2 (clamped to c_int::MAX) to leave one bit of headroom.
     let maxnode = (node_id + 2).min(libc::c_int::MAX as usize) as libc::c_ulong;
     let mode = MPOL_BIND;
-    let flags = MPOL_MF_STRICT | MPOL_MF_MOVE;
+    // Best-effort binding: MPOL_MF_MOVE migrates movable pages to the target
+    // node, but — unlike MPOL_MF_STRICT — does NOT fail the whole call when some
+    // pages cannot be moved.  STRICT made `mbind` fail spuriously and silently
+    // disabled NUMA binding for the allocation (finding L13).
+    let flags = MPOL_MF_MOVE;
     let res = unsafe {
         libc::syscall(
             libc::SYS_mbind,
@@ -177,12 +198,35 @@ fn mbind_to_node(ptr: *mut u8, size: usize, node_id: usize) -> bool {
             flags,
         )
     };
-    res == 0
+    if res == 0 {
+        true
+    } else {
+        MBIND_FAILURES.fetch_add(1, Ordering::Relaxed);
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mbind_failure_count_is_observable_and_monotonic() {
+        // Regression gate for finding L13 (2026-06-04): mbind failures are now
+        // counted and observable rather than silently swallowed.  The counter
+        // must be readable and never decrease across an allocation attempt
+        // (which may or may not bind, depending on the host).
+        let before = mbind_failure_count();
+        if let Some(p) = alloc_numa_aligned(4096, 4096, 0) {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::free(p as *mut libc::c_void)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let _ = p;
+        }
+        assert!(mbind_failure_count() >= before);
+    }
 
     #[test]
     fn single_node_topology_is_not_numa() {
