@@ -83,6 +83,42 @@ dispatch strips the header before matching entity size (56 → node, 88 → edge
    call it + the dangerous-structure (pivot) check in `commit` for Serializable.
    Engine/server write-skew harness asserts exactly-one-abort.
 
+## OBSTACLE discovered during write-path design (2026-06-05): intrusive adjacency vs MVCC
+
+`NodeRecord`/`EdgeRecord` carry **intrusive adjacency linked-lists**
+(`first_outgoing_edge`, `first_incoming_edge`, and `prev/next_source_edge`,
+`prev/next_target_edge`). Versioning the whole record collides with this:
+
+- A node's two versions (differing in `first_property`) both contain adjacency
+  head pointers. They must stay consistent, so either adjacency is duplicated
+  across versions (and every adjacency change rewrites all versions) or it is
+  factored out.
+- An edge insert mutates the **endpoints' adjacency heads** and the neighbour
+  edges' `prev/next` pointers. Under whole-record versioning, that insert would
+  have to create new versions of the endpoint nodes and the spliced edges, and a
+  snapshot traversal would have to follow only the edge versions visible to it —
+  a deep, subtle change to every adjacency walk.
+
+A property store (PostgreSQL) never hits this because relationships are separate
+rows, not intrusive pointers. This makes "version the whole record" much larger
+and riskier than a header prepend.
+
+### Resolution options (needs a call)
+
+1. **Version only the value part; keep topology single-version.** Split each
+   record into an immutable-topology part (adjacency pointers) that stays
+   single-version + in-place, and a versioned value part (`label_id`,
+   `first_property`). The version chain links value parts only; adjacency walks
+   are unchanged. Closes 220's *property* UPDATE gate (the acceptance test is
+   about property values v0/v1) without re-architecting adjacency. **Recommended**
+   — smallest correct change that satisfies the gate.
+2. **Full whole-record versioning** (adjacency included). Correct and complete,
+   but every edge insert versions its endpoints, and every adjacency traversal
+   becomes snapshot-filtered. Largest effort; touches the CSR and all scans.
+3. **Move adjacency out of the record** (separate adjacency store / rely on the
+   CSR), then version the now-topology-free record freely. Clean long-term, but a
+   broad storage refactor.
+
 ## Risks / notes
 
 - Recovery: PageInsert logs full page after-images, so version headers ride along
