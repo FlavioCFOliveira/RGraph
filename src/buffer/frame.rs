@@ -235,10 +235,22 @@ impl Frame {
     ///
     /// The `io_mutex` round-trip provides the acquire/release fence; the
     /// `io_inflight` check provides the liveness condition.
+    ///
+    /// The caller has already set `pin_count > 0` (at fix time).  The SeqCst
+    /// fence below orders that pin store before the `io_inflight` load in the
+    /// single total order of SeqCst operations.  Together with the symmetric
+    /// fence on the flusher side (`flush_single_frame`: store `io_inflight`,
+    /// fence, load `pin_count`), this makes the Dekker-style writer/flusher
+    /// handshake sequentially consistent: the writer and a concurrent flusher
+    /// can never BOTH observe the other's flag as not-yet-set and both proceed
+    /// to the same bytes.  Without it a StoreLoad reorder permits exactly that
+    /// (a data race / overlapping `&mut`, UB on weak-memory targets such as
+    /// aarch64).  See reliability-audit finding H10 (2026-06-04).
     pub(crate) fn wait_io_quiescent(&self) {
         loop {
             {
                 let _io_guard = self.io_mutex.lock();
+                std::sync::atomic::fence(Ordering::SeqCst);
                 if !self.desc.io_inflight.load(Ordering::Acquire) {
                     return;
                 }

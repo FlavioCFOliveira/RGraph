@@ -746,6 +746,14 @@ impl BufferPool {
             return Ok(()); // another thread is already flushing it
         }
 
+        // SeqCst fence: order the `io_inflight` store above before the
+        // `is_pinned` load below, mirroring the writer's fence in
+        // `Frame::wait_io_quiescent`.  This makes the two-flag (pin /
+        // io_inflight) handshake sequentially consistent, so a concurrent writer
+        // and this flusher can never both proceed to the same frame bytes
+        // (finding H10).
+        std::sync::atomic::fence(Ordering::SeqCst);
+
         // A pinned frame may have a live `PageGuard` writer mutating the bytes;
         // flushing it would read bytes that overlap that writer's `&mut`.  Skip
         // it and let a later flush (or `flush_all`) pick it up once unpinned.

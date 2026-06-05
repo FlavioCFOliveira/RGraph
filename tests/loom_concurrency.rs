@@ -34,7 +34,7 @@
 // so libtest finds no tests and the binary links cleanly.
 #![cfg(rgraph_loom)]
 
-use loom::sync::atomic::{AtomicU8, AtomicU16, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering, fence};
 use loom::sync::{Arc, Mutex};
 use rgraph::index::{LatchCoupling, LatchMode};
 
@@ -199,5 +199,74 @@ fn pin_count_blocks_eviction() {
             !final_mapped,
             "frame state and shard-map mapping diverged (torn eviction)"
         );
+    });
+}
+
+/// Model 3 — the writer/flusher byte-exclusion handshake (finding H10).
+///
+/// The buffer pool lets a `PageGuard` writer form a lock-free `&mut` to a
+/// frame's bytes while a background flusher may concurrently access them.  Mutual
+/// exclusion rests on a Dekker-style two-flag handshake:
+///
+/// * the **writer** sets `pin_count` (at fix time) then, in
+///   `Frame::wait_io_quiescent`, fences and reads `io_inflight`;
+/// * the **flusher** (`BufferPool::flush_single_frame`) swaps `io_inflight` true
+///   then fences and reads `pin_count` (`is_pinned`).
+///
+/// Each side enters its byte-access critical section only if it observed the
+/// other's flag unset.  Without a StoreLoad barrier on each side, a permitted
+/// reorder lets BOTH observe the other's flag as not-yet-set and both enter —
+/// overlapping access (UB on weak-memory targets).  The SeqCst fences (present
+/// in the real code and mirrored here) make the handshake sequentially
+/// consistent: at least one side must back off, so loom — which explores every
+/// interleaving AND memory ordering — never finds a state with both in the CS.
+/// (Removing either fence below makes loom fail, which is the point.)
+#[test]
+fn writer_flusher_handshake_excludes_concurrent_byte_access() {
+    loom::model(|| {
+        let pin = Arc::new(AtomicBool::new(false));
+        let io_inflight = Arc::new(AtomicBool::new(false));
+        // Number of threads currently in the byte-access critical section; must
+        // never exceed 1.
+        let in_cs = Arc::new(AtomicU8::new(0));
+
+        let (w_pin, w_io, w_cs) = (
+            Arc::clone(&pin),
+            Arc::clone(&io_inflight),
+            Arc::clone(&in_cs),
+        );
+        let writer = loom::thread::spawn(move || {
+            w_pin.store(true, Ordering::Relaxed); // pin established at fix time
+            fence(Ordering::SeqCst);
+            if !w_io.load(Ordering::Acquire) {
+                assert_eq!(
+                    w_cs.fetch_add(1, Ordering::AcqRel),
+                    0,
+                    "writer entered the byte CS while the flusher was in it"
+                );
+                w_cs.fetch_sub(1, Ordering::AcqRel);
+            }
+        });
+
+        let (f_pin, f_io, f_cs) = (
+            Arc::clone(&pin),
+            Arc::clone(&io_inflight),
+            Arc::clone(&in_cs),
+        );
+        let flusher = loom::thread::spawn(move || {
+            f_io.swap(true, Ordering::Acquire); // models io_inflight.swap(true)
+            fence(Ordering::SeqCst);
+            if !f_pin.load(Ordering::Relaxed) {
+                assert_eq!(
+                    f_cs.fetch_add(1, Ordering::AcqRel),
+                    0,
+                    "flusher entered the byte CS while the writer was in it"
+                );
+                f_cs.fetch_sub(1, Ordering::AcqRel);
+            }
+        });
+
+        writer.join().unwrap();
+        flusher.join().unwrap();
     });
 }
