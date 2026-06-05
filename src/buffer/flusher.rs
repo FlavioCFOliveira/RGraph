@@ -116,6 +116,9 @@ impl Flusher {
         candidates: &[crate::buffer::frame::FrameId],
         durable: u64,
     ) {
+        if pool.io_failed() {
+            return; // storage permanently failed; do not attempt further flushes
+        }
         let mut pending: Vec<Pending> = Vec::with_capacity(candidates.len());
         for &fid in candidates {
             let frame = pool.frame(fid);
@@ -256,6 +259,11 @@ impl Flusher {
         if extent.is_empty() {
             return Ok(());
         }
+        if pool.io_failed() {
+            return Err(std::io::Error::other(
+                "buffer pool storage permanently failed (prior fsync error)",
+            ));
+        }
 
         let offset = extent[0].page_id * PAGE_SIZE as u64;
         let handle = fs.open(&pool.data_path, false)?;
@@ -284,7 +292,13 @@ impl Flusher {
         }
 
         handle.writev_at(&slices, offset)?;
-        handle.sync_data()?;
+        if let Err(e) = handle.sync_data() {
+            // fsyncgate: the first fsync failure is permanent and non-retryable;
+            // poison the pool so no later flush falsely reports a page durable
+            // (finding M10).  The frames stay io_inflight/dirty for the caller.
+            pool.mark_io_failed();
+            return Err(e);
+        }
         Ok(())
     }
 

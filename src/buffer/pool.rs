@@ -6,7 +6,7 @@ use crate::wal::doublewrite::DoubleWriteBuffer;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Number of shards in the page-to-frame mapping table.
@@ -176,6 +176,13 @@ pub struct BufferPool {
     /// double-write buffer before the in-place write so that partial writes
     /// can be detected and repaired on restart.
     doublewrite: Option<Arc<DoubleWriteBuffer>>,
+    /// Set once any flush `fsync` has failed.  After an `fsync` returns an error
+    /// (e.g. EIO) the kernel may clear the file's error state, so a later
+    /// `fsync` — especially on a freshly re-opened fd — can return success even
+    /// though the data was never written (the "fsyncgate" lost-write class).
+    /// Once poisoned, all flush paths refuse to run and never mark a frame clean,
+    /// so a dirty page is never falsely reported durable (finding M10).
+    io_failed: AtomicBool,
 }
 
 // SAFETY: `BufferPool` is `Send + Sync` because:
@@ -234,7 +241,22 @@ impl BufferPool {
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             doublewrite: None,
+            io_failed: AtomicBool::new(false),
         }
+    }
+
+    /// Has a flush `fsync` permanently failed?  Once true the pool is poisoned:
+    /// no further flush will run or mark a page clean, so the caller must treat
+    /// the storage as failed (read-only / surfaced error) rather than trusting a
+    /// later "successful" `fsync` on a re-opened fd (finding M10).
+    pub fn io_failed(&self) -> bool {
+        self.io_failed.load(Ordering::Acquire)
+    }
+
+    /// Mark the pool's storage as permanently failed (called on the first flush
+    /// `fsync` error, here or from the background flusher).
+    pub(crate) fn mark_io_failed(&self) {
+        self.io_failed.store(true, Ordering::Release);
     }
 
     /// Which shard owns this page id?
@@ -756,6 +778,15 @@ impl BufferPool {
             return Ok(());
         }
 
+        // Refuse to flush once storage has permanently failed: a later fsync on
+        // a re-opened fd could falsely report success and mark the page clean,
+        // silently losing the write (finding M10).
+        if self.io_failed.load(Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "buffer pool storage permanently failed (prior fsync error)",
+            ));
+        }
+
         // Mark inflight so the sweeper and other flushers skip it.
         let was_inflight = frame.desc.io_inflight.swap(true, Ordering::Acquire);
         if was_inflight {
@@ -805,7 +836,15 @@ impl BufferPool {
             let bytes = unsafe { frame.buf.get() };
             handle.write_at(bytes, offset)?;
         }
-        handle.sync_data()?;
+        if let Err(e) = handle.sync_data() {
+            // fsyncgate: the first fsync failure is permanent and non-retryable.
+            // Poison the pool, leave the frame DIRTY (do not mark it clean), and
+            // surface the error — so no later flush can falsely report this (or
+            // any) page durable (finding M10).
+            self.io_failed.store(true, Ordering::Release);
+            frame.desc.io_inflight.store(false, Ordering::Release);
+            return Err(e);
+        }
 
         // DW buffer can now be cleared: the in-place write completed durably.
         if let Some(dw) = &self.doublewrite {
@@ -981,6 +1020,72 @@ mod tests {
         assert_eq!(
             hdr_page_id, 12,
             "prefetched page 12 must contain page 12, not a neighbouring page"
+        );
+    }
+
+    #[test]
+    fn flush_poisons_pool_on_fsync_failure_no_false_durability() {
+        // Regression gate for finding M10 (2026-06-04): the first flush fsync
+        // failure poisons the pool — the frame stays dirty, the error is
+        // surfaced, and NO later flush can falsely report the page durable (even
+        // once fsync 'works' again, which on a re-opened fd it can do after the
+        // kernel clears the error state).
+        use crate::io::{FaultConfig, FaultInjectFileSystem, FaultKind, FaultRule, OpMask};
+        use crate::storage::page::{PageType, SlottedPage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rgraph.db");
+        {
+            let fs = PosixFileSystem::new(false);
+            let handle = fs.open(&path, true).unwrap();
+            for pid in 0..16u64 {
+                let mut page = SlottedPage::init(pid, PageType::SlottedData);
+                page.update_checksum();
+                handle.write_at(&page.buf, pid * PAGE_SIZE as u64).unwrap();
+            }
+            handle.sync_data().unwrap();
+        }
+
+        let fault = FaultInjectFileSystem::new(Box::new(PosixFileSystem::new(false)));
+        let pool = BufferPool::new(4, path);
+
+        // Dirty page 3, then grab its frame id (guard dropped → unpinned).
+        {
+            let g = pool.fix_page(&fault, 3).unwrap();
+            g.set_dirty(5);
+        }
+        let fid = pool.fix_page(&fault, 3).unwrap().frame_id;
+
+        // Make fsync fail and flush: the error must be surfaced, the pool
+        // poisoned, and the frame left dirty.
+        fault.set_config(FaultConfig {
+            rules: vec![FaultRule {
+                op_mask: OpMask {
+                    sync_data: true,
+                    sync_all: true,
+                    ..OpMask::default()
+                },
+                kind: FaultKind::FsyncFail,
+                every_n: None,
+            }],
+        });
+        assert!(pool.flush_single_frame(&fault, fid).is_err());
+        assert!(pool.io_failed(), "pool must be poisoned after an fsync failure");
+        assert!(
+            pool.frame(fid).desc.dirty.load(Ordering::Acquire),
+            "frame must remain dirty after a failed flush"
+        );
+
+        // Even with fsync 'working' again, the poisoned pool must refuse to flush
+        // rather than falsely report the page durable.
+        fault.set_config(FaultConfig::default());
+        assert!(
+            pool.flush_single_frame(&fault, fid).is_err(),
+            "poisoned pool must not falsely succeed a later flush"
+        );
+        assert!(
+            pool.frame(fid).desc.dirty.load(Ordering::Acquire),
+            "frame must still be dirty (never falsely marked clean)"
         );
     }
 
