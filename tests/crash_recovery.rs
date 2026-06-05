@@ -179,8 +179,11 @@ fn fsync_failure_is_surfaced() {
         "db.sync must surface the underlying fsync failure, not swallow it"
     );
 
-    // Recovery: with fsync working again, a clean reopen must succeed.
+    // Recovery: with fsync working again, a clean reopen must succeed.  A real
+    // crash ends the process and the OS releases the exclusive lock; here we
+    // drop the crashed handle to model that before reopening (finding C8).
     clear_rules(&fs);
+    drop(db);
     let _db = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap();
 }
 

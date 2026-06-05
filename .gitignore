@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# Local Claude Code session/worktree state (not part of the project)
+.claude/

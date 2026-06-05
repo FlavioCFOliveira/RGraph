@@ -19,6 +19,14 @@ pub struct Database {
     pub path: PathBuf,
     pub graph_mode: GraphMode,
     graph: Graph,
+    /// Exclusive inter-process lock held for the lifetime of the handle.
+    ///
+    /// Declared LAST so it drops after `graph` — the engine's flush-on-Drop runs
+    /// while the lock is still held, and the `flock` is released only afterwards.
+    /// Holding this real OS lock prevents two processes (or two handles) opening
+    /// the same database concurrently and racing the superblock/bitmap/WAL into
+    /// incoherence (finding C8).
+    _lock: std::fs::File,
 }
 
 impl std::fmt::Debug for Database {
@@ -257,12 +265,9 @@ impl Database {
         }
         fs.create_dir_all(path)?;
 
-        // Advisory lock to prevent double-open.
-        let lock = path.join(Self::LOCK_FILE);
-        {
-            let handle = fs.open(&lock, true)?;
-            handle.sync_data()?;
-        }
+        // Acquire a real exclusive inter-process lock (held for the handle's
+        // lifetime) before touching any data (finding C8).
+        let lock_file = Self::acquire_exclusive_lock(&path.join(Self::LOCK_FILE))?;
 
         let data_path = path.join(PageManager::DATA_FILE);
         let engine = GraphStorageEngine::init(data_path, fs)?;
@@ -270,7 +275,34 @@ impl Database {
             path: path.to_path_buf(),
             graph_mode,
             graph: Graph::new(engine),
+            _lock: lock_file,
         })
+    }
+
+    /// Acquire a non-blocking exclusive `flock` on `lock_path` (creating it if
+    /// needed).  Returns the held file handle; the lock is released when it
+    /// drops.  Fails with `WouldBlock` if another process/handle already holds it.
+    fn acquire_exclusive_lock(lock_path: &Path) -> io::Result<std::fs::File> {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)?;
+        // SAFETY: `file` owns a valid fd for the duration of this call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "database is already open by another process (lock held)",
+                ));
+            }
+            return Err(err);
+        }
+        Ok(file)
     }
 
     /// Open an existing database, recovering WAL if necessary.
@@ -282,14 +314,9 @@ impl Database {
             ));
         }
 
-        // Check advisory lock.
-        let lock = path.join(Self::LOCK_FILE);
-        if !fs.exists(&lock) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "database lock file missing; partial init?",
-            ));
-        }
+        // Acquire the real exclusive inter-process lock before opening — a second
+        // concurrent open (same process or another) is rejected (finding C8).
+        let lock_file = Self::acquire_exclusive_lock(&path.join(Self::LOCK_FILE))?;
 
         let data_path = path.join(PageManager::DATA_FILE);
         if !fs.exists(&data_path) {
@@ -304,6 +331,7 @@ impl Database {
             path: path.to_path_buf(),
             graph_mode,
             graph: Graph::new(engine),
+            _lock: lock_file,
         })
     }
 }
@@ -315,6 +343,25 @@ mod tests {
     use crate::io::{AlignedBuffer, posix::PosixFileSystem};
     use crate::storage::meta::decode_superblock;
     use crate::storage::page::PAGE_SIZE;
+
+    #[test]
+    fn concurrent_open_is_rejected_by_the_lock() {
+        // Regression gate for finding C8 (2026-06-05): a second open of the same
+        // database while a handle is live must be rejected by the exclusive lock,
+        // and succeed again once the first handle is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = PosixFileSystem::new(false);
+        let db_path = dir.path().join("db");
+
+        let db1 = Database::init(&db_path, &fs, GraphMode::Lpg).unwrap();
+        // Second open while db1 holds the lock must fail.
+        let err = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        // Release the first handle; a fresh open now succeeds.
+        drop(db1);
+        let _db2 = Database::open(&db_path, &fs, GraphMode::Lpg).unwrap();
+    }
 
     #[test]
     fn drop_without_sync_flushes_and_is_recoverable() {
