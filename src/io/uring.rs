@@ -188,14 +188,7 @@ impl FileHandle for IoUringFileHandle {
                 .map_err(|_| io::Error::other("io_uring submission queue full"))?;
         }
 
-        ring.submit_and_wait(1)?;
-
-        let mut cq = ring.completion();
-        let cqe = cq
-            .next()
-            .ok_or_else(|| io::Error::other("io_uring completion queue empty"))?;
-
-        let res = cqe.result();
+        let res = submit_and_reap(&mut ring, 0x04)?;
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
         }
@@ -240,14 +233,7 @@ impl FileHandle for IoUringFileHandle {
                 .map_err(|_| io::Error::other("io_uring submission queue full"))?;
         }
 
-        ring.submit_and_wait(1)?;
-
-        let mut cq = ring.completion();
-        let cqe = cq
-            .next()
-            .ok_or_else(|| io::Error::other("io_uring completion queue empty"))?;
-
-        let res = cqe.result();
+        let res = submit_and_reap(&mut ring, 0x06)?;
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
         }
@@ -312,19 +298,60 @@ impl IoUringFileHandle {
                 .map_err(|_| io::Error::other("io_uring submission queue full"))?;
         }
 
-        ring.submit_and_wait(1)?;
-
-        let mut cq = ring.completion();
-        let cqe = cq
-            .next()
-            .ok_or_else(|| io::Error::other("io_uring completion queue empty"))?;
-
-        let res = cqe.result();
+        let res = submit_and_reap(&mut ring, 0x03)?;
         if res < 0 {
             return Err(io::Error::from_raw_os_error(-res));
         }
         Ok(())
     }
+}
+
+/// Submit the single queued SQE, wait for its completion, and return its
+/// `result()`.
+///
+/// * Retries `submit_and_wait` while it returns `EINTR` — `io_uring_enter` can
+///   be interrupted by a signal and that must not surface as an I/O error
+///   (finding L11).
+/// * Verifies the completion's `user_data` equals `expected_tag` so a stale or
+///   mis-attributed CQE can never be interpreted as this operation's result
+///   (finding M11).  On any error after the SQE was submitted — including a
+///   `user_data` mismatch — the completion queue is drained so a leftover CQE
+///   cannot poison the next operation that reuses this single shared ring.
+fn submit_and_reap(ring: &mut IoUring, expected_tag: u64) -> io::Result<i32> {
+    loop {
+        match ring.submit_and_wait(1) {
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                drain_completions(ring);
+                return Err(e);
+            }
+        }
+    }
+
+    let (tag, res) = {
+        let mut cq = ring.completion();
+        let cqe = cq
+            .next()
+            .ok_or_else(|| io::Error::other("io_uring completion queue empty"))?;
+        (cqe.user_data(), cqe.result())
+    };
+
+    if tag != expected_tag {
+        drain_completions(ring);
+        return Err(io::Error::other(format!(
+            "stale io_uring completion: expected user_data {:#x}, got {:#x}",
+            expected_tag, tag
+        )));
+    }
+    Ok(res)
+}
+
+/// Discard any pending completion-queue entries so a stale CQE left by an
+/// errored or mis-attributed operation cannot be reaped by a later one.
+fn drain_completions(ring: &mut IoUring) {
+    let mut cq = ring.completion();
+    while cq.next().is_some() {}
 }
 
 #[cfg(test)]
