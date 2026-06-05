@@ -415,6 +415,15 @@ impl GraphStorageEngine {
             }
         }
 
+        // Reconcile the allocator high-water mark and bitmaps against the data
+        // actually on disk.  On the server autocommit path the WAL and data
+        // pages are durable but the superblock/bitmaps are not synced per write,
+        // so after a crash the persisted next_free_page_id and bitmaps lag the
+        // real high-water mark.  Reconciling here — before index rebuild — makes
+        // the recovered pages discoverable and stops the next allocation from
+        // re-handing-out an in-use page (finding H12).
+        pm.reconcile_from_disk(fs)?;
+
         let config = BPlusTreeConfig::default();
         let wal_fs_arc = Arc::new(crate::io::posix::PosixFileSystem::new(false));
         let mut engine = Self {

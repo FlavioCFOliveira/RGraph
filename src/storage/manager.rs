@@ -285,6 +285,68 @@ impl PageManager {
         }
     }
 
+    /// Reconcile the in-memory allocation state against what is actually on
+    /// disk, advancing `next_free_page_id` and marking live pages allocated.
+    ///
+    /// On a write path that flushes the WAL and the data pages but **not** the
+    /// superblock/bitmaps (the server autocommit path never calls `sync()`), a
+    /// crash leaves the persisted `next_free_page_id` and the bitmaps lagging
+    /// the real high-water mark.  ARIES REDO restores the committed *data*
+    /// pages, but not this allocator metadata — so without reconciliation the
+    /// allocator would re-hand-out an in-use page and overwrite committed
+    /// records, and index rebuild (which scans bitmap-allocated pages) would
+    /// miss the recovered data entirely (finding H12).
+    ///
+    /// This scans every data page present in the file, marks each record-bearing
+    /// page allocated in its region bitmap (creating the bitmap slot if needed),
+    /// and advances `next_free_page_id` past the highest in-use page.  It only
+    /// ever raises `next_free_page_id`, so it is idempotent and safe on a cleanly
+    /// synced database (where it re-marks the same pages and changes nothing).
+    /// Torn or zeroed placeholder pages (checksum failure or `slot_count == 0`)
+    /// are skipped, so a page allocated but not yet written stays reusable.
+    pub fn reconcile_from_disk(&mut self, fs: &dyn FileSystem) -> io::Result<()> {
+        use crate::storage::page::SlottedPage;
+
+        let handle = fs.open(&self.data_path, false)?;
+        let file_len = handle.len()?;
+        let high_water = file_len / PAGE_SIZE as u64;
+
+        let mut max_in_use = self.superblock.next_free_page_id.saturating_sub(1);
+        let mut pid = FIRST_DATA_PAGE_ID;
+        while pid < high_water {
+            if Self::is_bitmap_page(pid) {
+                pid += 1;
+                continue;
+            }
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            let offset = pid * PAGE_SIZE as u64;
+            if handle.read_at(&mut buf, offset).is_err() || !SlottedPage::verify_checksum_bytes(&buf)
+            {
+                pid += 1;
+                continue;
+            }
+            let page = SlottedPage::new(buf);
+            if page.header().slot_count > 0 {
+                let slot = (pid as usize) / PAGES_PER_BITMAP;
+                self.ensure_bitmap(slot as u64);
+                self.bitmaps[slot].allocate(pid);
+                if pid > max_in_use {
+                    max_in_use = pid;
+                }
+            }
+            pid += 1;
+        }
+
+        let reconciled = max_in_use.saturating_add(1);
+        if reconciled > self.superblock.next_free_page_id {
+            self.superblock.next_free_page_id = reconciled;
+        }
+        if high_water > self.superblock.total_page_count {
+            self.superblock.total_page_count = high_water;
+        }
+        Ok(())
+    }
+
     /// Return a page to the free list.
     ///
     /// If a buffer pool has been attached via [`set_pool`], any frame
@@ -744,6 +806,48 @@ mod tests {
             0x22,
             "region-1 data must survive reopen intact"
         );
+    }
+
+    /// Finding H12 (Task 210): `reconcile_from_disk` must raise a stale
+    /// `next_free_page_id` to the real high-water mark and mark record-bearing
+    /// pages allocated, while leaving empty placeholder pages reusable.
+    #[test]
+    fn reconcile_from_disk_recovers_high_water_mark() {
+        use crate::storage::page::{PageType, SlottedPage};
+        let (_dir, fs, path) = temp_fs();
+
+        // Write two real data pages with records via a fresh manager.
+        let (p_a, p_b) = {
+            let mut pm = PageManager::init(path.clone(), PAGE_SIZE as u32, &fs).unwrap();
+            let a = pm.allocate_page();
+            let b = pm.allocate_page();
+            for pid in [a, b] {
+                let mut page = SlottedPage::init(pid, PageType::SlottedData);
+                page.insert(&[0xCDu8; 16]); // one slot -> slot_count > 0
+                page.update_checksum();
+                pm.write_page(&fs, pid, &mut page.buf).unwrap();
+            }
+            // Deliberately do NOT sync the superblock/bitmaps (crash model).
+            (a, b)
+        };
+
+        // Reopen with a STALE superblock (next_free_page_id still at the initial
+        // FIRST_DATA_PAGE_ID) and an empty bitmap, then reconcile.
+        let sb = Superblock::new(PAGE_SIZE as u32);
+        let bitmap_buf = AlignedBuffer::zeroed(PAGE_SIZE);
+        let mut pm = PageManager::open_multi(path, sb, vec![bitmap_buf], &fs).unwrap();
+        assert!(pm.superblock.next_free_page_id <= FIRST_DATA_PAGE_ID);
+
+        pm.reconcile_from_disk(&fs).unwrap();
+
+        // High-water mark advanced past the last record-bearing page.
+        assert_eq!(pm.superblock.next_free_page_id, p_b + 1);
+        // Both record pages are now marked allocated.
+        assert!(pm.bitmaps[0].is_set(p_a));
+        assert!(pm.bitmaps[0].is_set(p_b));
+        // A fresh allocation must not collide with the recovered pages.
+        let fresh = pm.allocate_page();
+        assert!(fresh > p_b, "fresh allocation must not alias a recovered page");
     }
 
     #[test]

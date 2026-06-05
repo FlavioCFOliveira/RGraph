@@ -444,3 +444,86 @@ fn create_relationship_survives_crash_atomically() {
         "edge must be in the target's incoming adjacency after restart"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 8. Server autocommit path: the allocator high-water mark is reconciled on
+//    reopen, so an unsynced crash never causes page double-allocation.
+// ---------------------------------------------------------------------------
+
+/// Regression gate for finding H12 (Task 210, 2026-06-05).
+///
+/// The server autocommit path flushes the WAL and writes data pages durably but
+/// never calls `sync()`, so the superblock's `next_free_page_id` and the bitmaps
+/// are not persisted per write.  After a crash, ARIES REDO restores the
+/// committed data pages but not the allocator metadata: without reconciliation
+/// the allocator would re-hand-out an in-use page (overwriting committed
+/// records) and index rebuild (which scans bitmap-allocated pages) would miss
+/// the recovered data.
+///
+/// This drives the [`Graph`] engine the server wraps: enough nodes to span more
+/// than one data page, no `sync()`, a simulated crash (`mem::forget` skips the
+/// engine's `Drop`-flush), reopen, then more writes — asserting every committed
+/// node survives, `next_free_page_id` was reconciled, and no committed node is
+/// overwritten by a post-reopen allocation.
+#[test]
+fn server_path_high_water_mark_reconciled_on_reopen() {
+    use rgraph::graph::engine::GraphStorageEngine;
+    use rgraph::graph::graph::Graph;
+    use rgraph::storage::manager::FIRST_DATA_PAGE_ID;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fs = PosixFileSystem::new(false);
+    let data_path = dir.path().join("recon.db");
+
+    // ~300 nodes guarantees more than one 8 KiB data page (NodeRecord = 32 B).
+    const N: usize = 300;
+    let ids: Vec<u64> = {
+        let engine = GraphStorageEngine::init(data_path.clone(), &fs).unwrap();
+        let mut graph = Graph::new(engine);
+        let mut ids = Vec::with_capacity(N);
+        for _ in 0..N {
+            let (_slot, id) = graph.create_node(NodeBuilder::new().label(1), &fs).unwrap();
+            ids.push(id);
+        }
+        // Crash: skip the Drop-flush, which would otherwise sync the superblock
+        // and bitmaps and hide the bug.
+        std::mem::forget(graph);
+        ids
+    };
+
+    // Reopen: recovery + reconcile.
+    let engine2 = GraphStorageEngine::open(data_path.clone(), &fs).unwrap();
+    let mut graph2 = Graph::new(engine2);
+
+    // next_free_page_id must have been reconciled past the fixed metadata pages;
+    // a stale superblock would still read FIRST_DATA_PAGE_ID.
+    let next_free = graph2.engine().page_manager.superblock.next_free_page_id;
+    assert!(
+        next_free > FIRST_DATA_PAGE_ID + 1,
+        "next_free_page_id must be reconciled to the real high-water mark, got {next_free}"
+    );
+
+    // Every committed node must still be present after recovery.
+    for id in &ids {
+        assert!(
+            graph2.get_node(*id, &fs).unwrap().is_some(),
+            "committed node {id} must survive the unsynced crash"
+        );
+    }
+
+    // Writing more must NOT overwrite any previously committed node.
+    let mut new_ids = Vec::new();
+    for _ in 0..50 {
+        let (_s, id) = graph2.create_node(NodeBuilder::new().label(2), &fs).unwrap();
+        new_ids.push(id);
+    }
+    for id in &ids {
+        assert!(
+            graph2.get_node(*id, &fs).unwrap().is_some(),
+            "committed node {id} was overwritten by a post-reopen allocation"
+        );
+    }
+    for id in &new_ids {
+        assert!(graph2.get_node(*id, &fs).unwrap().is_some());
+    }
+}
