@@ -337,8 +337,6 @@ impl GraphStorageEngine {
 
     /// Open an existing engine, recovering WAL if necessary.
     pub fn open(data_path: PathBuf, fs: &dyn FileSystem) -> io::Result<Self> {
-        use crate::storage::manager::FIRST_BITMAP_PAGE_ID;
-
         if !data_path.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -355,7 +353,9 @@ impl GraphStorageEngine {
         let mut bitmap_bufs: Vec<AlignedBuffer> = Vec::with_capacity(bitmap_count);
         for i in 0..bitmap_count {
             let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
-            let file_page_id = FIRST_BITMAP_PAGE_ID + i as u64;
+            // Region i's bitmap lives inside region i, not sequentially after
+            // the first bitmap (finding C7).
+            let file_page_id = PageManager::bitmap_physical_page_id(i as u64);
             let offset = file_page_id * PAGE_SIZE as u64;
             // If the file is too short for this bitmap page, use a zeroed buffer.
             let file_len = handle.len()?;
@@ -482,8 +482,11 @@ impl GraphStorageEngine {
 
         let allocated = self.page_manager.allocated_pages();
         for page_id in allocated {
-            // Skip metadata pages (superblock copies and bitmap).
-            if page_id < 3 {
+            // Skip metadata pages: superblock copies, and every region bitmap
+            // (slot 0 at page 2, slot S>=1 at S*PAGES_PER_BITMAP — finding C7).
+            if page_id < crate::storage::manager::FIRST_DATA_PAGE_ID
+                || PageManager::is_bitmap_page(page_id)
+            {
                 continue;
             }
 

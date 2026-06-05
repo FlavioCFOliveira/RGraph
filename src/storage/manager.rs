@@ -199,10 +199,61 @@ impl PageManager {
         }
     }
 
+    /// Physical page id at which the bitmap for `slot` (0-based region index)
+    /// is stored on disk.
+    ///
+    /// Each region's bitmap lives **inside the region it tracks** — at the
+    /// first page of region `slot` (local bit 0), i.e. physical `slot *
+    /// PAGES_PER_BITMAP`.  Region 0 is special-cased: its first two pages are
+    /// the superblock copies, so its bitmap sits at [`FIRST_BITMAP_PAGE_ID`]
+    /// (page 2) instead of page 0.
+    ///
+    /// This is the fix for finding C7: the previous layout stored slot `S`'s
+    /// bitmap at `FIRST_BITMAP_PAGE_ID + S`, which for `S >= 1` aliased live
+    /// data pages (slot 1's bitmap landed on data page 3) — silent corruption
+    /// once a database grew past one region (~508 MiB).
+    pub fn bitmap_physical_page_id(slot: u64) -> PageId {
+        if slot == 0 {
+            FIRST_BITMAP_PAGE_ID
+        } else {
+            slot * PAGES_PER_BITMAP as PageId
+        }
+    }
+
+    /// Is `page_id` a physical bitmap page (reserved, never a data page)?
+    ///
+    /// True for page 2 (slot 0's bitmap) and for every non-zero multiple of
+    /// [`PAGES_PER_BITMAP`] (slot `S >= 1`'s bitmap at `S * PAGES_PER_BITMAP`).
+    pub fn is_bitmap_page(page_id: PageId) -> bool {
+        page_id == FIRST_BITMAP_PAGE_ID
+            || (page_id != 0 && page_id.is_multiple_of(PAGES_PER_BITMAP as PageId))
+    }
+
+    /// Ensure the in-memory bitmap chain covers `slot`, lazily creating any
+    /// missing slots and reserving each new bitmap's own physical page (plus
+    /// the two superblock pages in region 0).
+    fn ensure_bitmap(&mut self, slot: u64) {
+        while (self.bitmaps.len() as u64) <= slot {
+            let new_slot = self.bitmaps.len() as u64;
+            let phys = Self::bitmap_physical_page_id(new_slot);
+            let mut bmp = BitmapPage::new(phys, new_slot);
+            // The bitmap occupies one page inside its own region — reserve it.
+            bmp.allocate(phys);
+            if new_slot == 0 {
+                // Region 0 also holds the primary and mirror superblocks.
+                bmp.allocate(PRIMARY_SB_PAGE_ID);
+                bmp.allocate(MIRROR_SB_PAGE_ID);
+            }
+            self.bitmaps.push(bmp);
+        }
+    }
+
     /// Allocate a new page id.
     ///
-    /// Prioritises the free-list cache, then extends the bitmap chain if
-    /// `next_free_page_id` would overflow the last bitmap's range.
+    /// Prioritises the free-list cache (which only ever holds data pages), then
+    /// extends from `next_free_page_id`, **skipping** any physical page reserved
+    /// for a region bitmap so a bitmap page is never handed out as data and a
+    /// data page never overwrites a bitmap (finding C7).
     pub fn allocate_page(&mut self) -> PageId {
         if let Some(pid) = self.free_cache.pop() {
             let bitmap_idx = (pid as usize) / PAGES_PER_BITMAP;
@@ -213,25 +264,25 @@ impl PageManager {
             return pid;
         }
 
-        let pid = self.superblock.next_free_page_id;
-        self.superblock.next_free_page_id += 1;
-        self.superblock.total_page_count += 1;
+        loop {
+            let pid = self.superblock.next_free_page_id;
+            self.superblock.next_free_page_id += 1;
+            self.superblock.total_page_count += 1;
 
-        // Determine which bitmap slot owns this page.
-        let bitmap_idx = (pid as usize) / PAGES_PER_BITMAP;
+            // Make sure the bitmap for this page's region exists (and has its
+            // own bitmap page reserved).
+            let slot = (pid as usize) / PAGES_PER_BITMAP;
+            self.ensure_bitmap(slot as u64);
 
-        // Extend the bitmap chain if needed.
-        while self.bitmaps.len() <= bitmap_idx {
-            let new_slot = self.bitmaps.len() as u64;
-            // The bitmap page for the next slot lives at:
-            //   FIRST_BITMAP_PAGE_ID + new_slot
-            // (bitmaps are stored sequentially after the first).
-            let file_page_id = FIRST_BITMAP_PAGE_ID + new_slot;
-            self.bitmaps.push(BitmapPage::new(file_page_id, new_slot));
+            if Self::is_bitmap_page(pid) {
+                // Reserved bitmap page: mark it allocated and skip it as data.
+                self.bitmaps[slot].allocate(pid);
+                continue;
+            }
+
+            self.bitmaps[slot].allocate(pid);
+            return pid;
         }
-
-        self.bitmaps[bitmap_idx].allocate(pid);
-        pid
     }
 
     /// Return a page to the free list.
@@ -240,6 +291,11 @@ impl PageManager {
     /// currently caching `page_id` is invalidated so that a subsequent
     /// reallocation of the same id never serves stale bytes.
     pub fn free_page(&mut self, page_id: PageId) {
+        // Never free reserved metadata pages (superblock copies or region
+        // bitmaps); doing so would let a later allocation overwrite them.
+        if page_id < FIRST_DATA_PAGE_ID || Self::is_bitmap_page(page_id) {
+            return;
+        }
         let bitmap_idx = (page_id as usize) / PAGES_PER_BITMAP;
         if bitmap_idx < self.bitmaps.len() {
             self.bitmaps[bitmap_idx].free(page_id);
@@ -423,8 +479,9 @@ impl PageManager {
                     return;
                 }
                 let pid = base + i as PageId;
-                // Skip the fixed metadata pages.
-                if pid < FIRST_DATA_PAGE_ID && !bitmap.is_set(pid) {
+                // Never hand out reserved metadata pages (superblock copies or
+                // region bitmaps) as free data pages.
+                if pid < FIRST_DATA_PAGE_ID || Self::is_bitmap_page(pid) {
                     continue;
                 }
                 if !bitmap.is_set(pid) {
@@ -562,6 +619,130 @@ mod tests {
         assert!(
             result.is_err(),
             "write_page must call sync_all after set_len when growing"
+        );
+    }
+
+    /// Regression gate for finding C7 (2026-06-05): a region's bitmap page must
+    /// live INSIDE its own region, never on top of a data page.  The old layout
+    /// placed slot S's bitmap at `FIRST_BITMAP_PAGE_ID + S`, so slot 1's bitmap
+    /// landed on data page 3 — silent corruption once the database grew past one
+    /// region.  This test fast-forwards the allocator to the region-0/region-1
+    /// boundary (avoiding 65 024 real allocations) and asserts the bitmap page is
+    /// skipped, self-reserved, and never aliases a data page.
+    #[test]
+    fn bitmap_boundary_does_not_alias_data_page() {
+        let (_dir, fs, path) = temp_fs();
+        let mut pm = PageManager::init(path, PAGE_SIZE as u32, &fs).unwrap();
+
+        // Region-0 baseline: the first data page is page 3, not a bitmap page.
+        let first = pm.allocate_page();
+        assert_eq!(first, FIRST_DATA_PAGE_ID);
+        assert!(!PageManager::is_bitmap_page(first));
+
+        // Jump to the boundary without allocating the whole region.
+        pm.superblock.next_free_page_id = PAGES_PER_BITMAP as u64;
+
+        // The next allocation must SKIP the region-1 bitmap page (at PAGES_PER_BITMAP)
+        // and return the first *data* page of region 1 (PAGES_PER_BITMAP + 1).
+        let boundary_alloc = pm.allocate_page();
+        assert_eq!(
+            boundary_alloc,
+            PAGES_PER_BITMAP as u64 + 1,
+            "allocator must skip the region-1 bitmap page and return its first data page"
+        );
+
+        // A second slot must now exist with its own bitmap page reserved.
+        assert_eq!(pm.bitmaps.len(), 2, "region-1 bitmap slot must be created");
+        let region1_bitmap = PageManager::bitmap_physical_page_id(1);
+        assert_eq!(region1_bitmap, PAGES_PER_BITMAP as u64);
+        assert!(
+            pm.bitmaps[1].is_set(region1_bitmap),
+            "the region-1 bitmap page must be marked allocated within its own slot"
+        );
+
+        // Core anti-aliasing invariant: the bitmap page must NOT be page 3 (the
+        // old bug), must be classified as a bitmap page, and must never equal a
+        // page handed out as data.
+        assert_ne!(
+            region1_bitmap, FIRST_DATA_PAGE_ID,
+            "region-1 bitmap must not alias data page 3"
+        );
+        assert!(PageManager::is_bitmap_page(region1_bitmap));
+        assert_ne!(
+            boundary_alloc, region1_bitmap,
+            "a data allocation must never alias a bitmap page"
+        );
+    }
+
+    /// C7 durability path: a region-1 bitmap stored inside region 1 (at
+    /// `PAGES_PER_BITMAP`) must be written to and read back from its real
+    /// physical offset on reopen, and a region-1 data page must survive without
+    /// aliasing region-0 data.  Backed by a sparse file so only the few touched
+    /// pages cost disk (the logical size is ~508 MiB).
+    #[test]
+    fn multi_region_bitmap_survives_reopen() {
+        use crate::storage::meta::load_superblock;
+        use crate::storage::page::{PageType, SlottedPage};
+
+        let (_dir, fs, path) = temp_fs();
+
+        let (data_pid, region1_bitmap) = {
+            let mut pm = PageManager::init(path.clone(), PAGE_SIZE as u32, &fs).unwrap();
+
+            // A real region-0 data page with a sentinel.
+            let p0 = pm.allocate_page();
+            let mut page0 = SlottedPage::init(p0, PageType::SlottedData);
+            page0.buf[SlottedPage::HEADER_SIZE] = 0x11;
+            page0.update_checksum();
+            pm.write_page(&fs, p0, &mut page0.buf).unwrap();
+
+            // Cross into region 1; allocate its first data page and write a sentinel.
+            pm.superblock.next_free_page_id = PAGES_PER_BITMAP as u64;
+            let p1 = pm.allocate_page();
+            assert_eq!(p1, PAGES_PER_BITMAP as u64 + 1);
+            let mut page1 = SlottedPage::init(p1, PageType::SlottedData);
+            page1.buf[SlottedPage::HEADER_SIZE] = 0x22;
+            page1.update_checksum();
+            pm.write_page(&fs, p1, &mut page1.buf).unwrap();
+
+            pm.sync_superblock(&fs).unwrap();
+            pm.sync_bitmaps(&fs).unwrap();
+            (p1, PageManager::bitmap_physical_page_id(1))
+        };
+
+        // Reopen: read every bitmap slot from its real physical location.
+        let sb = load_superblock(&fs, &path).unwrap();
+        let count = num_bitmap_pages(sb.next_free_page_id).max(1);
+        assert_eq!(count, 2, "next_free_page_id must span two bitmap regions");
+        let handle = fs.open(&path, false).unwrap();
+        let mut bufs = Vec::new();
+        for i in 0..count {
+            let mut buf = AlignedBuffer::zeroed(PAGE_SIZE);
+            let off = PageManager::bitmap_physical_page_id(i as u64) * PAGE_SIZE as u64;
+            handle.read_at(&mut buf, off).unwrap();
+            bufs.push(buf);
+        }
+        drop(handle);
+        let pm = PageManager::open_multi(path.clone(), sb, bufs, &fs).unwrap();
+
+        // The region-1 bitmap slot must record both its own bitmap page and the
+        // data page as allocated.
+        assert!(
+            pm.bitmaps[1].is_set(region1_bitmap),
+            "region-1 bitmap page must read back as allocated"
+        );
+        assert!(
+            pm.bitmaps[1].is_set(data_pid),
+            "region-1 data page must read back as allocated"
+        );
+
+        // The region-1 data sentinel must survive (no aliasing of region-0 data).
+        let mut rb = AlignedBuffer::zeroed(PAGE_SIZE);
+        pm.read_page(&fs, data_pid, &mut rb).unwrap();
+        assert_eq!(
+            rb[SlottedPage::HEADER_SIZE],
+            0x22,
+            "region-1 data must survive reopen intact"
         );
     }
 
